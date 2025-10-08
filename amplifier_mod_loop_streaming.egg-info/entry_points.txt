@@ -1,2 +1,0 @@
-[amplifier.modules]
-loop-streaming = amplifier_mod_loop_streaming:mount

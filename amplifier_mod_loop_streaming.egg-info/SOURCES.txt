@@ -1,9 +1,0 @@
-LICENSE
-pyproject.toml
-amplifier_mod_loop_streaming/__init__.py
-amplifier_mod_loop_streaming.egg-info/PKG-INFO
-amplifier_mod_loop_streaming.egg-info/SOURCES.txt
-amplifier_mod_loop_streaming.egg-info/dependency_links.txt
-amplifier_mod_loop_streaming.egg-info/entry_points.txt
-amplifier_mod_loop_streaming.egg-info/requires.txt
-amplifier_mod_loop_streaming.egg-info/top_level.txt
