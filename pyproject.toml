@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amplifier-module-loop-streaming"
+version = "1.0.0"
+description = "Streaming orchestrator module for Amplifier"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "amplifier-core>=1.0.0",
+]
+
+[project.entry-points."amplifier.modules"]
+loop-streaming = "amplifier_mod_loop_streaming:mount"
