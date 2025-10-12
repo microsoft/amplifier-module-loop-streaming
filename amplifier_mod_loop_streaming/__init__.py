@@ -12,6 +12,8 @@ from typing import Optional
 from amplifier_core import HookRegistry
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ToolResult
+from amplifier_core.events import CONTENT_BLOCK_END
+from amplifier_core.events import CONTENT_BLOCK_START
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,27 @@ class StreamingOrchestrator:
                     # Convert tools dict to list for provider
                     tools_list = list(tools.values()) if tools else []
                     response = await provider.complete(messages, tools=tools_list)
+
+                    # Emit content block events if present
+                    content_blocks = getattr(response, "content_blocks", None)
+                    if content_blocks:
+                        for idx, block in enumerate(content_blocks):
+                            # Emit block start
+                            await hooks.emit(
+                                CONTENT_BLOCK_START,
+                                {
+                                    "data": {
+                                        "block_type": block.type.value,
+                                        "block_index": idx,
+                                        "metadata": getattr(block, "raw", None),
+                                    }
+                                },
+                            )
+
+                            # Emit block end with complete block
+                            await hooks.emit(
+                                CONTENT_BLOCK_END, {"data": {"block_index": idx, "block": block.to_dict()}}
+                            )
 
                     # Parse tool calls
                     tool_calls = provider.parse_tool_calls(response)
