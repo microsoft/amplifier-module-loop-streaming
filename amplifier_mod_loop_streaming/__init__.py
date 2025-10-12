@@ -99,7 +99,9 @@ class StreamingOrchestrator:
             else:
                 # Fallback to non-streaming
                 try:
-                    response = await provider.complete(messages)
+                    # Convert tools dict to list for provider
+                    tools_list = list(tools.values()) if tools else []
+                    response = await provider.complete(messages, tools=tools_list)
 
                     # Parse tool calls
                     tool_calls = provider.parse_tool_calls(response)
@@ -112,9 +114,29 @@ class StreamingOrchestrator:
                         await context.add_message({"role": "assistant", "content": response.content})
                         break
 
-                    # Process tool calls
+                    # Add assistant message with tool calls
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": response.content if response.content else "",
+                        "tool_calls": [{"id": tc.id, "tool": tc.tool, "arguments": tc.arguments} for tc in tool_calls],
+                    }
+                    await context.add_message(assistant_msg)
+
+                    # Process tool calls with visible output
                     for tool_call in tool_calls:
-                        await self._execute_tool(tool_call, tools, context, hooks)
+                        # Show tool call to user
+                        yield f"\n\n🔧 **Using tool:** `{tool_call.tool}`\n"
+
+                        # Execute and capture result
+                        tool_result = await self._execute_tool_with_result(tool_call, tools, context, hooks)
+
+                        # Show result to user
+                        if tool_result:
+                            if tool_result.get("success"):
+                                yield "✓ Tool executed successfully\n"
+                            else:
+                                error_msg = tool_result.get("error") or "Unknown error"
+                                yield f"✗ Tool error: {error_msg}\n"
 
                 except Exception as e:
                     logger.error(f"Provider error: {e}")
@@ -136,7 +158,9 @@ class StreamingOrchestrator:
 
         full_response = ""
 
-        async for chunk in provider.stream(messages):
+        # Convert tools dict to list for provider
+        tools_list = list(tools.values()) if tools else []
+        async for chunk in provider.stream(messages, tools=tools_list):
             token = chunk.get("content", "")
             if token:
                 yield token
@@ -162,7 +186,11 @@ class StreamingOrchestrator:
             await asyncio.sleep(self.stream_delay)
 
     async def _execute_tool(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> None:
-        """Execute a single tool call."""
+        """Execute a single tool call (legacy method for compatibility)."""
+        await self._execute_tool_with_result(tool_call, tools, context, hooks)
+
+    async def _execute_tool_with_result(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> dict:
+        """Execute a single tool call and return result info."""
         # Pre-tool hook
         hook_result = await hooks.emit("tool:pre", {"tool": tool_call.tool, "arguments": tool_call.arguments})
 
@@ -170,13 +198,13 @@ class StreamingOrchestrator:
             await context.add_message(
                 {"role": "system", "content": f"Tool {tool_call.tool} denied: {hook_result.reason}"}
             )
-            return
+            return {"success": False, "error": f"Denied: {hook_result.reason}"}
 
         # Get tool
         tool = tools.get(tool_call.tool)
         if not tool:
             await context.add_message({"role": "system", "content": f"Tool {tool_call.tool} not found"})
-            return
+            return {"success": False, "error": "Tool not found"}
 
         # Execute
         try:
@@ -190,14 +218,17 @@ class StreamingOrchestrator:
             {"tool": tool_call.tool, "result": result.model_dump() if hasattr(result, "model_dump") else str(result)},
         )
 
-        # Add result
+        # Add result with tool_call_id
         await context.add_message(
             {
                 "role": "tool",
                 "name": tool_call.tool,
+                "tool_call_id": tool_call.id,
                 "content": str(result.output) if result.success else f"Error: {result.error}",
             }
         )
+
+        return {"success": result.success, "error": result.error if not result.success else None}
 
     async def _has_pending_tools(self, context) -> bool:
         """Check if there are pending tool calls."""
