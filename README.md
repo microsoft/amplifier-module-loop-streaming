@@ -2,6 +2,21 @@
 
 Token-level streaming orchestration for real-time response delivery.
 
+## Prerequisites
+
+- **Python 3.11+**
+- **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
+
+### Installing UV
+
+```bash
+# macOS/Linux/WSL
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
 ## Purpose
 
 Provides streaming orchestration that delivers LLM responses token-by-token for improved perceived performance and user experience.
@@ -10,7 +25,7 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 
 **Module Type:** Orchestrator
 **Mount Point:** `orchestrators`
-**Entry Point:** `amplifier_mod_loop_streaming:mount`
+**Entry Point:** `amplifier_module_loop_streaming:mount`
 
 ## Behavior
 
@@ -41,6 +56,7 @@ orchestrator = "loop-streaming"
 ```
 
 Perfect for:
+
 - Interactive CLI applications
 - Web UIs with progressive rendering
 - Long-form content generation

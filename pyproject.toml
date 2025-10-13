@@ -1,17 +1,37 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "amplifier-module-loop-streaming"
 version = "1.0.0"
 description = "Streaming orchestrator module for Amplifier"
+license = "MIT"
 readme = "README.md"
-requires-python = ">=3.9"
-license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    { name = "Microsoft MADE:Explorations Team" },
+]
 dependencies = [
-    "amplifier-core>=1.0.0",
+    "amplifier-core",
 ]
 
 [project.entry-points."amplifier.modules"]
-loop-streaming = "amplifier_mod_loop_streaming:mount"
+loop-streaming = "amplifier_module_loop_streaming:mount"
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.uv.sources.amplifier-core]
+path = "../amplifier-core"
+editable = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "amplifier_module_loop_streaming",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
