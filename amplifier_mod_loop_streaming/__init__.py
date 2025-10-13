@@ -37,6 +37,7 @@ class StreamingOrchestrator:
         self.config = config
         self.max_iterations = config.get("max_iterations", 50)
         self.stream_delay = config.get("stream_delay", 0.01)  # Artificial delay for demo
+        self.extended_thinking = config.get("extended_thinking", False)
 
     async def execute(
         self, prompt: str, context, providers: dict[str, Any], tools: dict[str, Any], hooks: HookRegistry
@@ -103,7 +104,13 @@ class StreamingOrchestrator:
                 try:
                     # Convert tools dict to list for provider
                     tools_list = list(tools.values()) if tools else []
-                    response = await provider.complete(messages, tools=tools_list)
+                    # Build kwargs for provider
+                    kwargs = {}
+                    if tools_list:
+                        kwargs["tools"] = tools_list
+                    if self.extended_thinking:
+                        kwargs["extended_thinking"] = True
+                    response = await provider.complete(messages, **kwargs)
 
                     # Emit content block events if present
                     content_blocks = getattr(response, "content_blocks", None)
@@ -134,15 +141,35 @@ class StreamingOrchestrator:
                         async for token in self._tokenize_stream(response.content):
                             yield token
 
-                        await context.add_message({"role": "assistant", "content": response.content})
+                        # Build assistant message with thinking block if present
+                        assistant_msg = {"role": "assistant", "content": response.content}
+
+                        # Preserve thinking blocks for Anthropic extended thinking
+                        if content_blocks:
+                            for block in content_blocks:
+                                if hasattr(block, "type") and block.type.value == "thinking":
+                                    # Store the raw thinking block to preserve signature
+                                    assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
+                                    break
+
+                        await context.add_message(assistant_msg)
                         break
 
-                    # Add assistant message with tool calls
+                    # Add assistant message with tool calls and thinking block
                     assistant_msg = {
                         "role": "assistant",
                         "content": response.content if response.content else "",
                         "tool_calls": [{"id": tc.id, "tool": tc.tool, "arguments": tc.arguments} for tc in tool_calls],
                     }
+
+                    # Preserve thinking blocks for Anthropic extended thinking
+                    if content_blocks:
+                        for block in content_blocks:
+                            if hasattr(block, "type") and block.type.value == "thinking":
+                                # Store the raw thinking block to preserve signature
+                                assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
+                                break
+
                     await context.add_message(assistant_msg)
 
                     # Process tool calls with visible output
@@ -264,14 +291,27 @@ class StreamingOrchestrator:
         pass
 
     def _select_provider(self, providers: dict[str, Any]) -> Any:
-        """Select a provider."""
+        """Select a provider based on priority."""
         if not providers:
             return None
 
-        # Prefer providers that support streaming
-        for _name, provider in providers.items():
-            if hasattr(provider, "stream"):
-                return provider
+        # Collect providers with their priority (default priority is 100)
+        provider_list = []
+        for name, provider in providers.items():
+            # Try to get priority from provider's config or attributes
+            priority = 100  # Default priority
+            if hasattr(provider, "priority"):
+                priority = provider.priority
+            elif hasattr(provider, "config") and isinstance(provider.config, dict):
+                priority = provider.config.get("priority", 100)
 
-        # Fallback to first available
-        return next(iter(providers.values()))
+            provider_list.append((priority, name, provider))
+
+        # Sort by priority (lower number = higher priority)
+        provider_list.sort(key=lambda x: x[0])
+
+        # Return the highest priority provider
+        if provider_list:
+            return provider_list[0][2]
+
+        return None
