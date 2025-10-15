@@ -245,15 +245,27 @@ class StreamingOrchestrator:
         hook_result = await hooks.emit("tool:pre", {"tool": tool_call.tool, "arguments": tool_call.arguments})
 
         if hook_result.action == "deny":
+            # Add tool_result message (not system) so Anthropic API accepts it
             await context.add_message(
-                {"role": "system", "content": f"Tool {tool_call.tool} denied: {hook_result.reason}"}
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"Tool execution denied: {hook_result.reason}",
+                }
             )
             return {"success": False, "error": f"Denied: {hook_result.reason}"}
 
         # Get tool
         tool = tools.get(tool_call.tool)
         if not tool:
-            await context.add_message({"role": "system", "content": f"Tool {tool_call.tool} not found"})
+            # Add tool_result message (not system) so Anthropic API accepts it
+            await context.add_message(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"Error: Tool '{tool_call.tool}' not found",
+                }
+            )
             return {"success": False, "error": "Tool not found"}
 
         # Execute
