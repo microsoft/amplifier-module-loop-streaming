@@ -172,21 +172,10 @@ class StreamingOrchestrator:
 
                     await context.add_message(assistant_msg)
 
-                    # Process tool calls with visible output
+                    # Process tool calls (display handled by streaming UI via tool:pre/post events)
                     for tool_call in tool_calls:
-                        # Show tool call to user
-                        yield f"\n\n🔧 **Using tool:** `{tool_call.tool}`\n"
-
-                        # Execute and capture result
-                        tool_result = await self._execute_tool_with_result(tool_call, tools, context, hooks)
-
-                        # Show result to user
-                        if tool_result:
-                            if tool_result.get("success"):
-                                yield "✓ Tool executed successfully\n"
-                            else:
-                                error_msg = tool_result.get("error") or "Unknown error"
-                                yield f"✗ Tool error: {error_msg}\n"
+                        # Execute tool (hooks will display via tool:pre/post events)
+                        await self._execute_tool_with_result(tool_call, tools, context, hooks)
 
                 except Exception as e:
                     logger.error(f"Provider error: {e}")
