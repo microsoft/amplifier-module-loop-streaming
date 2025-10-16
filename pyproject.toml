@@ -9,7 +9,6 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "amplifier-core",
 ]
 
 [project.entry-points."amplifier.modules"]
@@ -23,10 +22,6 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = true
-
-[tool.uv.sources.amplifier-core]
-path = "../amplifier-core"
-editable = true
 
 [tool.hatch.build.targets.wheel]
 packages = [
