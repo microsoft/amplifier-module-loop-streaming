@@ -48,7 +48,7 @@ class StreamingOrchestrator:
         Note: This is a simplified version. A real streaming implementation would
         need to modify the core interfaces to support AsyncIterator returns.
         """
-        # For now, collect the stream and return as string
+        # Collect the stream and return as string
         # In a real implementation, the interface would support streaming
         full_response = ""
 
@@ -215,11 +215,15 @@ class StreamingOrchestrator:
         Simulate token-by-token streaming from complete text.
         In production, this would be real streaming from the provider.
         """
-        # Split into words for demo
-        tokens = text.split()
+        # Split into words while preserving newlines
+        import re
+
+        # Match words or newline sequences
+        tokens = re.findall(r"\S+|\n+", text)
 
         for i, token in enumerate(tokens):
-            if i > 0:
+            # Add space before words (but not newlines)
+            if i > 0 and not token.startswith("\n") and not tokens[i - 1].endswith("\n"):
                 yield " "
             yield token
             await asyncio.sleep(self.stream_delay)
