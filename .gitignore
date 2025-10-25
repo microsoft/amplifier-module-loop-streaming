@@ -41,6 +41,3 @@ Thumbs.db
 
 # Amplifier local state (do not commit developer's profile choice)
 .amplifier/profile
-
-# Beads task tracking (managed at project root, not in submodules)
-.beads/
