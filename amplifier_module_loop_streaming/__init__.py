@@ -212,17 +212,26 @@ class StreamingOrchestrator:
 
     async def _tokenize_stream(self, text: str) -> AsyncIterator[str]:
         """
-        Simulate token-by-token streaming from complete text.
+        Simulate token-by-token streaming from complete text while preserving newlines.
         In production, this would be real streaming from the provider.
         """
-        # Split into words for demo
-        tokens = text.split()
+        # Split by lines first to preserve newlines
+        lines = text.split("\n")
 
-        for i, token in enumerate(tokens):
-            if i > 0:
-                yield " "
-            yield token
-            await asyncio.sleep(self.stream_delay)
+        for line_idx, line in enumerate(lines):
+            # Split line into words
+            words = line.split()
+
+            # Yield words with spaces
+            for word_idx, word in enumerate(words):
+                if word_idx > 0:
+                    yield " "
+                yield word
+                await asyncio.sleep(self.stream_delay)
+
+            # Yield newline after each line except the last
+            if line_idx < len(lines) - 1:
+                yield "\n"
 
     async def _execute_tool(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> None:
         """Execute a single tool call (legacy method for compatibility)."""
