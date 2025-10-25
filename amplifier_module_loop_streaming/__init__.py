@@ -238,57 +238,89 @@ class StreamingOrchestrator:
         await self._execute_tool_with_result(tool_call, tools, context, hooks)
 
     async def _execute_tool_with_result(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> dict:
-        """Execute a single tool call and return result info."""
-        # Pre-tool hook
-        hook_result = await hooks.emit("tool:pre", {"tool": tool_call.tool, "arguments": tool_call.arguments})
+        """Execute a single tool call and return result info.
 
-        if hook_result.action == "deny":
-            # Add tool_result message (not system) so Anthropic API accepts it
-            await context.add_message(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": f"Tool execution denied: {hook_result.reason}",
-                }
-            )
-            return {"success": False, "error": f"Denied: {hook_result.reason}"}
+        Guarantees that a tool response is always added to context, even if errors occur.
+        This prevents orphaned tool calls that corrupt conversation state.
+        """
+        response_added = False
 
-        # Get tool
-        tool = tools.get(tool_call.tool)
-        if not tool:
-            # Add tool_result message (not system) so Anthropic API accepts it
-            await context.add_message(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": f"Error: Tool '{tool_call.tool}' not found",
-                }
-            )
-            return {"success": False, "error": "Tool not found"}
-
-        # Execute
         try:
-            result = await tool.execute(tool_call.arguments)
+            # Pre-tool hook
+            hook_result = await hooks.emit("tool:pre", {"tool": tool_call.tool, "arguments": tool_call.arguments})
+
+            if hook_result.action == "deny":
+                # Add tool_result message (not system) so Anthropic API accepts it
+                await context.add_message(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": f"Tool execution denied: {hook_result.reason}",
+                    }
+                )
+                response_added = True
+                return {"success": False, "error": f"Denied: {hook_result.reason}"}
+
+            # Get tool
+            tool = tools.get(tool_call.tool)
+            if not tool:
+                # Add tool_result message (not system) so Anthropic API accepts it
+                await context.add_message(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": f"Error: Tool '{tool_call.tool}' not found",
+                    }
+                )
+                response_added = True
+                return {"success": False, "error": "Tool not found"}
+
+            # Execute
+            try:
+                result = await tool.execute(tool_call.arguments)
+            except Exception as e:
+                result = ToolResult(success=False, error={"message": str(e)})
+
+            # Post-tool hook
+            await hooks.emit(
+                "tool:post",
+                {
+                    "tool": tool_call.tool,
+                    "result": result.model_dump() if hasattr(result, "model_dump") else str(result),
+                },
+            )
+
+            # Add result with tool_call_id
+            await context.add_message(
+                {
+                    "role": "tool",
+                    "name": tool_call.tool,
+                    "tool_call_id": tool_call.id,
+                    "content": str(result.output) if result.success else f"Error: {result.error}",
+                }
+            )
+            response_added = True
+
+            return {"success": result.success, "error": result.error if not result.success else None}
+
         except Exception as e:
-            result = ToolResult(success=False, error={"message": str(e)})
+            # Safety net: Ensure a tool response is ALWAYS added to prevent orphaned tool calls
+            logger.error(f"Unexpected error executing tool {tool_call.tool}: {e}", exc_info=True)
 
-        # Post-tool hook
-        await hooks.emit(
-            "tool:post",
-            {"tool": tool_call.tool, "result": result.model_dump() if hasattr(result, "model_dump") else str(result)},
-        )
+            if not response_added:
+                try:
+                    await context.add_message(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": f"Internal error executing tool: {str(e)}",
+                        }
+                    )
+                except Exception as inner_e:
+                    # Critical failure: Even adding error response failed
+                    logger.error(f"Critical: Failed to add error response for tool_call_id {tool_call.id}: {inner_e}")
 
-        # Add result with tool_call_id
-        await context.add_message(
-            {
-                "role": "tool",
-                "name": tool_call.tool,
-                "tool_call_id": tool_call.id,
-                "content": str(result.output) if result.success else f"Error: {result.error}",
-            }
-        )
-
-        return {"success": result.success, "error": result.error if not result.success else None}
+            return {"success": False, "error": str(e)}
 
     async def _has_pending_tools(self, context) -> bool:
         """Check if there are pending tool calls."""
