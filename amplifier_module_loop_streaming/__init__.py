@@ -172,10 +172,25 @@ class StreamingOrchestrator:
 
                     await context.add_message(assistant_msg)
 
-                    # Process tool calls (display handled by streaming UI via tool:pre/post events)
-                    for tool_call in tool_calls:
-                        # Execute tool (hooks will display via tool:pre/post events)
-                        await self._execute_tool_with_result(tool_call, tools, context, hooks)
+                    # Process tool calls in parallel (user guidance: assume parallel intent)
+                    # Execute tools concurrently, but add results to context sequentially for determinism
+                    import uuid
+
+                    parallel_group_id = str(uuid.uuid4())
+
+                    # Execute all tools in parallel (no context updates inside)
+                    tool_tasks = [self._execute_tool_only(tc, tools, hooks, parallel_group_id) for tc in tool_calls]
+                    tool_results = await asyncio.gather(*tool_tasks)
+
+                    # Add all results to context in original order (sequential, deterministic)
+                    for tool_call_id, content in tool_results:
+                        await context.add_message(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": content,
+                            }
+                        )
 
                 except Exception as e:
                     logger.error(f"Provider error: {e}")
@@ -236,6 +251,69 @@ class StreamingOrchestrator:
     async def _execute_tool(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> None:
         """Execute a single tool call (legacy method for compatibility)."""
         await self._execute_tool_with_result(tool_call, tools, context, hooks)
+
+    async def _execute_tool_only(
+        self, tool_call, tools: dict[str, Any], hooks: HookRegistry, parallel_group_id: str
+    ) -> tuple[str, str]:
+        """Execute a single tool in parallel without adding to context.
+
+        Returns (tool_call_id, content) tuple.
+        Never raises - errors become error messages.
+        """
+        try:
+            # Pre-tool hook
+            await hooks.emit(
+                "tool:pre",
+                {"tool": tool_call.tool, "arguments": tool_call.arguments, "parallel_group_id": parallel_group_id},
+            )
+
+            # Get tool
+            tool = tools.get(tool_call.tool)
+            if not tool:
+                error_msg = f"Error: Tool '{tool_call.tool}' not found"
+                await hooks.emit(
+                    "tool:error",
+                    {
+                        "tool": tool_call.tool,
+                        "error": {"type": "RuntimeError", "msg": error_msg},
+                        "parallel_group_id": parallel_group_id,
+                    },
+                )
+                return (tool_call.id, error_msg)
+
+            # Execute
+            try:
+                result = await tool.execute(tool_call.arguments)
+            except Exception as e:
+                result = ToolResult(success=False, error={"message": str(e)})
+
+            # Post-tool hook
+            await hooks.emit(
+                "tool:post",
+                {
+                    "tool": tool_call.tool,
+                    "result": result.model_dump() if hasattr(result, "model_dump") else str(result),
+                    "parallel_group_id": parallel_group_id,
+                },
+            )
+
+            # Return result content
+            content = str(result.output) if result.success else f"Error: {result.error}"
+            return (tool_call.id, content)
+
+        except Exception as e:
+            # Safety net: errors become error messages
+            logger.error(f"Tool {tool_call.tool} failed: {e}")
+            error_msg = f"Internal error executing tool: {str(e)}"
+            await hooks.emit(
+                "tool:error",
+                {
+                    "tool": tool_call.tool,
+                    "error": {"type": type(e).__name__, "msg": str(e)},
+                    "parallel_group_id": parallel_group_id,
+                },
+            )
+            return (tool_call.id, error_msg)
 
     async def _execute_tool_with_result(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> dict:
         """Execute a single tool call and return result info.

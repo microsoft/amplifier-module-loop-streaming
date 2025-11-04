@@ -31,6 +31,8 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 
 - Token-level streaming from provider
 - Real-time response delivery
+- **Parallel tool execution**: Multiple tool calls execute concurrently
+- Deterministic context updates: Results added in original order
 - Progressive rendering
 - Interruptible generation
 
