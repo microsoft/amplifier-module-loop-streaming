@@ -15,6 +15,9 @@ from amplifier_core import ToolResult
 from amplifier_core.events import CONTENT_BLOCK_END
 from amplifier_core.events import CONTENT_BLOCK_START
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
+from amplifier_core.events import PROMPT_SUBMIT
+from amplifier_core.events import TOOL_POST
+from amplifier_core.events import TOOL_PRE
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +63,7 @@ class StreamingOrchestrator:
         full_response = ""
         iteration_count = 0
 
-        async for token, iteration in self._execute_stream(prompt, context, providers, tools, hooks):
+        async for token, iteration in self._execute_stream(prompt, context, providers, tools, hooks, coordinator):
             full_response += token
             iteration_count = iteration
 
@@ -79,12 +82,26 @@ class StreamingOrchestrator:
         return full_response
 
     async def _execute_stream(
-        self, prompt: str, context, providers: dict[str, Any], tools: dict[str, Any], hooks: HookRegistry
+        self,
+        prompt: str,
+        context,
+        providers: dict[str, Any],
+        tools: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
     ) -> AsyncIterator[tuple[str, int]]:
         """
         Internal streaming execution.
         Yields tuples of (token, iteration) as they're generated.
         """
+        # Emit and process prompt submit (allows hooks to inject context before processing)
+        result = await hooks.emit(PROMPT_SUBMIT, {"data": {"prompt": prompt}})
+        if coordinator:
+            result = await coordinator.process_hook_result(result, "prompt:submit", "orchestrator")
+            if result.action == "deny":
+                yield (f"Operation denied: {result.reason}", 0)
+                return
+
         # Emit session start
         await hooks.emit("session:start", {"prompt": prompt})
 
@@ -200,7 +217,9 @@ class StreamingOrchestrator:
                     parallel_group_id = str(uuid.uuid4())
 
                     # Execute all tools in parallel (no context updates inside)
-                    tool_tasks = [self._execute_tool_only(tc, tools, hooks, parallel_group_id) for tc in tool_calls]
+                    tool_tasks = [
+                        self._execute_tool_only(tc, tools, hooks, parallel_group_id, coordinator) for tc in tool_calls
+                    ]
                     tool_results = await asyncio.gather(*tool_tasks)
 
                     # Add all results to context in original order (sequential, deterministic)
@@ -269,12 +288,24 @@ class StreamingOrchestrator:
             if line_idx < len(lines) - 1:
                 yield "\n"
 
-    async def _execute_tool(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> None:
+    async def _execute_tool(
+        self,
+        tool_call,
+        tools: dict[str, Any],
+        context,
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
+    ) -> None:
         """Execute a single tool call (legacy method for compatibility)."""
-        await self._execute_tool_with_result(tool_call, tools, context, hooks)
+        await self._execute_tool_with_result(tool_call, tools, context, hooks, coordinator)
 
     async def _execute_tool_only(
-        self, tool_call, tools: dict[str, Any], hooks: HookRegistry, parallel_group_id: str
+        self,
+        tool_call,
+        tools: dict[str, Any],
+        hooks: HookRegistry,
+        parallel_group_id: str,
+        coordinator: ModuleCoordinator | None = None,
     ) -> tuple[str, str]:
         """Execute a single tool in parallel without adding to context.
 
@@ -283,10 +314,22 @@ class StreamingOrchestrator:
         """
         try:
             # Pre-tool hook
-            await hooks.emit(
-                "tool:pre",
-                {"tool": tool_call.tool, "arguments": tool_call.arguments, "parallel_group_id": parallel_group_id},
+            pre_result = await hooks.emit(
+                TOOL_PRE,
+                {
+                    "data": {
+                        "tool_name": tool_call.tool,
+                        "tool": tool_call.tool,
+                        "tool_input": tool_call.arguments,
+                        "args": tool_call.arguments,
+                        "parallel_group_id": parallel_group_id,
+                    }
+                },
             )
+            if coordinator:
+                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.tool)
+                if pre_result.action == "deny":
+                    return (tool_call.id, f"Denied by hook: {pre_result.reason}")
 
             # Get tool
             tool = tools.get(tool_call.tool)
@@ -308,15 +351,24 @@ class StreamingOrchestrator:
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
 
+            # Serialize result for logging
+            result_data = result.model_dump() if hasattr(result, "model_dump") else str(result)
+
             # Post-tool hook
-            await hooks.emit(
-                "tool:post",
+            post_result = await hooks.emit(
+                TOOL_POST,
                 {
-                    "tool": tool_call.tool,
-                    "result": result.model_dump() if hasattr(result, "model_dump") else str(result),
-                    "parallel_group_id": parallel_group_id,
+                    "data": {
+                        "tool_name": tool_call.tool,
+                        "tool": tool_call.tool,
+                        "tool_input": tool_call.arguments,
+                        "result": result_data,
+                        "parallel_group_id": parallel_group_id,
+                    }
                 },
             )
+            if coordinator:
+                await coordinator.process_hook_result(post_result, "tool:post", tool_call.tool)
 
             # Return result content
             content = str(result.output) if result.success else f"Error: {result.error}"
@@ -336,7 +388,14 @@ class StreamingOrchestrator:
             )
             return (tool_call.id, error_msg)
 
-    async def _execute_tool_with_result(self, tool_call, tools: dict[str, Any], context, hooks: HookRegistry) -> dict:
+    async def _execute_tool_with_result(
+        self,
+        tool_call,
+        tools: dict[str, Any],
+        context,
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
+    ) -> dict:
         """Execute a single tool call and return result info.
 
         Guarantees that a tool response is always added to context, even if errors occur.
@@ -346,19 +405,30 @@ class StreamingOrchestrator:
 
         try:
             # Pre-tool hook
-            hook_result = await hooks.emit("tool:pre", {"tool": tool_call.tool, "arguments": tool_call.arguments})
-
-            if hook_result.action == "deny":
-                # Add tool_result message (not system) so Anthropic API accepts it
-                await context.add_message(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": f"Tool execution denied: {hook_result.reason}",
+            pre_result = await hooks.emit(
+                TOOL_PRE,
+                {
+                    "data": {
+                        "tool_name": tool_call.tool,
+                        "tool": tool_call.tool,
+                        "tool_input": tool_call.arguments,
+                        "args": tool_call.arguments,
                     }
-                )
-                response_added = True
-                return {"success": False, "error": f"Denied: {hook_result.reason}"}
+                },
+            )
+            if coordinator:
+                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.tool)
+                if pre_result.action == "deny":
+                    # Add tool_result message (not system) so Anthropic API accepts it
+                    await context.add_message(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": f"Tool execution denied: {pre_result.reason}",
+                        }
+                    )
+                    response_added = True
+                    return {"success": False, "error": f"Denied: {pre_result.reason}"}
 
             # Get tool
             tool = tools.get(tool_call.tool)
@@ -380,14 +450,23 @@ class StreamingOrchestrator:
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
 
+            # Serialize result for logging
+            result_data = result.model_dump() if hasattr(result, "model_dump") else str(result)
+
             # Post-tool hook
-            await hooks.emit(
-                "tool:post",
+            post_result = await hooks.emit(
+                TOOL_POST,
                 {
-                    "tool": tool_call.tool,
-                    "result": result.model_dump() if hasattr(result, "model_dump") else str(result),
+                    "data": {
+                        "tool_name": tool_call.tool,
+                        "tool": tool_call.tool,
+                        "tool_input": tool_call.arguments,
+                        "result": result_data,
+                    }
                 },
             )
+            if coordinator:
+                await coordinator.process_hook_result(post_result, "tool:post", tool_call.tool)
 
             # Add result with tool_call_id
             await context.add_message(
