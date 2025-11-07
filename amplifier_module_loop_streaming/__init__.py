@@ -14,6 +14,7 @@ from amplifier_core import ModuleCoordinator
 from amplifier_core import ToolResult
 from amplifier_core.events import CONTENT_BLOCK_END
 from amplifier_core.events import CONTENT_BLOCK_START
+from amplifier_core.events import ORCHESTRATOR_COMPLETE
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,13 @@ class StreamingOrchestrator:
         self.extended_thinking = config.get("extended_thinking", False)
 
     async def execute(
-        self, prompt: str, context, providers: dict[str, Any], tools: dict[str, Any], hooks: HookRegistry
+        self,
+        prompt: str,
+        context,
+        providers: dict[str, Any],
+        tools: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
     ) -> str:
         """
         Execute with streaming - returns full response but could be modified to stream.
@@ -51,18 +58,32 @@ class StreamingOrchestrator:
         # For now, collect the stream and return as string
         # In a real implementation, the interface would support streaming
         full_response = ""
+        iteration_count = 0
 
-        async for token in self._execute_stream(prompt, context, providers, tools, hooks):
+        async for token, iteration in self._execute_stream(prompt, context, providers, tools, hooks):
             full_response += token
+            iteration_count = iteration
+
+        # Emit orchestrator complete event
+        await hooks.emit(
+            ORCHESTRATOR_COMPLETE,
+            {
+                "data": {
+                    "orchestrator": "loop-streaming",
+                    "turn_count": iteration_count,
+                    "status": "success" if full_response else "incomplete",
+                }
+            },
+        )
 
         return full_response
 
     async def _execute_stream(
         self, prompt: str, context, providers: dict[str, Any], tools: dict[str, Any], hooks: HookRegistry
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[tuple[str, int]]:
         """
         Internal streaming execution.
-        Yields tokens as they're generated.
+        Yields tuples of (token, iteration) as they're generated.
         """
         # Emit session start
         await hooks.emit("session:start", {"prompt": prompt})
@@ -73,7 +94,7 @@ class StreamingOrchestrator:
         # Select provider
         provider = self._select_provider(providers)
         if not provider:
-            yield "Error: No providers available"
+            yield ("Error: No providers available", 0)
             return
 
         iteration = 0
@@ -88,7 +109,7 @@ class StreamingOrchestrator:
             if hasattr(provider, "stream"):
                 # Use streaming if available
                 async for chunk in self._stream_from_provider(provider, messages, context, tools, hooks):
-                    yield chunk
+                    yield (chunk, iteration)
 
                 # Check for tool calls after streaming
                 # This is simplified - real implementation would parse during stream
@@ -139,7 +160,7 @@ class StreamingOrchestrator:
                     if not tool_calls:
                         # Stream the final response token by token
                         async for token in self._tokenize_stream(response.content):
-                            yield token
+                            yield (token, iteration)
 
                         # Build assistant message with thinking block if present
                         assistant_msg = {"role": "assistant", "content": response.content}
@@ -194,7 +215,7 @@ class StreamingOrchestrator:
 
                 except Exception as e:
                     logger.error(f"Provider error: {e}")
-                    yield f"\nError: {e}"
+                    yield (f"\nError: {e}", iteration)
                     break
 
             # Check compaction
