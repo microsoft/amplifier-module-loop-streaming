@@ -71,11 +71,9 @@ class StreamingOrchestrator:
         await hooks.emit(
             ORCHESTRATOR_COMPLETE,
             {
-                "data": {
-                    "orchestrator": "loop-streaming",
-                    "turn_count": iteration_count,
-                    "status": "success" if full_response else "incomplete",
-                }
+                "orchestrator": "loop-streaming",
+                "turn_count": iteration_count,
+                "status": "success" if full_response else "incomplete",
             },
         )
 
@@ -95,7 +93,7 @@ class StreamingOrchestrator:
         Yields tuples of (token, iteration) as they're generated.
         """
         # Emit and process prompt submit (allows hooks to inject context before processing)
-        result = await hooks.emit(PROMPT_SUBMIT, {"data": {"prompt": prompt}})
+        result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
         if coordinator:
             result = await coordinator.process_hook_result(result, "prompt:submit", "orchestrator")
             if result.action == "deny":
@@ -158,18 +156,14 @@ class StreamingOrchestrator:
                             await hooks.emit(
                                 CONTENT_BLOCK_START,
                                 {
-                                    "data": {
-                                        "block_type": block.type.value,
-                                        "block_index": idx,
-                                        "metadata": getattr(block, "raw", None),
-                                    }
+                                    "block_type": block.type.value,
+                                    "block_index": idx,
+                                    "metadata": getattr(block, "raw", None),
                                 },
                             )
 
                             # Emit block end with complete block
-                            await hooks.emit(
-                                CONTENT_BLOCK_END, {"data": {"block_index": idx, "block": block.to_dict()}}
-                            )
+                            await hooks.emit(CONTENT_BLOCK_END, {"block_index": idx, "block": block.to_dict()})
 
                     # Parse tool calls
                     tool_calls = provider.parse_tool_calls(response)
@@ -317,13 +311,9 @@ class StreamingOrchestrator:
             pre_result = await hooks.emit(
                 TOOL_PRE,
                 {
-                    "data": {
-                        "tool_name": tool_call.tool,
-                        "tool": tool_call.tool,
-                        "tool_input": tool_call.arguments,
-                        "args": tool_call.arguments,
-                        "parallel_group_id": parallel_group_id,
-                    }
+                    "tool_name": tool_call.tool,
+                    "tool_input": tool_call.arguments,
+                    "parallel_group_id": parallel_group_id,
                 },
             )
             if coordinator:
@@ -358,13 +348,10 @@ class StreamingOrchestrator:
             post_result = await hooks.emit(
                 TOOL_POST,
                 {
-                    "data": {
-                        "tool_name": tool_call.tool,
-                        "tool": tool_call.tool,
-                        "tool_input": tool_call.arguments,
-                        "result": result_data,
-                        "parallel_group_id": parallel_group_id,
-                    }
+                    "tool_name": tool_call.tool,
+                    "tool_input": tool_call.arguments,
+                    "result": result_data,
+                    "parallel_group_id": parallel_group_id,
                 },
             )
             if coordinator:
@@ -408,12 +395,8 @@ class StreamingOrchestrator:
             pre_result = await hooks.emit(
                 TOOL_PRE,
                 {
-                    "data": {
-                        "tool_name": tool_call.tool,
-                        "tool": tool_call.tool,
-                        "tool_input": tool_call.arguments,
-                        "args": tool_call.arguments,
-                    }
+                    "tool_name": tool_call.tool,
+                    "tool_input": tool_call.arguments,
                 },
             )
             if coordinator:
@@ -457,12 +440,9 @@ class StreamingOrchestrator:
             post_result = await hooks.emit(
                 TOOL_POST,
                 {
-                    "data": {
-                        "tool_name": tool_call.tool,
-                        "tool": tool_call.tool,
-                        "tool_input": tool_call.arguments,
-                        "result": result_data,
-                    }
+                    "tool_name": tool_call.tool,
+                    "tool_input": tool_call.arguments,
+                    "result": result_data,
                 },
             )
             if coordinator:
