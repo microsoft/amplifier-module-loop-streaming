@@ -16,6 +16,7 @@ from amplifier_core.events import CONTENT_BLOCK_END
 from amplifier_core.events import CONTENT_BLOCK_START
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
+from amplifier_core.events import PROVIDER_REQUEST
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
 
@@ -112,13 +113,32 @@ class StreamingOrchestrator:
             yield ("Error: No providers available", 0)
             return
 
+        # Find provider name for event emission
+        provider_name = None
+        for name, prov in providers.items():
+            if prov is provider:
+                provider_name = name
+                break
+
         iteration = 0
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            # Get messages
+            # Emit provider request BEFORE getting messages (allows hook injections)
+            result = await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration})
+            if coordinator:
+                result = await coordinator.process_hook_result(result, "provider:request", "orchestrator")
+                if result.action == "deny":
+                    yield (f"Operation denied: {result.reason}", iteration)
+                    return
+
+            # Get messages (includes permanent injections)
             messages = await context.get_messages()
+
+            # Append ephemeral injection if present (temporary, not stored)
+            if result.action == "inject_context" and result.ephemeral and result.context_injection:
+                messages.append({"role": result.context_injection_role, "content": result.context_injection})
 
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
