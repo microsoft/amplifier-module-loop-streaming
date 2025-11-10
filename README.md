@@ -43,9 +43,9 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 module = "loop-streaming"
 name = "streaming"
 config = {
-    buffer_size = 10,  # Tokens to buffer before flush
-    max_turns = 10,
-    timeout = 300
+    buffer_size = 10,           # Tokens to buffer before flush
+    max_iterations = -1,        # Maximum iterations (-1 = unlimited, default)
+    timeout = 300               # Timeout in seconds
 }
 ```
 

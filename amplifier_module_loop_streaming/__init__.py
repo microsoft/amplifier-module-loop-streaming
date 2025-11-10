@@ -40,7 +40,9 @@ class StreamingOrchestrator:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self.max_iterations = config.get("max_iterations", 50)
+        # -1 means unlimited iterations (default)
+        max_iter_config = config.get("max_iterations", -1)
+        self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
         self.stream_delay = config.get("stream_delay", 0.01)  # Artificial delay for demo
         self.extended_thinking = config.get("extended_thinking", False)
 
@@ -122,7 +124,7 @@ class StreamingOrchestrator:
 
         iteration = 0
 
-        while iteration < self.max_iterations:
+        while self.max_iterations == -1 or iteration < self.max_iterations:
             iteration += 1
 
             # Emit provider request BEFORE getting messages (allows hook injections)
@@ -255,6 +257,47 @@ class StreamingOrchestrator:
             if await context.should_compact():
                 await hooks.emit("context:pre-compact", {})
                 await context.compact()
+
+        # Check if we exceeded max iterations (only if not unlimited)
+        if self.max_iterations != -1 and iteration >= self.max_iterations:
+            logger.warning(f"Max iterations ({self.max_iterations}) reached")
+
+            # Inject system reminder to agent before returning
+            await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration, "max_reached": True})
+
+            # Get one final response with the reminder (via _execute_stream helper)
+            message_dicts = await context.get_messages()
+            message_dicts = list(message_dicts)
+            message_dicts.append(
+                {
+                    "role": "system",
+                    "content": """<system-reminder>
+You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
+</system-reminder>""",
+                }
+            )
+
+            try:
+                kwargs = {}
+                tools_list = list(tools.values()) if tools else []
+                if tools_list:
+                    kwargs["tools"] = tools_list
+                if self.extended_thinking:
+                    kwargs["extended_thinking"] = True
+
+                response = await provider.complete(message_dicts, **kwargs)
+                content = response.content if hasattr(response, "content") else str(response)
+
+                if content:
+                    # Yield the final response
+                    async for token in self._tokenize_stream(content):
+                        yield (token, iteration)
+
+                    # Add to context
+                    await context.add_message({"role": "assistant", "content": content})
+
+            except Exception as e:
+                logger.error(f"Error getting final response after max iterations: {e}")
 
         # Emit session end
         await hooks.emit("session:end", {})
