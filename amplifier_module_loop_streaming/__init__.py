@@ -29,16 +29,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     # Declare observable lifecycle events for this module
     # (hooks-logging will auto-discover and log these)
-    # Get existing list, extend, then re-register (aggregation pattern)
-    obs_events = coordinator.get_capability("observability.events") or []
-    obs_events.extend(
-        [
+    coordinator.register_contributor(
+        "observability.events",
+        "loop-streaming",
+        lambda: [
             "session:start",  # When session begins
             "session:end",  # When session completes
             "context:pre-compact",  # Before context compaction
-        ]
+        ],
     )
-    coordinator.register_capability("observability.events", obs_events)
 
     orchestrator = StreamingOrchestrator(config)
     await coordinator.mount("orchestrator", orchestrator)
