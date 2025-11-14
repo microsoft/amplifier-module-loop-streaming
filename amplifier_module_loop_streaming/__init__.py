@@ -204,12 +204,19 @@ class StreamingOrchestrator:
                     tool_calls = provider.parse_tool_calls(response)
 
                     if not tool_calls:
+                        # Extract text content from response
+                        # Use .text field if available (e.g., OpenAI provider), otherwise extract from content blocks
+                        if hasattr(response, "text") and response.text:
+                            response_text = response.text
+                        else:
+                            response_text = self._extract_text_from_content(response.content)
+
                         # Stream the final response token by token
-                        async for token in self._tokenize_stream(response.content):
+                        async for token in self._tokenize_stream(response_text):
                             yield (token, iteration)
 
                         # Build assistant message with thinking block if present
-                        assistant_msg = {"role": "assistant", "content": response.content}
+                        assistant_msg = {"role": "assistant", "content": response_text}
 
                         # Preserve thinking blocks for Anthropic extended thinking
                         if content_blocks:
@@ -223,9 +230,15 @@ class StreamingOrchestrator:
                         break
 
                     # Add assistant message with tool calls and thinking block
+                    # Extract text content from response
+                    if hasattr(response, "text") and response.text:
+                        response_text = response.text
+                    else:
+                        response_text = self._extract_text_from_content(response.content) if response.content else ""
+
                     assistant_msg = {
                         "role": "assistant",
-                        "content": response.content if response.content else "",
+                        "content": response_text,
                         "tool_calls": [{"id": tc.id, "tool": tc.tool, "arguments": tc.arguments} for tc in tool_calls],
                     }
 
@@ -334,6 +347,31 @@ You have reached the maximum number of iterations for this turn. Please provide 
         # Add complete message to context
         if full_response:
             await context.add_message({"role": "assistant", "content": full_response})
+
+    def _extract_text_from_content(self, content) -> str:
+        """Extract text from content blocks.
+
+        Args:
+            content: Either a string or list of ContentBlock objects
+
+        Returns:
+            Extracted text as string
+        """
+        if isinstance(content, str):
+            return content
+
+        if not content:
+            return ""
+
+        # Extract text from content blocks
+        text_parts = []
+        for block in content:
+            if hasattr(block, "text"):
+                text_parts.append(block.text)
+            elif hasattr(block, "thinking"):
+                text_parts.append(block.thinking)
+
+        return "\n\n".join(text_parts)
 
     async def _tokenize_stream(self, text: str) -> AsyncIterator[str]:
         """
