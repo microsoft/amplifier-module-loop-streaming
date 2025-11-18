@@ -153,7 +153,28 @@ class StreamingOrchestrator:
 
             # Append ephemeral injection if present (temporary, not stored)
             if result.action == "inject_context" and result.ephemeral and result.context_injection:
-                messages.append({"role": result.context_injection_role, "content": result.context_injection})
+                # Check if we should append to last tool result
+                if result.append_to_last_tool_result and len(messages) > 0:
+                    last_msg = messages[-1]
+                    # Append to last message if it's a tool result
+                    if last_msg.get("role") == "tool":
+                        # Append to existing content
+                        original_content = last_msg.get("content", "")
+                        messages[-1] = {
+                            **last_msg,
+                            "content": f"{original_content}\n\n{result.context_injection}",
+                        }
+                        logger.debug("Appended ephemeral injection to last tool result message")
+                    else:
+                        # Fall back to new message if last message isn't a tool result
+                        messages.append({"role": result.context_injection_role, "content": result.context_injection})
+                        logger.debug(
+                            f"Last message role is '{last_msg.get('role')}', not 'tool' - "
+                            "created new message for injection"
+                        )
+                else:
+                    # Default behavior: append as new message
+                    messages.append({"role": result.context_injection_role, "content": result.context_injection})
 
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
