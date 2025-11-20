@@ -19,6 +19,9 @@ from amplifier_core.events import PROMPT_SUBMIT
 from amplifier_core.events import PROVIDER_REQUEST
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
+from amplifier_core.message_models import ChatRequest
+from amplifier_core.message_models import Message
+from amplifier_core.message_models import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -149,37 +152,55 @@ class StreamingOrchestrator:
                     return
 
             # Get messages (includes permanent injections)
-            messages = await context.get_messages()
+            message_dicts = await context.get_messages()
+            message_dicts = list(message_dicts)  # Convert to list for modification
 
             # Append ephemeral injection if present (temporary, not stored)
             if result.action == "inject_context" and result.ephemeral and result.context_injection:
                 # Check if we should append to last tool result
-                if result.append_to_last_tool_result and len(messages) > 0:
-                    last_msg = messages[-1]
+                if result.append_to_last_tool_result and len(message_dicts) > 0:
+                    last_msg = message_dicts[-1]
                     # Append to last message if it's a tool result
                     if last_msg.get("role") == "tool":
                         # Append to existing content
                         original_content = last_msg.get("content", "")
-                        messages[-1] = {
+                        message_dicts[-1] = {
                             **last_msg,
                             "content": f"{original_content}\n\n{result.context_injection}",
                         }
                         logger.debug("Appended ephemeral injection to last tool result message")
                     else:
                         # Fall back to new message if last message isn't a tool result
-                        messages.append({"role": result.context_injection_role, "content": result.context_injection})
+                        message_dicts.append(
+                            {"role": result.context_injection_role, "content": result.context_injection}
+                        )
                         logger.debug(
                             f"Last message role is '{last_msg.get('role')}', not 'tool' - "
                             "created new message for injection"
                         )
                 else:
                     # Default behavior: append as new message
-                    messages.append({"role": result.context_injection_role, "content": result.context_injection})
+                    message_dicts.append({"role": result.context_injection_role, "content": result.context_injection})
+
+            # Convert dicts to ChatRequest for provider
+            messages_objects = [Message(**msg) for msg in message_dicts]
+
+            # Convert tools to ToolSpec format for ChatRequest
+            tools_list = None
+            if tools:
+                tools_list = [
+                    ToolSpec(name=t.name, description=t.description, parameters=t.input_schema) for t in tools.values()
+                ]
+
+            chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
+            logger.info(f"[ORCHESTRATOR] ChatRequest created with {len(tools_list) if tools_list else 0} tools")
+            if tools_list:
+                logger.debug(f"[ORCHESTRATOR] Tool names: {[t.name for t in tools_list]}")
 
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
                 # Use streaming if available
-                async for chunk in self._stream_from_provider(provider, messages, context, tools, hooks):
+                async for chunk in self._stream_from_provider(provider, chat_request, context, tools, hooks):
                     yield (chunk, iteration)
 
                 # Check for tool calls after streaming
@@ -194,15 +215,11 @@ class StreamingOrchestrator:
             else:
                 # Fallback to non-streaming
                 try:
-                    # Convert tools dict to list for provider
-                    tools_list = list(tools.values()) if tools else []
                     # Build kwargs for provider
                     kwargs = {}
-                    if tools_list:
-                        kwargs["tools"] = tools_list
                     if self.extended_thinking:
                         kwargs["extended_thinking"] = True
-                    response = await provider.complete(messages, **kwargs)
+                    response = await provider.complete(chat_request, **kwargs)
 
                     # Emit content block events if present
                     content_blocks = getattr(response, "content_blocks", None)
@@ -260,7 +277,7 @@ class StreamingOrchestrator:
                     assistant_msg = {
                         "role": "assistant",
                         "content": response_text,
-                        "tool_calls": [{"id": tc.id, "tool": tc.tool, "arguments": tc.arguments} for tc in tool_calls],
+                        "tool_calls": [{"id": tc.id, "tool": tc.name, "arguments": tc.arguments} for tc in tool_calls],
                     }
 
                     # Preserve thinking blocks for Anthropic extended thinking
@@ -325,14 +342,24 @@ You have reached the maximum number of iterations for this turn. Please provide 
             )
 
             try:
+                # Convert dicts to ChatRequest
+                messages_objects = [Message(**msg) for msg in message_dicts]
+
+                # Convert tools to ToolSpec format for ChatRequest
+                tools_list = None
+                if tools:
+                    tools_list = [
+                        ToolSpec(name=t.name, description=t.description, parameters=t.input_schema)
+                        for t in tools.values()
+                    ]
+
+                max_iter_chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
+
                 kwargs = {}
-                tools_list = list(tools.values()) if tools else []
-                if tools_list:
-                    kwargs["tools"] = tools_list
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
 
-                response = await provider.complete(message_dicts, **kwargs)
+                response = await provider.complete(max_iter_chat_request, **kwargs)
                 content = response.content if hasattr(response, "content") else str(response)
 
                 if content:
@@ -349,7 +376,7 @@ You have reached the maximum number of iterations for this turn. Please provide 
         # Emit session end
         await hooks.emit("session:end", {})
 
-    async def _stream_from_provider(self, provider, messages, context, tools, hooks) -> AsyncIterator[str]:
+    async def _stream_from_provider(self, provider, chat_request, context, tools, hooks) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming."""
         # This is a simplified example
         # Real implementation would handle streaming tool calls
@@ -358,7 +385,7 @@ You have reached the maximum number of iterations for this turn. Please provide 
 
         # Convert tools dict to list for provider
         tools_list = list(tools.values()) if tools else []
-        async for chunk in provider.stream(messages, tools=tools_list):
+        async for chunk in provider.stream(chat_request, tools=tools_list):
             token = chunk.get("content", "")
             if token:
                 yield token
@@ -446,24 +473,24 @@ You have reached the maximum number of iterations for this turn. Please provide 
             pre_result = await hooks.emit(
                 TOOL_PRE,
                 {
-                    "tool_name": tool_call.tool,
+                    "tool_name": tool_call.name,
                     "tool_input": tool_call.arguments,
                     "parallel_group_id": parallel_group_id,
                 },
             )
             if coordinator:
-                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.tool)
+                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.name)
                 if pre_result.action == "deny":
                     return (tool_call.id, f"Denied by hook: {pre_result.reason}")
 
             # Get tool
-            tool = tools.get(tool_call.tool)
+            tool = tools.get(tool_call.name)
             if not tool:
-                error_msg = f"Error: Tool '{tool_call.tool}' not found"
+                error_msg = f"Error: Tool '{tool_call.name}' not found"
                 await hooks.emit(
                     "tool:error",
                     {
-                        "tool": tool_call.tool,
+                        "tool": tool_call.name,
                         "error": {"type": "RuntimeError", "msg": error_msg},
                         "parallel_group_id": parallel_group_id,
                     },
@@ -483,14 +510,14 @@ You have reached the maximum number of iterations for this turn. Please provide 
             post_result = await hooks.emit(
                 TOOL_POST,
                 {
-                    "tool_name": tool_call.tool,
+                    "tool_name": tool_call.name,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
                     "parallel_group_id": parallel_group_id,
                 },
             )
             if coordinator:
-                await coordinator.process_hook_result(post_result, "tool:post", tool_call.tool)
+                await coordinator.process_hook_result(post_result, "tool:post", tool_call.name)
 
             # Return result content
             content = str(result.output) if result.success else f"Error: {result.error}"
@@ -498,12 +525,12 @@ You have reached the maximum number of iterations for this turn. Please provide 
 
         except Exception as e:
             # Safety net: errors become error messages
-            logger.error(f"Tool {tool_call.tool} failed: {e}")
+            logger.error(f"Tool {tool_call.name} failed: {e}")
             error_msg = f"Internal error executing tool: {str(e)}"
             await hooks.emit(
                 "tool:error",
                 {
-                    "tool": tool_call.tool,
+                    "tool": tool_call.name,
                     "error": {"type": type(e).__name__, "msg": str(e)},
                     "parallel_group_id": parallel_group_id,
                 },
@@ -530,12 +557,12 @@ You have reached the maximum number of iterations for this turn. Please provide 
             pre_result = await hooks.emit(
                 TOOL_PRE,
                 {
-                    "tool_name": tool_call.tool,
+                    "tool_name": tool_call.name,
                     "tool_input": tool_call.arguments,
                 },
             )
             if coordinator:
-                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.tool)
+                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.name)
                 if pre_result.action == "deny":
                     # Add tool_result message (not system) so Anthropic API accepts it
                     await context.add_message(
@@ -549,14 +576,14 @@ You have reached the maximum number of iterations for this turn. Please provide 
                     return {"success": False, "error": f"Denied: {pre_result.reason}"}
 
             # Get tool
-            tool = tools.get(tool_call.tool)
+            tool = tools.get(tool_call.name)
             if not tool:
                 # Add tool_result message (not system) so Anthropic API accepts it
                 await context.add_message(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": f"Error: Tool '{tool_call.tool}' not found",
+                        "content": f"Error: Tool '{tool_call.name}' not found",
                     }
                 )
                 response_added = True
@@ -575,19 +602,19 @@ You have reached the maximum number of iterations for this turn. Please provide 
             post_result = await hooks.emit(
                 TOOL_POST,
                 {
-                    "tool_name": tool_call.tool,
+                    "tool_name": tool_call.name,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
                 },
             )
             if coordinator:
-                await coordinator.process_hook_result(post_result, "tool:post", tool_call.tool)
+                await coordinator.process_hook_result(post_result, "tool:post", tool_call.name)
 
             # Add result with tool_call_id
             await context.add_message(
                 {
                     "role": "tool",
-                    "name": tool_call.tool,
+                    "name": tool_call.name,
                     "tool_call_id": tool_call.id,
                     "content": str(result.output) if result.success else f"Error: {result.error}",
                 }
@@ -598,7 +625,7 @@ You have reached the maximum number of iterations for this turn. Please provide 
 
         except Exception as e:
             # Safety net: Ensure a tool response is ALWAYS added to prevent orphaned tool calls
-            logger.error(f"Unexpected error executing tool {tool_call.tool}: {e}", exc_info=True)
+            logger.error(f"Unexpected error executing tool {tool_call.name}: {e}", exc_info=True)
 
             if not response_added:
                 try:
