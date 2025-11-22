@@ -242,7 +242,7 @@ class StreamingOrchestrator:
                     tool_calls = provider.parse_tool_calls(response)
 
                     if not tool_calls:
-                        # Extract text content from response
+                        # Extract text content from response for streaming
                         # Use .text field if available (e.g., OpenAI provider), otherwise extract from content blocks
                         if hasattr(response, "text") and response.text:
                             response_text = response.text
@@ -253,10 +253,30 @@ class StreamingOrchestrator:
                         async for token in self._tokenize_stream(response_text):
                             yield (token, iteration)
 
-                        # Build assistant message with thinking block if present
-                        assistant_msg = {"role": "assistant", "content": response_text}
+                        # Store structured content from response.content (our Pydantic models)
+                        # This preserves reasoning state, thinking blocks, etc.
+                        # response.content = list of our ContentBlock models (TextBlock, ThinkingBlock, etc.)
+                        # response.content_blocks = raw SDK objects (for streaming events only)
+                        response_content = getattr(response, "content", None)
+                        if response_content and isinstance(response_content, list):
+                            # Convert ContentBlock objects to dicts for serialization
+                            content_dicts = [
+                                block.model_dump() if hasattr(block, "model_dump") else block
+                                for block in response_content
+                            ]
+                            logger.info(f"[ORCHESTRATOR] Storing {len(content_dicts)} content blocks")
+                            for i, block_dict in enumerate(content_dicts):
+                                logger.info(
+                                    f"[ORCHESTRATOR]   Block {i}: type={block_dict.get('type')}, has_content={'content' in block_dict}"
+                                )
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": content_dicts,
+                            }
+                        else:
+                            assistant_msg = {"role": "assistant", "content": response_text}
 
-                        # Preserve thinking blocks for Anthropic extended thinking
+                        # Preserve thinking blocks for Anthropic extended thinking (backward compat)
                         if content_blocks:
                             for block in content_blocks:
                                 if hasattr(block, "type") and block.type.value == "thinking":
@@ -264,29 +284,56 @@ class StreamingOrchestrator:
                                     assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
                                     break
 
+                        # Preserve provider metadata (provider-agnostic passthrough)
+                        # This enables providers to maintain state across steps (e.g., OpenAI reasoning items)
+                        if hasattr(response, "metadata") and response.metadata:
+                            assistant_msg["metadata"] = response.metadata
+
                         await context.add_message(assistant_msg)
                         break
 
-                    # Add assistant message with tool calls and thinking block
-                    # Extract text content from response
+                    # Add assistant message with tool calls
+                    # Store structured content blocks (preserves reasoning state, thinking blocks, etc.)
+                    # Extract text for display/logging only
                     if hasattr(response, "text") and response.text:
                         response_text = response.text
                     else:
                         response_text = self._extract_text_from_content(response.content) if response.content else ""
 
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": response_text,
-                        "tool_calls": [{"id": tc.id, "tool": tc.name, "arguments": tc.arguments} for tc in tool_calls],
-                    }
+                    # Store structured content from response.content (our Pydantic models)
+                    response_content = getattr(response, "content", None)
+                    if response_content and isinstance(response_content, list):
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": [
+                                block.model_dump() if hasattr(block, "model_dump") else block
+                                for block in response_content
+                            ],
+                            "tool_calls": [
+                                {"id": tc.id, "tool": tc.name, "arguments": tc.arguments} for tc in tool_calls
+                            ],
+                        }
+                    else:
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": response_text,
+                            "tool_calls": [
+                                {"id": tc.id, "tool": tc.name, "arguments": tc.arguments} for tc in tool_calls
+                            ],
+                        }
 
-                    # Preserve thinking blocks for Anthropic extended thinking
+                    # Preserve thinking blocks for Anthropic extended thinking (backward compat)
                     if content_blocks:
                         for block in content_blocks:
                             if hasattr(block, "type") and block.type.value == "thinking":
                                 # Store the raw thinking block to preserve signature
                                 assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
                                 break
+
+                    # Preserve provider metadata (provider-agnostic passthrough)
+                    # This enables providers to maintain state across steps (e.g., OpenAI reasoning items)
+                    if hasattr(response, "metadata") and response.metadata:
+                        assistant_msg["metadata"] = response.metadata
 
                     await context.add_message(assistant_msg)
 
@@ -412,12 +459,16 @@ You have reached the maximum number of iterations for this turn. Please provide 
             return ""
 
         # Extract text from content blocks
+        # NOTE: Only extract from TextBlock, NOT ThinkingBlock
+        # Thinking blocks have visibility="internal" and are rendered separately in the UI
+        # Including them here causes thinking text to appear in main response (duplication)
         text_parts = []
         for block in content:
             if hasattr(block, "text"):
                 text_parts.append(block.text)
-            elif hasattr(block, "thinking"):
-                text_parts.append(block.thinking)
+            # Skip thinking blocks - they're rendered separately
+            # elif hasattr(block, "thinking"):
+            #     text_parts.append(block.thinking)
 
         return "\n\n".join(text_parts)
 
