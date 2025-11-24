@@ -235,8 +235,11 @@ class StreamingOrchestrator:
                                 },
                             )
 
-                            # Emit block end with complete block
-                            await hooks.emit(CONTENT_BLOCK_END, {"block_index": idx, "block": block.to_dict()})
+                            # Emit block end with complete block and usage
+                            event_data = {"block_index": idx, "block": block.to_dict()}
+                            if response.usage:
+                                event_data["usage"] = response.usage.model_dump()
+                            await hooks.emit(CONTENT_BLOCK_END, event_data)
 
                     # Parse tool calls
                     tool_calls = provider.parse_tool_calls(response)
