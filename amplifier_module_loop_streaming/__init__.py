@@ -224,6 +224,7 @@ class StreamingOrchestrator:
                     # Emit content block events if present
                     content_blocks = getattr(response, "content_blocks", None)
                     if content_blocks:
+                        total_blocks = len(content_blocks)
                         for idx, block in enumerate(content_blocks):
                             # Emit block start
                             await hooks.emit(
@@ -231,12 +232,17 @@ class StreamingOrchestrator:
                                 {
                                     "block_type": block.type.value,
                                     "block_index": idx,
+                                    "total_blocks": total_blocks,
                                     "metadata": getattr(block, "raw", None),
                                 },
                             )
 
-                            # Emit block end with complete block and usage
-                            event_data = {"block_index": idx, "block": block.to_dict()}
+                            # Emit block end with complete block, usage, and total count
+                            event_data = {
+                                "block_index": idx,
+                                "total_blocks": total_blocks,
+                                "block": block.to_dict(),
+                            }
                             if response.usage:
                                 event_data["usage"] = response.usage.model_dump()
                             await hooks.emit(CONTENT_BLOCK_END, event_data)
