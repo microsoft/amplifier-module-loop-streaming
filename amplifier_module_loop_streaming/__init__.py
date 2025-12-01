@@ -286,11 +286,12 @@ class StreamingOrchestrator:
                             assistant_msg = {"role": "assistant", "content": response_text}
 
                         # Preserve thinking blocks for Anthropic extended thinking (backward compat)
-                        if content_blocks:
-                            for block in content_blocks:
-                                if hasattr(block, "type") and block.type.value == "thinking":
-                                    # Store the raw thinking block to preserve signature
-                                    assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
+                        # Extract from response.content (Pydantic models) instead of content_blocks (streaming objects)
+                        if response_content:
+                            for block in response_content:
+                                if hasattr(block, "type") and block.type == "thinking":
+                                    # Store the full thinking block with signature
+                                    assistant_msg["thinking_block"] = block.model_dump()
                                     break
 
                         # Preserve provider metadata (provider-agnostic passthrough)
@@ -332,11 +333,12 @@ class StreamingOrchestrator:
                         }
 
                     # Preserve thinking blocks for Anthropic extended thinking (backward compat)
-                    if content_blocks:
-                        for block in content_blocks:
-                            if hasattr(block, "type") and block.type.value == "thinking":
-                                # Store the raw thinking block to preserve signature
-                                assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
+                    # Extract from response.content (Pydantic models) instead of content_blocks (streaming objects)
+                    if response_content:
+                        for block in response_content:
+                            if hasattr(block, "type") and block.type == "thinking":
+                                # Store the full thinking block with signature
+                                assistant_msg["thinking_block"] = block.model_dump()
                                 break
 
                     # Preserve provider metadata (provider-agnostic passthrough)
