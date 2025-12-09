@@ -3,6 +3,9 @@ Streaming orchestrator module for Amplifier.
 Provides token-by-token streaming responses.
 """
 
+# Amplifier module metadata
+__amplifier_module_type__ = "orchestrator"
+
 import asyncio
 import logging
 from collections.abc import AsyncIterator
