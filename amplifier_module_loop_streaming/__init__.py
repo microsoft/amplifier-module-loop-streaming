@@ -288,23 +288,12 @@ class StreamingOrchestrator:
                         else:
                             assistant_msg = {"role": "assistant", "content": response_text}
 
-                        # Preserve thinking blocks for Anthropic extended thinking
-                        # Extract from response.content (ThinkingBlock pydantic models with signature)
-                        # NOT from content_blocks (ThinkingContent without raw populated)
-                        if response_content:
-                            for block in response_content:
-                                # Handle both Literal types (ThinkingBlock.type == "thinking")
-                                # and enum types (ContentBlockType.THINKING.value == "thinking")
-                                block_type = getattr(block, "type", None)
-                                is_thinking = block_type == "thinking" or (
-                                    block_type is not None
-                                    and hasattr(block_type, "value")
-                                    and block_type.value == "thinking"
-                                )
-                                if is_thinking:
-                                    assistant_msg["thinking_block"] = (
-                                        block.model_dump() if hasattr(block, "model_dump") else None
-                                    )
+                        # Preserve thinking blocks for Anthropic extended thinking (backward compat)
+                        if content_blocks:
+                            for block in content_blocks:
+                                if hasattr(block, "type") and block.type.value == "thinking":
+                                    # Store the raw thinking block to preserve signature
+                                    assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
                                     break
 
                         # Preserve provider metadata (provider-agnostic passthrough)
@@ -345,23 +334,12 @@ class StreamingOrchestrator:
                             ],
                         }
 
-                    # Preserve thinking blocks for Anthropic extended thinking
-                    # Extract from response.content (ThinkingBlock pydantic models with signature)
-                    # NOT from content_blocks (ThinkingContent without raw populated)
-                    if response_content:
-                        for block in response_content:
-                            # Handle both Literal types (ThinkingBlock.type == "thinking")
-                            # and enum types (ContentBlockType.THINKING.value == "thinking")
-                            block_type = getattr(block, "type", None)
-                            is_thinking = block_type == "thinking" or (
-                                block_type is not None
-                                and hasattr(block_type, "value")
-                                and block_type.value == "thinking"
-                            )
-                            if is_thinking:
-                                assistant_msg["thinking_block"] = (
-                                    block.model_dump() if hasattr(block, "model_dump") else None
-                                )
+                    # Preserve thinking blocks for Anthropic extended thinking (backward compat)
+                    if content_blocks:
+                        for block in content_blocks:
+                            if hasattr(block, "type") and block.type.value == "thinking":
+                                # Store the raw thinking block to preserve signature
+                                assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
                                 break
 
                     # Preserve provider metadata (provider-agnostic passthrough)
