@@ -289,11 +289,16 @@ class StreamingOrchestrator:
                             assistant_msg = {"role": "assistant", "content": response_text}
 
                         # Preserve thinking blocks for Anthropic extended thinking (backward compat)
-                        if content_blocks:
-                            for block in content_blocks:
-                                if hasattr(block, "type") and block.type.value == "thinking":
-                                    # Store the raw thinking block to preserve signature
-                                    assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
+                        # Use response_content (our Pydantic models) not content_blocks (raw SDK objects)
+                        if response_content and isinstance(response_content, list):
+                            for block in response_content:
+                                block_type = getattr(block, "type", None)
+                                type_value = getattr(block_type, "value", block_type) if block_type else None
+                                if type_value == "thinking":
+                                    # Store the thinking block as dict to preserve signature
+                                    assistant_msg["thinking_block"] = (
+                                        block.model_dump() if hasattr(block, "model_dump") else None
+                                    )
                                     break
 
                         # Preserve provider metadata (provider-agnostic passthrough)
@@ -335,11 +340,16 @@ class StreamingOrchestrator:
                         }
 
                     # Preserve thinking blocks for Anthropic extended thinking (backward compat)
-                    if content_blocks:
-                        for block in content_blocks:
-                            if hasattr(block, "type") and block.type.value == "thinking":
-                                # Store the raw thinking block to preserve signature
-                                assistant_msg["thinking_block"] = block.raw if hasattr(block, "raw") else None
+                    # Use response_content (our Pydantic models) not content_blocks (raw SDK objects)
+                    if response_content and isinstance(response_content, list):
+                        for block in response_content:
+                            block_type = getattr(block, "type", None)
+                            type_value = getattr(block_type, "value", block_type) if block_type else None
+                            if type_value == "thinking":
+                                # Store the thinking block as dict to preserve signature
+                                assistant_msg["thinking_block"] = (
+                                    block.model_dump() if hasattr(block, "model_dump") else None
+                                )
                                 break
 
                     # Preserve provider metadata (provider-agnostic passthrough)
