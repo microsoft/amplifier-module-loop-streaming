@@ -371,6 +371,12 @@ class StreamingOrchestrator:
                     ]
                     tool_results = await asyncio.gather(*tool_tasks)
 
+                    # Check compaction BEFORE adding tool results (not during)
+                    # This prevents compaction mid-batch which can orphan tool_use messages
+                    if await context.should_compact():
+                        await hooks.emit("context:pre-compact", {})
+                        await context.compact()
+
                     # Add all results to context in original order (sequential, deterministic)
                     for tool_call_id, content in tool_results:
                         await context.add_message(
