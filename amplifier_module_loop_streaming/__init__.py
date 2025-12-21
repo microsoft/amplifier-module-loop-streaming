@@ -146,6 +146,11 @@ class StreamingOrchestrator:
         while self.max_iterations == -1 or iteration < self.max_iterations:
             iteration += 1
 
+            # Check compaction at START of iteration to ensure room for provider response
+            if await context.should_compact():
+                await hooks.emit("context:pre-compact", {})
+                await context.compact()
+
             # Emit provider request BEFORE getting messages (allows hook injections)
             result = await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration})
             if coordinator:
