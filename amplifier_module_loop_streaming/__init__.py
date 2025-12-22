@@ -41,7 +41,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         lambda: [
             "session:start",  # When session begins
             "session:end",  # When session completes
-            "context:pre-compact",  # Before context compaction
         ],
     )
 
@@ -146,11 +145,6 @@ class StreamingOrchestrator:
         while self.max_iterations == -1 or iteration < self.max_iterations:
             iteration += 1
 
-            # Check compaction at START of iteration to ensure room for provider response
-            if await context.should_compact():
-                await hooks.emit("context:pre-compact", {})
-                await context.compact()
-
             # Emit provider request BEFORE getting messages (allows hook injections)
             result = await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration})
             if coordinator:
@@ -159,8 +153,8 @@ class StreamingOrchestrator:
                     yield (f"Operation denied: {result.reason}", iteration)
                     return
 
-            # Get messages (includes permanent injections)
-            message_dicts = await context.get_messages()
+            # Get messages for LLM request (context handles compaction internally)
+            message_dicts = await context.get_messages_for_request()
             message_dicts = list(message_dicts)  # Convert to list for modification
 
             # Append ephemeral injection if present (temporary, not stored)
@@ -376,13 +370,8 @@ class StreamingOrchestrator:
                     ]
                     tool_results = await asyncio.gather(*tool_tasks)
 
-                    # Check compaction BEFORE adding tool results (not during)
-                    # This prevents compaction mid-batch which can orphan tool_use messages
-                    if await context.should_compact():
-                        await hooks.emit("context:pre-compact", {})
-                        await context.compact()
-
                     # Add all results to context in original order (sequential, deterministic)
+                    # Note: Context manager handles compaction internally when get_messages_for_request() is called
                     for tool_call_id, content in tool_results:
                         await context.add_message(
                             {
@@ -397,11 +386,6 @@ class StreamingOrchestrator:
                     yield (f"\nError: {e}", iteration)
                     break
 
-            # Check compaction
-            if await context.should_compact():
-                await hooks.emit("context:pre-compact", {})
-                await context.compact()
-
         # Check if we exceeded max iterations (only if not unlimited)
         if self.max_iterations != -1 and iteration >= self.max_iterations:
             logger.warning(f"Max iterations ({self.max_iterations}) reached")
@@ -410,7 +394,7 @@ class StreamingOrchestrator:
             await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration, "max_reached": True})
 
             # Get one final response with the reminder (via _execute_stream helper)
-            message_dicts = await context.get_messages()
+            message_dicts = await context.get_messages_for_request()
             message_dicts = list(message_dicts)
             message_dicts.append(
                 {
