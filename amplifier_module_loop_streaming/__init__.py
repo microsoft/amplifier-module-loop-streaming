@@ -154,7 +154,8 @@ class StreamingOrchestrator:
                     return
 
             # Get messages for LLM request (context handles compaction internally)
-            message_dicts = await context.get_messages_for_request()
+            # Pass provider for dynamic budget calculation based on model's context window
+            message_dicts = await context.get_messages_for_request(provider=provider)
             message_dicts = list(message_dicts)  # Convert to list for modification
 
             # Append ephemeral injection if present (temporary, not stored)
@@ -394,7 +395,7 @@ class StreamingOrchestrator:
             await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration, "max_reached": True})
 
             # Get one final response with the reminder (via _execute_stream helper)
-            message_dicts = await context.get_messages_for_request()
+            message_dicts = await context.get_messages_for_request(provider=provider)
             message_dicts = list(message_dicts)
             message_dicts.append(
                 {
