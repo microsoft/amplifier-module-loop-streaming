@@ -499,8 +499,15 @@ You have reached the maximum number of iterations for this turn. Please provide 
         lines = text.split("\n")
 
         for line_idx, line in enumerate(lines):
-            # Split line into words
-            words = line.split()
+            # Preserve leading whitespace (critical for code block indentation)
+            stripped = line.lstrip()
+            leading_ws = line[: len(line) - len(stripped)]
+
+            if leading_ws:
+                yield leading_ws
+
+            # Split remaining content into words (split() on stripped line)
+            words = stripped.split()
 
             # Yield words with spaces
             for word_idx, word in enumerate(words):
