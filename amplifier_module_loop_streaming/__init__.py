@@ -383,8 +383,10 @@ class StreamingOrchestrator:
                         )
 
                 except Exception as e:
-                    logger.error(f"Provider error: {e}")
-                    yield (f"\nError: {e}", iteration)
+                    # Ensure error message is never empty (TimeoutError has empty str())
+                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
+                    logger.error(f"Provider error: {error_msg}")
+                    yield (f"\nError: {error_msg}", iteration)
                     break
 
         # Check if we exceeded max iterations (only if not unlimited)
