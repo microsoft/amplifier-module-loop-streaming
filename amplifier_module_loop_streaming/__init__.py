@@ -20,6 +20,7 @@ from amplifier_core.events import CONTENT_BLOCK_START
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
 from amplifier_core.events import PROVIDER_REQUEST
+from amplifier_core.events import TOOL_ERROR
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
 from amplifier_core.message_models import ChatRequest
@@ -552,6 +553,7 @@ You have reached the maximum number of iterations for this turn. Please provide 
                 TOOL_PRE,
                 {
                     "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "parallel_group_id": parallel_group_id,
                 },
@@ -566,9 +568,10 @@ You have reached the maximum number of iterations for this turn. Please provide 
             if not tool:
                 error_msg = f"Error: Tool '{tool_call.name}' not found"
                 await hooks.emit(
-                    "tool:error",
+                    TOOL_ERROR,
                     {
-                        "tool": tool_call.name,
+                        "tool_name": tool_call.name,
+                        "tool_call_id": tool_call.id,
                         "error": {"type": "RuntimeError", "msg": error_msg},
                         "parallel_group_id": parallel_group_id,
                     },
@@ -589,6 +592,7 @@ You have reached the maximum number of iterations for this turn. Please provide 
                 TOOL_POST,
                 {
                     "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
                     "parallel_group_id": parallel_group_id,
@@ -606,9 +610,10 @@ You have reached the maximum number of iterations for this turn. Please provide 
             logger.error(f"Tool {tool_call.name} failed: {e}")
             error_msg = f"Internal error executing tool: {str(e)}"
             await hooks.emit(
-                "tool:error",
+                TOOL_ERROR,
                 {
-                    "tool": tool_call.name,
+                    "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
                     "error": {"type": type(e).__name__, "msg": str(e)},
                     "parallel_group_id": parallel_group_id,
                 },
@@ -636,6 +641,7 @@ You have reached the maximum number of iterations for this turn. Please provide 
                 TOOL_PRE,
                 {
                     "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                 },
             )
@@ -681,6 +687,7 @@ You have reached the maximum number of iterations for this turn. Please provide 
                 TOOL_POST,
                 {
                     "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
                 },
