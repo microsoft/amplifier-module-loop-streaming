@@ -8,6 +8,7 @@ __amplifier_module_type__ = "orchestrator"
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 from typing import Optional
@@ -495,29 +496,27 @@ You have reached the maximum number of iterations for this turn. Please provide 
 
     async def _tokenize_stream(self, text: str) -> AsyncIterator[str]:
         """
-        Simulate token-by-token streaming from complete text while preserving newlines.
+        Simulate token-by-token streaming from complete text while preserving whitespace.
         In production, this would be real streaming from the provider.
+
+        Preserves:
+        - Leading whitespace (critical for code block indentation)
+        - Multiple consecutive spaces (critical for ASCII art alignment)
+        - Newlines between lines
         """
-        # Split by lines first to preserve newlines
         lines = text.split("\n")
 
         for line_idx, line in enumerate(lines):
-            # Preserve leading whitespace (critical for code block indentation)
-            stripped = line.lstrip()
-            leading_ws = line[: len(line) - len(stripped)]
+            # Split into tokens while PRESERVING all whitespace runs
+            # \S+ matches non-whitespace sequences, \s+ matches whitespace sequences
+            # This ensures multiple spaces are preserved (e.g., for ASCII art tables)
+            tokens = re.findall(r"\S+|\s+", line)
 
-            if leading_ws:
-                yield leading_ws
-
-            # Split remaining content into words (split() on stripped line)
-            words = stripped.split()
-
-            # Yield words with spaces
-            for word_idx, word in enumerate(words):
-                if word_idx > 0:
-                    yield " "
-                yield word
-                await asyncio.sleep(self.stream_delay)
+            for token in tokens:
+                yield token
+                # Only delay on non-whitespace tokens for natural streaming effect
+                if token.strip():
+                    await asyncio.sleep(self.stream_delay)
 
             # Yield newline after each line except the last
             if line_idx < len(lines) - 1:
