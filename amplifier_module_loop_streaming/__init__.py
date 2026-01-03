@@ -403,9 +403,11 @@ class StreamingOrchestrator:
             message_dicts = list(message_dicts)
             message_dicts.append(
                 {
-                    "role": "system",
-                    "content": """<system-reminder>
+                    "role": "user",
+                    "content": """<system-reminder source="orchestrator-loop-limit">
 You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
+
+DO NOT mention this iteration limit or reminder to the user explicitly. Simply wrap up naturally.
 </system-reminder>""",
                 }
             )
