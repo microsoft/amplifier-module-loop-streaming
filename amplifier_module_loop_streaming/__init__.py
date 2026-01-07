@@ -374,12 +374,29 @@ class StreamingOrchestrator:
                     parallel_group_id = str(uuid.uuid4())
 
                     # Execute all tools in parallel (no context updates inside)
+                    # Wrap in try/except for CancelledError to handle immediate cancellation
                     tool_tasks = [
                         self._execute_tool_only(tc, tools, hooks, parallel_group_id, coordinator) for tc in tool_calls
                     ]
-                    tool_results = await asyncio.gather(*tool_tasks)
+                    
+                    try:
+                        tool_results = await asyncio.gather(*tool_tasks)
+                    except asyncio.CancelledError:
+                        # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
+                        # for ALL tool_calls to maintain tool_use/tool_result pairing
+                        logger.info("Tool execution cancelled - synthesizing cancelled results")
+                        for tc in tool_calls:
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
+                                }
+                            )
+                        # Re-raise to let the cancellation propagate
+                        raise
 
-                    # Check for cancellation after tools complete
+                    # Check for cancellation after tools complete (graceful cancellation)
                     if coordinator and coordinator.cancellation.is_cancelled:
                         # MUST add tool results to context before returning
                         # Otherwise we leave orphaned tool_calls without matching tool_results
