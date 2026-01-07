@@ -90,13 +90,14 @@ class StreamingOrchestrator:
             full_response += token
             iteration_count = iteration
 
-        # Emit orchestrator complete event
+        # Emit orchestrator complete event with appropriate status
+        status = "cancelled" if (coordinator and coordinator.cancellation.is_cancelled) else ("success" if full_response else "incomplete")
         await hooks.emit(
             ORCHESTRATOR_COMPLETE,
             {
                 "orchestrator": "loop-streaming",
                 "turn_count": iteration_count,
-                "status": "success" if full_response else "incomplete",
+                "status": status,
             },
         )
 
@@ -145,6 +146,11 @@ class StreamingOrchestrator:
         iteration = 0
 
         while self.max_iterations == -1 or iteration < self.max_iterations:
+            # Check for cancellation at iteration start
+            if coordinator and coordinator.cancellation.is_cancelled:
+                # Don't yield more content, just exit
+                return
+
             iteration += 1
 
             # Emit provider request BEFORE getting messages (allows hook injections)
@@ -373,6 +379,11 @@ class StreamingOrchestrator:
                     ]
                     tool_results = await asyncio.gather(*tool_tasks)
 
+                    # Check for cancellation after tools complete
+                    if coordinator and coordinator.cancellation.is_cancelled:
+                        # Exit the loop - orchestrator complete event will be emitted in execute()
+                        return
+
                     # Add all results to context in original order (sequential, deterministic)
                     # Note: Context manager handles compaction internally when get_messages_for_request() is called
                     for tool_call_id, content in tool_results:
@@ -579,11 +590,19 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 )
                 return (tool_call.id, error_msg)
 
+            # Register tool with cancellation token for visibility
+            if coordinator:
+                coordinator.cancellation.register_tool_start(tool_call.id, tool_call.name)
+
             # Execute
             try:
                 result = await tool.execute(tool_call.arguments)
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
+            finally:
+                # Always unregister tool from cancellation token
+                if coordinator:
+                    coordinator.cancellation.register_tool_complete(tool_call.id)
 
             # Serialize result for logging
             result_data = result.model_dump() if hasattr(result, "model_dump") else str(result)
