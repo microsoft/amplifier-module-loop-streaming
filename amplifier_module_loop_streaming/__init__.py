@@ -381,6 +381,17 @@ class StreamingOrchestrator:
 
                     # Check for cancellation after tools complete
                     if coordinator and coordinator.cancellation.is_cancelled:
+                        # MUST add tool results to context before returning
+                        # Otherwise we leave orphaned tool_calls without matching tool_results
+                        # which violates provider API contracts (Anthropic, OpenAI)
+                        for tool_call_id, content in tool_results:
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": content,
+                                }
+                            )
                         # Exit the loop - orchestrator complete event will be emitted in execute()
                         return
 
