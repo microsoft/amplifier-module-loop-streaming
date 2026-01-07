@@ -398,7 +398,8 @@ class StreamingOrchestrator:
                 except Exception as e:
                     # Ensure error message is never empty (TimeoutError has empty str())
                     error_msg = str(e) or f"{type(e).__name__}: (no message)"
-                    logger.error(f"Provider error: {error_msg}")
+                    # Note: Don't log here - the error is yielded as response content
+                    # and will be displayed to the user. Logging would cause duplicate output.
                     yield (f"\nError: {error_msg}", iteration)
                     break
 
