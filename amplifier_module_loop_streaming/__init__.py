@@ -9,6 +9,7 @@ __amplifier_module_type__ = "orchestrator"
 import asyncio
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 from typing import Optional
@@ -65,6 +66,37 @@ class StreamingOrchestrator:
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
         self.stream_delay = config.get("stream_delay", 0.01)  # Artificial delay for demo
         self.extended_thinking = config.get("extended_thinking", False)
+        self.min_delay_between_calls_ms = config.get("min_delay_between_calls_ms", 0)
+        self._last_provider_call_end: float | None = None  # Timestamp tracking
+
+    async def _apply_rate_limit_delay(self, hooks: HookRegistry, iteration: int) -> None:
+        """Apply rate limit delay if configured and needed.
+
+        Only delays if:
+        - min_delay_between_calls_ms > 0 (enabled)
+        - This is not the first call (has previous timestamp)
+        - Elapsed time < configured minimum
+        """
+        if self.min_delay_between_calls_ms <= 0:
+            return  # Disabled
+
+        if self._last_provider_call_end is None:
+            return  # First call, no delay needed
+
+        elapsed_ms = (time.monotonic() - self._last_provider_call_end) * 1000
+        remaining_ms = self.min_delay_between_calls_ms - elapsed_ms
+
+        if remaining_ms > 0:
+            await hooks.emit(
+                "orchestrator:rate_limit_delay",
+                {
+                    "delay_ms": remaining_ms,
+                    "configured_ms": self.min_delay_between_calls_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "iteration": iteration,
+                },
+            )
+            await asyncio.sleep(remaining_ms / 1000)
 
     async def execute(
         self,
@@ -126,6 +158,9 @@ class StreamingOrchestrator:
 
         # Emit session start
         await hooks.emit("session:start", {"prompt": prompt})
+
+        # Reset rate limit tracking for new session
+        self._last_provider_call_end = None
 
         # Add user message
         await context.add_message({"role": "user", "content": prompt})
@@ -208,11 +243,17 @@ class StreamingOrchestrator:
             if tools_list:
                 logger.debug(f"[ORCHESTRATOR] Tool names: {[t.name for t in tools_list]}")
 
+            # Apply rate limit delay before provider call
+            await self._apply_rate_limit_delay(hooks, iteration)
+
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
                 # Use streaming if available
                 async for chunk in self._stream_from_provider(provider, chat_request, context, tools, hooks):
                     yield (chunk, iteration)
+
+                # Update rate limit timestamp after streaming completes
+                self._last_provider_call_end = time.monotonic()
 
                 # Check for tool calls after streaming
                 # This is simplified - real implementation would parse during stream
@@ -231,6 +272,9 @@ class StreamingOrchestrator:
                     if self.extended_thinking:
                         kwargs["extended_thinking"] = True
                     response = await provider.complete(chat_request, **kwargs)
+
+                    # Update rate limit timestamp after non-streaming response
+                    self._last_provider_call_end = time.monotonic()
 
                     # Emit content block events if present
                     content_blocks = getattr(response, "content_blocks", None)
