@@ -12,7 +12,6 @@ import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
-from typing import Optional
 
 from amplifier_core import HookRegistry
 from amplifier_core import ModuleCoordinator
@@ -64,12 +63,18 @@ class StreamingOrchestrator:
         # -1 means unlimited iterations (default)
         max_iter_config = config.get("max_iterations", -1)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
-        self.stream_delay = config.get("stream_delay", 0.01)  # Artificial delay for demo
+        self.stream_delay = config.get(
+            "stream_delay", 0.01
+        )  # Artificial delay for demo
         self.extended_thinking = config.get("extended_thinking", False)
         self.min_delay_between_calls_ms = config.get("min_delay_between_calls_ms", 0)
         self._last_provider_call_end: float | None = None  # Timestamp tracking
+        # Store ephemeral injections from tool:post hooks for next iteration
+        self._pending_ephemeral_injections: list[dict[str, Any]] = []
 
-    async def _apply_rate_limit_delay(self, hooks: HookRegistry, iteration: int) -> None:
+    async def _apply_rate_limit_delay(
+        self, hooks: HookRegistry, iteration: int
+    ) -> None:
         """Apply rate limit delay if configured and needed.
 
         Only delays if:
@@ -118,12 +123,18 @@ class StreamingOrchestrator:
         full_response = ""
         iteration_count = 0
 
-        async for token, iteration in self._execute_stream(prompt, context, providers, tools, hooks, coordinator):
+        async for token, iteration in self._execute_stream(
+            prompt, context, providers, tools, hooks, coordinator
+        ):
             full_response += token
             iteration_count = iteration
 
         # Emit orchestrator complete event with appropriate status
-        status = "cancelled" if (coordinator and coordinator.cancellation.is_cancelled) else ("success" if full_response else "incomplete")
+        status = (
+            "cancelled"
+            if (coordinator and coordinator.cancellation.is_cancelled)
+            else ("success" if full_response else "incomplete")
+        )
         await hooks.emit(
             ORCHESTRATOR_COMPLETE,
             {
@@ -151,7 +162,9 @@ class StreamingOrchestrator:
         # Emit and process prompt submit (allows hooks to inject context before processing)
         result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
         if coordinator:
-            result = await coordinator.process_hook_result(result, "prompt:submit", "orchestrator")
+            result = await coordinator.process_hook_result(
+                result, "prompt:submit", "orchestrator"
+            )
             if result.action == "deny":
                 yield (f"Operation denied: {result.reason}", 0)
                 return
@@ -189,9 +202,13 @@ class StreamingOrchestrator:
             iteration += 1
 
             # Emit provider request BEFORE getting messages (allows hook injections)
-            result = await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration})
+            result = await hooks.emit(
+                PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration}
+            )
             if coordinator:
-                result = await coordinator.process_hook_result(result, "provider:request", "orchestrator")
+                result = await coordinator.process_hook_result(
+                    result, "provider:request", "orchestrator"
+                )
                 if result.action == "deny":
                     yield (f"Operation denied: {result.reason}", iteration)
                     return
@@ -202,7 +219,11 @@ class StreamingOrchestrator:
             message_dicts = list(message_dicts)  # Convert to list for modification
 
             # Append ephemeral injection if present (temporary, not stored)
-            if result.action == "inject_context" and result.ephemeral and result.context_injection:
+            if (
+                result.action == "inject_context"
+                and result.ephemeral
+                and result.context_injection
+            ):
                 # Check if we should append to last tool result
                 if result.append_to_last_tool_result and len(message_dicts) > 0:
                     last_msg = message_dicts[-1]
@@ -214,11 +235,16 @@ class StreamingOrchestrator:
                             **last_msg,
                             "content": f"{original_content}\n\n{result.context_injection}",
                         }
-                        logger.debug("Appended ephemeral injection to last tool result message")
+                        logger.debug(
+                            "Appended ephemeral injection to last tool result message"
+                        )
                     else:
                         # Fall back to new message if last message isn't a tool result
                         message_dicts.append(
-                            {"role": result.context_injection_role, "content": result.context_injection}
+                            {
+                                "role": result.context_injection_role,
+                                "content": result.context_injection,
+                            }
                         )
                         logger.debug(
                             f"Last message role is '{last_msg.get('role')}', not 'tool' - "
@@ -226,7 +252,49 @@ class StreamingOrchestrator:
                         )
                 else:
                     # Default behavior: append as new message
-                    message_dicts.append({"role": result.context_injection_role, "content": result.context_injection})
+                    message_dicts.append(
+                        {
+                            "role": result.context_injection_role,
+                            "content": result.context_injection,
+                        }
+                    )
+
+            # Apply pending ephemeral injections from tool:post hooks
+            if self._pending_ephemeral_injections:
+                for injection in self._pending_ephemeral_injections:
+                    if (
+                        injection.get("append_to_last_tool_result")
+                        and len(message_dicts) > 0
+                    ):
+                        last_msg = message_dicts[-1]
+                        if last_msg.get("role") == "tool":
+                            original_content = last_msg.get("content", "")
+                            message_dicts[-1] = {
+                                **last_msg,
+                                "content": f"{original_content}\n\n{injection['content']}",
+                            }
+                            logger.debug(
+                                "Applied pending ephemeral injection to last tool result"
+                            )
+                        else:
+                            message_dicts.append(
+                                {
+                                    "role": injection["role"],
+                                    "content": injection["content"],
+                                }
+                            )
+                            logger.debug(
+                                "Last message not a tool result, created new message for injection"
+                            )
+                    else:
+                        message_dicts.append(
+                            {"role": injection["role"], "content": injection["content"]}
+                        )
+                        logger.debug(
+                            "Applied pending ephemeral injection as new message"
+                        )
+                # Clear pending injections after applying
+                self._pending_ephemeral_injections = []
 
             # Convert dicts to ChatRequest for provider
             messages_objects = [Message(**msg) for msg in message_dicts]
@@ -235,13 +303,22 @@ class StreamingOrchestrator:
             tools_list = None
             if tools:
                 tools_list = [
-                    ToolSpec(name=t.name, description=t.description, parameters=t.input_schema) for t in tools.values()
+                    ToolSpec(
+                        name=t.name,
+                        description=t.description,
+                        parameters=t.input_schema,
+                    )
+                    for t in tools.values()
                 ]
 
             chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
-            logger.info(f"[ORCHESTRATOR] ChatRequest created with {len(tools_list) if tools_list else 0} tools")
+            logger.info(
+                f"[ORCHESTRATOR] ChatRequest created with {len(tools_list) if tools_list else 0} tools"
+            )
             if tools_list:
-                logger.debug(f"[ORCHESTRATOR] Tool names: {[t.name for t in tools_list]}")
+                logger.debug(
+                    f"[ORCHESTRATOR] Tool names: {[t.name for t in tools_list]}"
+                )
 
             # Apply rate limit delay before provider call
             await self._apply_rate_limit_delay(hooks, iteration)
@@ -249,7 +326,9 @@ class StreamingOrchestrator:
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
                 # Use streaming if available
-                async for chunk in self._stream_from_provider(provider, chat_request, context, tools, hooks):
+                async for chunk in self._stream_from_provider(
+                    provider, chat_request, context, tools, hooks
+                ):
                     yield (chunk, iteration)
 
                 # Update rate limit timestamp after streaming completes
@@ -311,7 +390,9 @@ class StreamingOrchestrator:
                         if hasattr(response, "text") and response.text:
                             response_text = response.text
                         else:
-                            response_text = self._extract_text_from_content(response.content)
+                            response_text = self._extract_text_from_content(
+                                response.content
+                            )
 
                         # Stream the final response token by token
                         async for token in self._tokenize_stream(response_text):
@@ -325,10 +406,14 @@ class StreamingOrchestrator:
                         if response_content and isinstance(response_content, list):
                             # Convert ContentBlock objects to dicts for serialization
                             content_dicts = [
-                                block.model_dump() if hasattr(block, "model_dump") else block
+                                block.model_dump()
+                                if hasattr(block, "model_dump")
+                                else block
                                 for block in response_content
                             ]
-                            logger.info(f"[ORCHESTRATOR] Storing {len(content_dicts)} content blocks")
+                            logger.info(
+                                f"[ORCHESTRATOR] Storing {len(content_dicts)} content blocks"
+                            )
                             for i, block_dict in enumerate(content_dicts):
                                 logger.info(
                                     f"[ORCHESTRATOR]   Block {i}: type={block_dict.get('type')}, has_content={'content' in block_dict}"
@@ -338,18 +423,27 @@ class StreamingOrchestrator:
                                 "content": content_dicts,
                             }
                         else:
-                            assistant_msg = {"role": "assistant", "content": response_text}
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": response_text,
+                            }
 
                         # Preserve thinking blocks for Anthropic extended thinking (backward compat)
                         # Use response_content (our Pydantic models) not content_blocks (raw SDK objects)
                         if response_content and isinstance(response_content, list):
                             for block in response_content:
                                 block_type = getattr(block, "type", None)
-                                type_value = getattr(block_type, "value", block_type) if block_type else None
+                                type_value = (
+                                    getattr(block_type, "value", block_type)
+                                    if block_type
+                                    else None
+                                )
                                 if type_value == "thinking":
                                     # Store the thinking block as dict to preserve signature
                                     assistant_msg["thinking_block"] = (
-                                        block.model_dump() if hasattr(block, "model_dump") else None
+                                        block.model_dump()
+                                        if hasattr(block, "model_dump")
+                                        else None
                                     )
                                     break
 
@@ -367,7 +461,11 @@ class StreamingOrchestrator:
                     if hasattr(response, "text") and response.text:
                         response_text = response.text
                     else:
-                        response_text = self._extract_text_from_content(response.content) if response.content else ""
+                        response_text = (
+                            self._extract_text_from_content(response.content)
+                            if response.content
+                            else ""
+                        )
 
                     # Store structured content from response.content (our Pydantic models)
                     response_content = getattr(response, "content", None)
@@ -375,11 +473,18 @@ class StreamingOrchestrator:
                         assistant_msg = {
                             "role": "assistant",
                             "content": [
-                                block.model_dump() if hasattr(block, "model_dump") else block
+                                block.model_dump()
+                                if hasattr(block, "model_dump")
+                                else block
                                 for block in response_content
                             ],
                             "tool_calls": [
-                                {"id": tc.id, "tool": tc.name, "arguments": tc.arguments} for tc in tool_calls
+                                {
+                                    "id": tc.id,
+                                    "tool": tc.name,
+                                    "arguments": tc.arguments,
+                                }
+                                for tc in tool_calls
                             ],
                         }
                     else:
@@ -387,7 +492,12 @@ class StreamingOrchestrator:
                             "role": "assistant",
                             "content": response_text,
                             "tool_calls": [
-                                {"id": tc.id, "tool": tc.name, "arguments": tc.arguments} for tc in tool_calls
+                                {
+                                    "id": tc.id,
+                                    "tool": tc.name,
+                                    "arguments": tc.arguments,
+                                }
+                                for tc in tool_calls
                             ],
                         }
 
@@ -396,11 +506,17 @@ class StreamingOrchestrator:
                     if response_content and isinstance(response_content, list):
                         for block in response_content:
                             block_type = getattr(block, "type", None)
-                            type_value = getattr(block_type, "value", block_type) if block_type else None
+                            type_value = (
+                                getattr(block_type, "value", block_type)
+                                if block_type
+                                else None
+                            )
                             if type_value == "thinking":
                                 # Store the thinking block as dict to preserve signature
                                 assistant_msg["thinking_block"] = (
-                                    block.model_dump() if hasattr(block, "model_dump") else None
+                                    block.model_dump()
+                                    if hasattr(block, "model_dump")
+                                    else None
                                 )
                                 break
 
@@ -420,15 +536,20 @@ class StreamingOrchestrator:
                     # Execute all tools in parallel (no context updates inside)
                     # Wrap in try/except for CancelledError to handle immediate cancellation
                     tool_tasks = [
-                        self._execute_tool_only(tc, tools, hooks, parallel_group_id, coordinator) for tc in tool_calls
+                        self._execute_tool_only(
+                            tc, tools, hooks, parallel_group_id, coordinator
+                        )
+                        for tc in tool_calls
                     ]
-                    
+
                     try:
                         tool_results = await asyncio.gather(*tool_tasks)
                     except asyncio.CancelledError:
                         # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
                         # for ALL tool_calls to maintain tool_use/tool_result pairing
-                        logger.info("Tool execution cancelled - synthesizing cancelled results")
+                        logger.info(
+                            "Tool execution cancelled - synthesizing cancelled results"
+                        )
                         for tc in tool_calls:
                             await context.add_message(
                                 {
@@ -480,7 +601,14 @@ class StreamingOrchestrator:
             logger.warning(f"Max iterations ({self.max_iterations}) reached")
 
             # Inject system reminder to agent before returning
-            await hooks.emit(PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration, "max_reached": True})
+            await hooks.emit(
+                PROVIDER_REQUEST,
+                {
+                    "provider": provider_name,
+                    "iteration": iteration,
+                    "max_reached": True,
+                },
+            )
 
             # Get one final response with the reminder (via _execute_stream helper)
             message_dicts = await context.get_messages_for_request(provider=provider)
@@ -504,18 +632,26 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 tools_list = None
                 if tools:
                     tools_list = [
-                        ToolSpec(name=t.name, description=t.description, parameters=t.input_schema)
+                        ToolSpec(
+                            name=t.name,
+                            description=t.description,
+                            parameters=t.input_schema,
+                        )
                         for t in tools.values()
                     ]
 
-                max_iter_chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
+                max_iter_chat_request = ChatRequest(
+                    messages=messages_objects, tools=tools_list
+                )
 
                 kwargs = {}
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
 
                 response = await provider.complete(max_iter_chat_request, **kwargs)
-                content = response.content if hasattr(response, "content") else str(response)
+                content = (
+                    response.content if hasattr(response, "content") else str(response)
+                )
 
                 if content:
                     # Yield the final response
@@ -531,7 +667,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         # Emit session end
         await hooks.emit("session:end", {})
 
-    async def _stream_from_provider(self, provider, chat_request, context, tools, hooks) -> AsyncIterator[str]:
+    async def _stream_from_provider(
+        self, provider, chat_request, context, tools, hooks
+    ) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming."""
         # This is a simplified example
         # Real implementation would handle streaming tool calls
@@ -617,7 +755,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         coordinator: ModuleCoordinator | None = None,
     ) -> None:
         """Execute a single tool call (legacy method for compatibility)."""
-        await self._execute_tool_with_result(tool_call, tools, context, hooks, coordinator)
+        await self._execute_tool_with_result(
+            tool_call, tools, context, hooks, coordinator
+        )
 
     async def _execute_tool_only(
         self,
@@ -644,7 +784,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 },
             )
             if coordinator:
-                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.name)
+                pre_result = await coordinator.process_hook_result(
+                    pre_result, "tool:pre", tool_call.name
+                )
                 if pre_result.action == "deny":
                     return (tool_call.id, f"Denied by hook: {pre_result.reason}")
 
@@ -665,7 +807,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
             # Register tool with cancellation token for visibility
             if coordinator:
-                coordinator.cancellation.register_tool_start(tool_call.id, tool_call.name)
+                coordinator.cancellation.register_tool_start(
+                    tool_call.id, tool_call.name
+                )
 
             # Execute
             try:
@@ -678,7 +822,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     coordinator.cancellation.register_tool_complete(tool_call.id)
 
             # Serialize result for logging
-            result_data = result.model_dump() if hasattr(result, "model_dump") else str(result)
+            result_data = (
+                result.model_dump() if hasattr(result, "model_dump") else str(result)
+            )
 
             # Post-tool hook
             post_result = await hooks.emit(
@@ -692,7 +838,26 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 },
             )
             if coordinator:
-                await coordinator.process_hook_result(post_result, "tool:post", tool_call.name)
+                await coordinator.process_hook_result(
+                    post_result, "tool:post", tool_call.name
+                )
+
+            # Store ephemeral injection from tool:post for next iteration
+            if (
+                post_result.action == "inject_context"
+                and post_result.ephemeral
+                and post_result.context_injection
+            ):
+                self._pending_ephemeral_injections.append(
+                    {
+                        "role": post_result.context_injection_role,
+                        "content": post_result.context_injection,
+                        "append_to_last_tool_result": post_result.append_to_last_tool_result,
+                    }
+                )
+                logger.debug(
+                    f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
+                )
 
             # Return result content (JSON-serialized for dict/list outputs)
             content = result.get_serialized_output()
@@ -739,7 +904,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 },
             )
             if coordinator:
-                pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_call.name)
+                pre_result = await coordinator.process_hook_result(
+                    pre_result, "tool:pre", tool_call.name
+                )
                 if pre_result.action == "deny":
                     # Add tool_result message (not system) so Anthropic API accepts it
                     await context.add_message(
@@ -773,7 +940,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 result = ToolResult(success=False, error={"message": str(e)})
 
             # Serialize result for logging
-            result_data = result.model_dump() if hasattr(result, "model_dump") else str(result)
+            result_data = (
+                result.model_dump() if hasattr(result, "model_dump") else str(result)
+            )
 
             # Post-tool hook
             post_result = await hooks.emit(
@@ -786,7 +955,26 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 },
             )
             if coordinator:
-                await coordinator.process_hook_result(post_result, "tool:post", tool_call.name)
+                await coordinator.process_hook_result(
+                    post_result, "tool:post", tool_call.name
+                )
+
+            # Store ephemeral injection from tool:post for next iteration
+            if (
+                post_result.action == "inject_context"
+                and post_result.ephemeral
+                and post_result.context_injection
+            ):
+                self._pending_ephemeral_injections.append(
+                    {
+                        "role": post_result.context_injection_role,
+                        "content": post_result.context_injection,
+                        "append_to_last_tool_result": post_result.append_to_last_tool_result,
+                    }
+                )
+                logger.debug(
+                    f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
+                )
 
             # Add result with tool_call_id (JSON-serialized for dict/list outputs)
             await context.add_message(
@@ -799,11 +987,16 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             )
             response_added = True
 
-            return {"success": result.success, "error": result.error if not result.success else None}
+            return {
+                "success": result.success,
+                "error": result.error if not result.success else None,
+            }
 
         except Exception as e:
             # Safety net: Ensure a tool response is ALWAYS added to prevent orphaned tool calls
-            logger.error(f"Unexpected error executing tool {tool_call.name}: {e}", exc_info=True)
+            logger.error(
+                f"Unexpected error executing tool {tool_call.name}: {e}", exc_info=True
+            )
 
             if not response_added:
                 try:
@@ -816,7 +1009,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     )
                 except Exception as inner_e:
                     # Critical failure: Even adding error response failed
-                    logger.error(f"Critical: Failed to add error response for tool_call_id {tool_call.id}: {inner_e}")
+                    logger.error(
+                        f"Critical: Failed to add error response for tool_call_id {tool_call.id}: {inner_e}"
+                    )
 
             return {"success": False, "error": str(e)}
 
