@@ -58,10 +58,14 @@ class StreamingOrchestrator:
     Yields tokens as they're generated for real-time display.
     """
 
+    # Default max iterations provides a safety net against runaway loops.
+    # Set to -1 explicitly in config for unlimited (not recommended for sub-sessions).
+    DEFAULT_MAX_ITERATIONS = 200
+
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        # -1 means unlimited iterations (default)
-        max_iter_config = config.get("max_iterations", -1)
+        # Default to 200 iterations as a safety net; -1 means unlimited (explicit opt-in)
+        max_iter_config = config.get("max_iterations", self.DEFAULT_MAX_ITERATIONS)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
         self.stream_delay = config.get(
             "stream_delay", 0.01
