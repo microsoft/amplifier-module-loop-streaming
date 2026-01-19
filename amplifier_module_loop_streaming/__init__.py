@@ -160,14 +160,32 @@ class StreamingOrchestrator:
         Yields tuples of (token, iteration) as they're generated.
         """
         # Emit and process prompt submit (allows hooks to inject context before processing)
-        result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
+        prompt_submit_result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
         if coordinator:
-            result = await coordinator.process_hook_result(
-                result, "prompt:submit", "orchestrator"
+            prompt_submit_result = await coordinator.process_hook_result(
+                prompt_submit_result, "prompt:submit", "orchestrator"
             )
-            if result.action == "deny":
-                yield (f"Operation denied: {result.reason}", 0)
+            if prompt_submit_result.action == "deny":
+                yield (f"Operation denied: {prompt_submit_result.reason}", 0)
                 return
+
+        # Store ephemeral injection from prompt:submit for use in the loop
+        # (must be stored before provider:request overwrites 'result')
+        if (
+            prompt_submit_result.action == "inject_context"
+            and prompt_submit_result.ephemeral
+            and prompt_submit_result.context_injection
+        ):
+            self._pending_ephemeral_injections.append(
+                {
+                    "role": prompt_submit_result.context_injection_role,
+                    "content": prompt_submit_result.context_injection,
+                    "append_to_last_tool_result": prompt_submit_result.append_to_last_tool_result,
+                }
+            )
+            logger.debug(
+                "Stored ephemeral injection from prompt:submit for first iteration"
+            )
 
         # Emit session start
         await hooks.emit("session:start", {"prompt": prompt})
