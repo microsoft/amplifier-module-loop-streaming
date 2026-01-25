@@ -41,8 +41,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         "observability.events",
         "loop-streaming",
         lambda: [
-            "session:start",  # When session begins
-            "session:end",  # When session completes
+            "execution:start",  # When orchestrator execution begins
+            "execution:end",  # When orchestrator execution completes
         ],
     )
 
@@ -187,8 +187,8 @@ class StreamingOrchestrator:
                 "Stored ephemeral injection from prompt:submit for first iteration"
             )
 
-        # Emit session start
-        await hooks.emit("session:start", {"prompt": prompt})
+        # Emit execution start
+        await hooks.emit("execution:start", {"prompt": prompt})
 
         # Reset rate limit tracking for new session
         self._last_provider_call_end = None
@@ -682,8 +682,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             except Exception as e:
                 logger.error(f"Error getting final response after max iterations: {e}")
 
-        # Emit session end
-        await hooks.emit("session:end", {})
+        # Emit execution end
+        await hooks.emit("execution:end", {})
 
     async def _stream_from_provider(
         self, provider, chat_request, context, tools, hooks
