@@ -572,6 +572,7 @@ class StreamingOrchestrator:
                             await context.add_message(
                                 {
                                     "role": "tool",
+                                    "name": tc.name,
                                     "tool_call_id": tc.id,
                                     "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
                                 }
@@ -584,10 +585,11 @@ class StreamingOrchestrator:
                         # MUST add tool results to context before returning
                         # Otherwise we leave orphaned tool_calls without matching tool_results
                         # which violates provider API contracts (Anthropic, OpenAI)
-                        for tool_call_id, content in tool_results:
+                        for tool_call_id, tool_name, content in tool_results:
                             await context.add_message(
                                 {
                                     "role": "tool",
+                                    "name": tool_name,
                                     "tool_call_id": tool_call_id,
                                     "content": content,
                                 }
@@ -597,10 +599,11 @@ class StreamingOrchestrator:
 
                     # Add all results to context in original order (sequential, deterministic)
                     # Note: Context manager handles compaction internally when get_messages_for_request() is called
-                    for tool_call_id, content in tool_results:
+                    for tool_call_id, tool_name, content in tool_results:
                         await context.add_message(
                             {
                                 "role": "tool",
+                                "name": tool_name,
                                 "tool_call_id": tool_call_id,
                                 "content": content,
                             }
@@ -784,10 +787,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         hooks: HookRegistry,
         parallel_group_id: str,
         coordinator: ModuleCoordinator | None = None,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         """Execute a single tool in parallel without adding to context.
 
-        Returns (tool_call_id, content) tuple.
+        Returns (tool_call_id, name, content) tuple.
         Never raises - errors become error messages.
         """
         try:
@@ -806,7 +809,11 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     pre_result, "tool:pre", tool_call.name
                 )
                 if pre_result.action == "deny":
-                    return (tool_call.id, f"Denied by hook: {pre_result.reason}")
+                    return (
+                        tool_call.id,
+                        tool_call.name,
+                        f"Denied by hook: {pre_result.reason}",
+                    )
 
             # Get tool
             tool = tools.get(tool_call.name)
@@ -821,7 +828,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         "parallel_group_id": parallel_group_id,
                     },
                 )
-                return (tool_call.id, error_msg)
+                return (tool_call.id, tool_call.name, error_msg)
 
             # Register tool with cancellation token for visibility
             if coordinator:
@@ -879,7 +886,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
             # Return result content (JSON-serialized for dict/list outputs)
             content = result.get_serialized_output()
-            return (tool_call.id, content)
+            return (tool_call.id, tool_call.name, content)
 
         except Exception as e:
             # Safety net: errors become error messages
@@ -894,7 +901,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     "parallel_group_id": parallel_group_id,
                 },
             )
-            return (tool_call.id, error_msg)
+            return (tool_call.id, tool_call.name, error_msg)
 
     async def _execute_tool_with_result(
         self,
@@ -930,6 +937,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     await context.add_message(
                         {
                             "role": "tool",
+                            "name": tool_call.name,
                             "tool_call_id": tool_call.id,
                             "content": f"Tool execution denied: {pre_result.reason}",
                         }
@@ -944,6 +952,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 await context.add_message(
                     {
                         "role": "tool",
+                        "name": tool_call.name,
                         "tool_call_id": tool_call.id,
                         "content": f"Error: Tool '{tool_call.name}' not found",
                     }
@@ -1021,6 +1030,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     await context.add_message(
                         {
                             "role": "tool",
+                            "name": tool_call.name,
                             "tool_call_id": tool_call.id,
                             "content": f"Internal error executing tool: {str(e)}",
                         }
