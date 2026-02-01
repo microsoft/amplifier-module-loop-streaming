@@ -345,8 +345,11 @@ class StreamingOrchestrator:
             if hasattr(provider, "stream"):
                 # Use streaming if available
                 async for chunk in self._stream_from_provider(
-                    provider, chat_request, context, tools, hooks
+                    provider, chat_request, context, tools, hooks, coordinator
                 ):
+                    # Check for immediate cancellation between chunks
+                    if coordinator and coordinator.cancellation.is_immediate:
+                        return
                     yield (chunk, iteration)
 
                 # Update rate limit timestamp after streaming completes
@@ -689,9 +692,18 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         await hooks.emit("execution:end", {})
 
     async def _stream_from_provider(
-        self, provider, chat_request, context, tools, hooks
+        self, provider, chat_request, context, tools, hooks, coordinator=None
     ) -> AsyncIterator[str]:
-        """Stream tokens from provider that supports streaming."""
+        """Stream tokens from provider that supports streaming.
+
+        Args:
+            provider: The provider to stream from
+            chat_request: The chat request to send
+            context: The context manager
+            tools: Available tools
+            hooks: Hook registry
+            coordinator: Optional coordinator for cancellation support
+        """
         # This is a simplified example
         # Real implementation would handle streaming tool calls
 
@@ -700,6 +712,15 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         # Convert tools dict to list for provider
         tools_list = list(tools.values()) if tools else []
         async for chunk in provider.stream(chat_request, tools=tools_list):
+            # Check for immediate cancellation between chunks
+            if coordinator and coordinator.cancellation.is_immediate:
+                # Add partial response to context before exiting
+                if full_response:
+                    await context.add_message(
+                        {"role": "assistant", "content": full_response}
+                    )
+                return
+
             token = chunk.get("content", "")
             if token:
                 yield token
