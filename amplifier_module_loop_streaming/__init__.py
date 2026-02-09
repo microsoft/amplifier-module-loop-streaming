@@ -118,23 +118,27 @@ class StreamingOrchestrator:
         Note: This is a simplified version. A real streaming implementation would
         need to modify the core interfaces to support AsyncIterator returns.
         """
-        # For now, collect the stream and return as string
-        # In a real implementation, the interface would support streaming
         full_response = ""
         iteration_count = 0
+        error: Exception | None = None
 
-        async for token, iteration in self._execute_stream(
-            prompt, context, providers, tools, hooks, coordinator
-        ):
-            full_response += token
-            iteration_count = iteration
+        try:
+            async for token, iteration in self._execute_stream(
+                prompt, context, providers, tools, hooks, coordinator
+            ):
+                full_response += token
+                iteration_count = iteration
+        except Exception as e:
+            error = e
 
-        # Emit orchestrator complete event with appropriate status
-        status = (
-            "cancelled"
-            if (coordinator and coordinator.cancellation.is_cancelled)
-            else ("success" if full_response else "incomplete")
-        )
+        # Always emit orchestrator complete event (observability)
+        if error:
+            status = "error"
+        elif coordinator and coordinator.cancellation.is_cancelled:
+            status = "cancelled"
+        else:
+            status = "success" if full_response else "incomplete"
+
         await hooks.emit(
             ORCHESTRATOR_COMPLETE,
             {
@@ -143,6 +147,9 @@ class StreamingOrchestrator:
                 "status": status,
             },
         )
+
+        if error:
+            raise error
 
         return full_response
 
@@ -366,160 +373,86 @@ class StreamingOrchestrator:
                     break
             else:
                 # Fallback to non-streaming
-                try:
-                    # Build kwargs for provider
-                    kwargs = {}
-                    if self.extended_thinking:
-                        kwargs["extended_thinking"] = True
-                    response = await provider.complete(chat_request, **kwargs)
+                # Build kwargs for provider
+                kwargs = {}
+                if self.extended_thinking:
+                    kwargs["extended_thinking"] = True
+                response = await provider.complete(chat_request, **kwargs)
 
-                    # Update rate limit timestamp after non-streaming response
-                    self._last_provider_call_end = time.monotonic()
+                # Update rate limit timestamp after non-streaming response
+                self._last_provider_call_end = time.monotonic()
 
-                    # Emit content block events if present
-                    content_blocks = getattr(response, "content_blocks", None)
-                    if content_blocks:
-                        total_blocks = len(content_blocks)
-                        for idx, block in enumerate(content_blocks):
-                            # Emit block start
-                            await hooks.emit(
-                                CONTENT_BLOCK_START,
-                                {
-                                    "block_type": block.type.value,
-                                    "block_index": idx,
-                                    "total_blocks": total_blocks,
-                                    "metadata": getattr(block, "raw", None),
-                                },
-                            )
-
-                            # Emit block end with complete block, usage, and total count
-                            event_data = {
+                # Emit content block events if present
+                content_blocks = getattr(response, "content_blocks", None)
+                if content_blocks:
+                    total_blocks = len(content_blocks)
+                    for idx, block in enumerate(content_blocks):
+                        # Emit block start
+                        await hooks.emit(
+                            CONTENT_BLOCK_START,
+                            {
+                                "block_type": block.type.value,
                                 "block_index": idx,
                                 "total_blocks": total_blocks,
-                                "block": block.to_dict(),
-                            }
-                            if response.usage:
-                                event_data["usage"] = response.usage.model_dump()
-                            await hooks.emit(CONTENT_BLOCK_END, event_data)
+                                "metadata": getattr(block, "raw", None),
+                            },
+                        )
 
-                    # Parse tool calls
-                    tool_calls = provider.parse_tool_calls(response)
+                        # Emit block end with complete block, usage, and total count
+                        event_data = {
+                            "block_index": idx,
+                            "total_blocks": total_blocks,
+                            "block": block.to_dict(),
+                        }
+                        if response.usage:
+                            event_data["usage"] = response.usage.model_dump()
+                        await hooks.emit(CONTENT_BLOCK_END, event_data)
 
-                    if not tool_calls:
-                        # Extract text content from response for streaming
-                        # Use .text field if available (e.g., OpenAI provider), otherwise extract from content blocks
-                        if hasattr(response, "text") and response.text:
-                            response_text = response.text
-                        else:
-                            response_text = self._extract_text_from_content(
-                                response.content
-                            )
+                # Parse tool calls
+                tool_calls = provider.parse_tool_calls(response)
 
-                        # Stream the final response token by token
-                        async for token in self._tokenize_stream(response_text):
-                            yield (token, iteration)
-
-                        # Store structured content from response.content (our Pydantic models)
-                        # This preserves reasoning state, thinking blocks, etc.
-                        # response.content = list of our ContentBlock models (TextBlock, ThinkingBlock, etc.)
-                        # response.content_blocks = raw SDK objects (for streaming events only)
-                        response_content = getattr(response, "content", None)
-                        if response_content and isinstance(response_content, list):
-                            # Convert ContentBlock objects to dicts for serialization
-                            content_dicts = [
-                                block.model_dump()
-                                if hasattr(block, "model_dump")
-                                else block
-                                for block in response_content
-                            ]
-                            logger.info(
-                                f"[ORCHESTRATOR] Storing {len(content_dicts)} content blocks"
-                            )
-                            for i, block_dict in enumerate(content_dicts):
-                                logger.info(
-                                    f"[ORCHESTRATOR]   Block {i}: type={block_dict.get('type')}, has_content={'content' in block_dict}"
-                                )
-                            assistant_msg = {
-                                "role": "assistant",
-                                "content": content_dicts,
-                            }
-                        else:
-                            assistant_msg = {
-                                "role": "assistant",
-                                "content": response_text,
-                            }
-
-                        # Preserve thinking blocks for Anthropic extended thinking (backward compat)
-                        # Use response_content (our Pydantic models) not content_blocks (raw SDK objects)
-                        if response_content and isinstance(response_content, list):
-                            for block in response_content:
-                                block_type = getattr(block, "type", None)
-                                type_value = (
-                                    getattr(block_type, "value", block_type)
-                                    if block_type
-                                    else None
-                                )
-                                if type_value == "thinking":
-                                    # Store the thinking block as dict to preserve signature
-                                    assistant_msg["thinking_block"] = (
-                                        block.model_dump()
-                                        if hasattr(block, "model_dump")
-                                        else None
-                                    )
-                                    break
-
-                        # Preserve provider metadata (provider-agnostic passthrough)
-                        # This enables providers to maintain state across steps (e.g., OpenAI reasoning items)
-                        if hasattr(response, "metadata") and response.metadata:
-                            assistant_msg["metadata"] = response.metadata
-
-                        await context.add_message(assistant_msg)
-                        break
-
-                    # Add assistant message with tool calls
-                    # Store structured content blocks (preserves reasoning state, thinking blocks, etc.)
-                    # Extract text for display/logging only
+                if not tool_calls:
+                    # Extract text content from response for streaming
+                    # Use .text field if available (e.g., OpenAI provider), otherwise extract from content blocks
                     if hasattr(response, "text") and response.text:
                         response_text = response.text
                     else:
-                        response_text = (
-                            self._extract_text_from_content(response.content)
-                            if response.content
-                            else ""
+                        response_text = self._extract_text_from_content(
+                            response.content
                         )
 
+                    # Stream the final response token by token
+                    async for token in self._tokenize_stream(response_text):
+                        yield (token, iteration)
+
                     # Store structured content from response.content (our Pydantic models)
+                    # This preserves reasoning state, thinking blocks, etc.
+                    # response.content = list of our ContentBlock models (TextBlock, ThinkingBlock, etc.)
+                    # response.content_blocks = raw SDK objects (for streaming events only)
                     response_content = getattr(response, "content", None)
                     if response_content and isinstance(response_content, list):
+                        # Convert ContentBlock objects to dicts for serialization
+                        content_dicts = [
+                            block.model_dump()
+                            if hasattr(block, "model_dump")
+                            else block
+                            for block in response_content
+                        ]
+                        logger.info(
+                            f"[ORCHESTRATOR] Storing {len(content_dicts)} content blocks"
+                        )
+                        for i, block_dict in enumerate(content_dicts):
+                            logger.info(
+                                f"[ORCHESTRATOR]   Block {i}: type={block_dict.get('type')}, has_content={'content' in block_dict}"
+                            )
                         assistant_msg = {
                             "role": "assistant",
-                            "content": [
-                                block.model_dump()
-                                if hasattr(block, "model_dump")
-                                else block
-                                for block in response_content
-                            ],
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "tool": tc.name,
-                                    "arguments": tc.arguments,
-                                }
-                                for tc in tool_calls
-                            ],
+                            "content": content_dicts,
                         }
                     else:
                         assistant_msg = {
                             "role": "assistant",
                             "content": response_text,
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "tool": tc.name,
-                                    "arguments": tc.arguments,
-                                }
-                                for tc in tool_calls
-                            ],
                         }
 
                     # Preserve thinking blocks for Anthropic extended thinking (backward compat)
@@ -547,61 +480,120 @@ class StreamingOrchestrator:
                         assistant_msg["metadata"] = response.metadata
 
                     await context.add_message(assistant_msg)
+                    break
 
-                    # Process tool calls in parallel (user guidance: assume parallel intent)
-                    # Execute tools concurrently, but add results to context sequentially for determinism
-                    import uuid
+                # Add assistant message with tool calls
+                # Store structured content blocks (preserves reasoning state, thinking blocks, etc.)
+                # Extract text for display/logging only
+                if hasattr(response, "text") and response.text:
+                    response_text = response.text
+                else:
+                    response_text = (
+                        self._extract_text_from_content(response.content)
+                        if response.content
+                        else ""
+                    )
 
-                    parallel_group_id = str(uuid.uuid4())
+                # Store structured content from response.content (our Pydantic models)
+                response_content = getattr(response, "content", None)
+                if response_content and isinstance(response_content, list):
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": [
+                            block.model_dump()
+                            if hasattr(block, "model_dump")
+                            else block
+                            for block in response_content
+                        ],
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "tool": tc.name,
+                                "arguments": tc.arguments,
+                            }
+                            for tc in tool_calls
+                        ],
+                    }
+                else:
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": response_text,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "tool": tc.name,
+                                "arguments": tc.arguments,
+                            }
+                            for tc in tool_calls
+                        ],
+                    }
 
-                    # Execute all tools in parallel (no context updates inside)
-                    # Wrap in try/except for CancelledError to handle immediate cancellation
-                    tool_tasks = [
-                        self._execute_tool_only(
-                            tc, tools, hooks, parallel_group_id, coordinator
+                # Preserve thinking blocks for Anthropic extended thinking (backward compat)
+                # Use response_content (our Pydantic models) not content_blocks (raw SDK objects)
+                if response_content and isinstance(response_content, list):
+                    for block in response_content:
+                        block_type = getattr(block, "type", None)
+                        type_value = (
+                            getattr(block_type, "value", block_type)
+                            if block_type
+                            else None
                         )
-                        for tc in tool_calls
-                    ]
+                        if type_value == "thinking":
+                            # Store the thinking block as dict to preserve signature
+                            assistant_msg["thinking_block"] = (
+                                block.model_dump()
+                                if hasattr(block, "model_dump")
+                                else None
+                            )
+                            break
 
-                    try:
-                        tool_results = await asyncio.gather(*tool_tasks)
-                    except asyncio.CancelledError:
-                        # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
-                        # for ALL tool_calls to maintain tool_use/tool_result pairing
-                        logger.info(
-                            "Tool execution cancelled - synthesizing cancelled results"
+                # Preserve provider metadata (provider-agnostic passthrough)
+                # This enables providers to maintain state across steps (e.g., OpenAI reasoning items)
+                if hasattr(response, "metadata") and response.metadata:
+                    assistant_msg["metadata"] = response.metadata
+
+                await context.add_message(assistant_msg)
+
+                # Process tool calls in parallel (user guidance: assume parallel intent)
+                # Execute tools concurrently, but add results to context sequentially for determinism
+                import uuid
+
+                parallel_group_id = str(uuid.uuid4())
+
+                # Execute all tools in parallel (no context updates inside)
+                # Wrap in try/except for CancelledError to handle immediate cancellation
+                tool_tasks = [
+                    self._execute_tool_only(
+                        tc, tools, hooks, parallel_group_id, coordinator
+                    )
+                    for tc in tool_calls
+                ]
+
+                try:
+                    tool_results = await asyncio.gather(*tool_tasks)
+                except asyncio.CancelledError:
+                    # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
+                    # for ALL tool_calls to maintain tool_use/tool_result pairing
+                    logger.info(
+                        "Tool execution cancelled - synthesizing cancelled results"
+                    )
+                    for tc in tool_calls:
+                        await context.add_message(
+                            {
+                                "role": "tool",
+                                "name": tc.name,
+                                "tool_call_id": tc.id,
+                                "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
+                            }
                         )
-                        for tc in tool_calls:
-                            await context.add_message(
-                                {
-                                    "role": "tool",
-                                    "name": tc.name,
-                                    "tool_call_id": tc.id,
-                                    "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
-                                }
-                            )
-                        # Re-raise to let the cancellation propagate
-                        raise
+                    # Re-raise to let the cancellation propagate
+                    raise
 
-                    # Check for cancellation after tools complete (graceful cancellation)
-                    if coordinator and coordinator.cancellation.is_cancelled:
-                        # MUST add tool results to context before returning
-                        # Otherwise we leave orphaned tool_calls without matching tool_results
-                        # which violates provider API contracts (Anthropic, OpenAI)
-                        for tool_call_id, tool_name, content in tool_results:
-                            await context.add_message(
-                                {
-                                    "role": "tool",
-                                    "name": tool_name,
-                                    "tool_call_id": tool_call_id,
-                                    "content": content,
-                                }
-                            )
-                        # Exit the loop - orchestrator complete event will be emitted in execute()
-                        return
-
-                    # Add all results to context in original order (sequential, deterministic)
-                    # Note: Context manager handles compaction internally when get_messages_for_request() is called
+                # Check for cancellation after tools complete (graceful cancellation)
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    # MUST add tool results to context before returning
+                    # Otherwise we leave orphaned tool_calls without matching tool_results
+                    # which violates provider API contracts (Anthropic, OpenAI)
                     for tool_call_id, tool_name, content in tool_results:
                         await context.add_message(
                             {
@@ -611,14 +603,20 @@ class StreamingOrchestrator:
                                 "content": content,
                             }
                         )
+                    # Exit the loop - orchestrator complete event will be emitted in execute()
+                    return
 
-                except Exception as e:
-                    # Ensure error message is never empty (TimeoutError has empty str())
-                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
-                    # Note: Don't log here - the error is yielded as response content
-                    # and will be displayed to the user. Logging would cause duplicate output.
-                    yield (f"\nError: {error_msg}", iteration)
-                    break
+                # Add all results to context in original order (sequential, deterministic)
+                # Note: Context manager handles compaction internally when get_messages_for_request() is called
+                for tool_call_id, tool_name, content in tool_results:
+                    await context.add_message(
+                        {
+                            "role": "tool",
+                            "name": tool_name,
+                            "tool_call_id": tool_call_id,
+                            "content": content,
+                        }
+                    )
 
         # Check if we exceeded max iterations (only if not unlimited)
         if self.max_iterations != -1 and iteration >= self.max_iterations:
