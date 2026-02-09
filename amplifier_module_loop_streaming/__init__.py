@@ -20,10 +20,12 @@ from amplifier_core.events import CONTENT_BLOCK_END
 from amplifier_core.events import CONTENT_BLOCK_START
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
+from amplifier_core.events import PROVIDER_ERROR
 from amplifier_core.events import PROVIDER_REQUEST
 from amplifier_core.events import TOOL_ERROR
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
+from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolSpec
@@ -336,7 +338,11 @@ class StreamingOrchestrator:
                     for t in tools.values()
                 ]
 
-            chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
+            chat_request = ChatRequest(
+                messages=messages_objects,
+                tools=tools_list,
+                reasoning_effort=self.config.get("reasoning_effort"),
+            )
             logger.info(
                 f"[ORCHESTRATOR] ChatRequest created with {len(tools_list) if tools_list else 0} tools"
             )
@@ -352,7 +358,13 @@ class StreamingOrchestrator:
             if hasattr(provider, "stream"):
                 # Use streaming if available
                 async for chunk in self._stream_from_provider(
-                    provider, chat_request, context, tools, hooks, coordinator
+                    provider,
+                    chat_request,
+                    context,
+                    tools,
+                    hooks,
+                    coordinator,
+                    provider_name=provider_name,
                 ):
                     # Check for immediate cancellation between chunks
                     if coordinator and coordinator.cancellation.is_immediate:
@@ -377,7 +389,28 @@ class StreamingOrchestrator:
                 kwargs = {}
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
-                response = await provider.complete(chat_request, **kwargs)
+                try:
+                    response = await provider.complete(chat_request, **kwargs)
+                except LLMError as e:
+                    await hooks.emit(
+                        PROVIDER_ERROR,
+                        {
+                            "provider": provider_name,
+                            "error": {"type": type(e).__name__, "msg": str(e)},
+                            "retryable": e.retryable,
+                            "status_code": e.status_code,
+                        },
+                    )
+                    raise
+                except Exception as e:
+                    await hooks.emit(
+                        PROVIDER_ERROR,
+                        {
+                            "provider": provider_name,
+                            "error": {"type": type(e).__name__, "msg": str(e)},
+                        },
+                    )
+                    raise
 
                 # Update rate limit timestamp after non-streaming response
                 self._last_provider_call_end = time.monotonic()
@@ -663,7 +696,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     ]
 
                 max_iter_chat_request = ChatRequest(
-                    messages=messages_objects, tools=tools_list
+                    messages=messages_objects,
+                    tools=tools_list,
+                    reasoning_effort=self.config.get("reasoning_effort"),
                 )
 
                 kwargs = {}
@@ -683,14 +718,39 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     # Add to context
                     await context.add_message({"role": "assistant", "content": content})
 
+            except LLMError as e:
+                await hooks.emit(
+                    PROVIDER_ERROR,
+                    {
+                        "provider": provider_name,
+                        "error": {"type": type(e).__name__, "msg": str(e)},
+                        "retryable": e.retryable,
+                        "status_code": e.status_code,
+                    },
+                )
+                logger.error(f"Error getting final response after max iterations: {e}")
             except Exception as e:
+                await hooks.emit(
+                    PROVIDER_ERROR,
+                    {
+                        "provider": provider_name,
+                        "error": {"type": type(e).__name__, "msg": str(e)},
+                    },
+                )
                 logger.error(f"Error getting final response after max iterations: {e}")
 
         # Emit execution end
         await hooks.emit("execution:end", {})
 
     async def _stream_from_provider(
-        self, provider, chat_request, context, tools, hooks, coordinator=None
+        self,
+        provider,
+        chat_request,
+        context,
+        tools,
+        hooks,
+        coordinator=None,
+        provider_name=None,
     ) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming.
 
@@ -701,6 +761,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             tools: Available tools
             hooks: Hook registry
             coordinator: Optional coordinator for cancellation support
+            provider_name: Name of the provider for event emission
         """
         # This is a simplified example
         # Real implementation would handle streaming tool calls
@@ -709,7 +770,30 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
         # Convert tools dict to list for provider
         tools_list = list(tools.values()) if tools else []
-        async for chunk in provider.stream(chat_request, tools=tools_list):
+        try:
+            stream_iter = provider.stream(chat_request, tools=tools_list)
+        except LLMError as e:
+            await hooks.emit(
+                PROVIDER_ERROR,
+                {
+                    "provider": provider_name,
+                    "error": {"type": type(e).__name__, "msg": str(e)},
+                    "retryable": e.retryable,
+                    "status_code": e.status_code,
+                },
+            )
+            raise
+        except Exception as e:
+            await hooks.emit(
+                PROVIDER_ERROR,
+                {
+                    "provider": provider_name,
+                    "error": {"type": type(e).__name__, "msg": str(e)},
+                },
+            )
+            raise
+
+        async for chunk in stream_iter:
             # Check for immediate cancellation between chunks
             if coordinator and coordinator.cancellation.is_immediate:
                 # Add partial response to context before exiting
