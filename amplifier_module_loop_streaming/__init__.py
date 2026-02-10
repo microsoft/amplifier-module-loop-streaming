@@ -7,6 +7,7 @@ Provides token-by-token streaming responses.
 __amplifier_module_type__ = "orchestrator"
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -987,8 +988,24 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
 
-            # Return result content (JSON-serialized for dict/list outputs)
-            content = result.get_serialized_output()
+            # Check if a hook modified the tool result.
+            # hooks.emit() chains modify actions: when a hook
+            # returns action="modify", the data dict is replaced.
+            # We detect this by checking if the returned "result"
+            # is a different object than what we originally sent.
+            modified_result = None
+            if post_result and post_result.data is not None:
+                returned_result = post_result.data.get("result")
+                if returned_result is not None and returned_result is not result_data:
+                    modified_result = returned_result
+
+            if modified_result is not None:
+                if isinstance(modified_result, (dict, list)):
+                    content = json.dumps(modified_result)
+                else:
+                    content = str(modified_result)
+            else:
+                content = result.get_serialized_output()
             return (tool_call.id, tool_call.name, content)
 
         except Exception as e:
@@ -1106,13 +1123,31 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
 
-            # Add result with tool_call_id (JSON-serialized for dict/list outputs)
+            # Check if a hook modified the tool result.
+            # hooks.emit() chains modify actions: when a hook
+            # returns action="modify", the data dict is replaced.
+            # We detect this by checking if the returned "result"
+            # is a different object than what we originally sent.
+            modified_result = None
+            if post_result and post_result.data is not None:
+                returned_result = post_result.data.get("result")
+                if returned_result is not None and returned_result is not result_data:
+                    modified_result = returned_result
+
+            if modified_result is not None:
+                if isinstance(modified_result, (dict, list)):
+                    tool_content = json.dumps(modified_result)
+                else:
+                    tool_content = str(modified_result)
+            else:
+                tool_content = result.get_serialized_output()
+
             await context.add_message(
                 {
                     "role": "tool",
                     "name": tool_call.name,
                     "tool_call_id": tool_call.id,
-                    "content": result.get_serialized_output(),
+                    "content": tool_content,
                 }
             )
             response_added = True
