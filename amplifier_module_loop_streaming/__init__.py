@@ -528,6 +528,15 @@ class StreamingOrchestrator:
                         else ""
                     )
 
+                # --- P1 FIX: Yield intermediate text before tool execution ---
+                # The no-tool-calls branch (line 459) yields text via
+                # _tokenize_stream(). This branch was missing that step,
+                # causing intermediate text to be silently dropped.
+                if response_text:
+                    async for token in self._tokenize_stream(response_text):
+                        yield (token, iteration)
+                # --- END P1 FIX ---
+
                 # Store structured content from response.content (our Pydantic models)
                 response_content = getattr(response, "content", None)
                 if response_content and isinstance(response_content, list):
