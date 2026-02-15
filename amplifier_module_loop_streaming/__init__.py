@@ -123,12 +123,16 @@ class StreamingOrchestrator:
         """
         full_response = ""
         iteration_count = 0
+        last_iteration = -1
         error: Exception | None = None
 
         try:
             async for token, iteration in self._execute_stream(
                 prompt, context, providers, tools, hooks, coordinator
             ):
+                if iteration != last_iteration:
+                    full_response = ""
+                    last_iteration = iteration
                 full_response += token
                 iteration_count = iteration
         except Exception as e:
@@ -527,15 +531,6 @@ class StreamingOrchestrator:
                         if response.content
                         else ""
                     )
-
-                # --- P1 FIX: Yield intermediate text before tool execution ---
-                # The no-tool-calls branch (line 459) yields text via
-                # _tokenize_stream(). This branch was missing that step,
-                # causing intermediate text to be silently dropped.
-                if response_text:
-                    async for token in self._tokenize_stream(response_text):
-                        yield (token, iteration)
-                # --- END P1 FIX ---
 
                 # Store structured content from response.content (our Pydantic models)
                 response_content = getattr(response, "content", None)
