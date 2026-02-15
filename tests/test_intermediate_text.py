@@ -1,9 +1,11 @@
-"""Tests for intermediate text visibility when tool calls are present.
+"""Tests for intermediate text handling when tool calls are present.
 
 Covers:
-- Text blocks accompanying tool calls are yielded to the caller (P1 fix)
-- Content block events fire for text blocks in tool-call responses
+- execute() returns ONLY final iteration text (intermediate text excluded)
+- Content block events fire for text blocks in tool-call responses (hook path)
+- Text content_block:end events fire BEFORE tool execution begins
 - Pure text responses (no tool calls) still work identically (regression)
+- Accumulator resets between iterations (defense-in-depth)
 """
 
 import pytest
@@ -73,16 +75,18 @@ def _response_with_content_blocks(text, tool_calls=None):
 
 
 # ---------------------------------------------------------------------------
-# Test: Text accompanying tool calls MUST be yielded
+# Test: execute() returns only final iteration text
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_text_with_tool_calls_is_yielded():
-    """When LLM returns [TEXT, TOOL_USE], the text must appear in the response.
+async def test_execute_returns_only_final_iteration_text():
+    """execute() must return ONLY the final iteration's text, not intermediate.
 
-    This is the core P1 test. Before the fix, the orchestrator silently drops
-    the text — it's stored in context but never yielded to the caller.
+    The P1 fix yielded intermediate text into the token stream, which caused
+    it to appear in the accumulated return value. After removing that yield,
+    execute() returns only the final iteration's response. Intermediate text
+    is still visible via content_block:end events (tested separately).
     """
     call_count = 0
 
@@ -118,11 +122,11 @@ async def test_text_with_tool_calls_is_yielded():
         hooks=hooks,
     )
 
-    # The intermediate text "Let me check that config file." MUST be in the response
-    assert "Let me check that config file." in result, (
-        f"Intermediate text was not yielded. Full response: {result!r}"
+    # Intermediate text must NOT be in the return value
+    assert "Let me check that config file." not in result, (
+        f"Intermediate text leaked into return value: {result!r}"
     )
-    # The final response text must also be present
+    # Only the final response text should be returned
     assert "Here are the results." in result
 
 
@@ -279,10 +283,11 @@ async def test_pure_text_response_still_works():
 
 @pytest.mark.asyncio
 async def test_empty_text_with_tool_calls():
-    """When tool-call response has empty text, no extra tokens should be yielded.
+    """When tool-call response has empty text, return value is final-only.
 
-    Some LLM responses have empty text blocks before tool calls. The fix must
-    handle this gracefully — no empty string tokens yielded.
+    Some LLM responses have empty text blocks before tool calls. The return
+    value must contain only the final iteration's text — no empty-string
+    artifacts from intermediate iterations.
     """
     call_count = 0
 
@@ -314,5 +319,72 @@ async def test_empty_text_with_tool_calls():
         hooks=hooks,
     )
 
-    # Should contain the final response but no leading garbage from empty text
+    # Return value contains only the final iteration's text
     assert result.strip() == "Final."
+
+
+# ---------------------------------------------------------------------------
+# Test: Accumulator reset ensures final-iteration-only return value
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_accumulator_resets_between_iterations():
+    """execute() must reset its accumulator when the iteration number changes.
+
+    Defense-in-depth: even if _execute_stream yields tokens from multiple
+    iterations, execute() returns only text from the LAST iteration.
+    This tests the iteration-boundary reset in execute().
+    """
+    call_count = 0
+
+    class MultiIterationProvider(_BaseProvider):
+        """Three iterations: two tool-call rounds, then a final text response."""
+
+        async def complete(self, request, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return ChatResponse(
+                    content=[TextBlock(text="Starting analysis...")],
+                    tool_calls=[
+                        ToolCall(id="tc1", name="todo", arguments={"action": "list"})
+                    ],
+                )
+            if call_count == 2:
+                return ChatResponse(
+                    content=[TextBlock(text="Running second check...")],
+                    tool_calls=[
+                        ToolCall(id="tc2", name="todo", arguments={"action": "list"})
+                    ],
+                )
+            # Third call: final response (no tool calls)
+            return ChatResponse(
+                content=[TextBlock(text="All checks complete. Everything looks good.")]
+            )
+
+        def parse_tool_calls(self, response):
+            return getattr(response, "tool_calls", None) or []
+
+    orchestrator = _orch()
+    context = MockContextManager()
+    hooks = EventRecorder()
+
+    result = await orchestrator.execute(
+        prompt="Run full analysis",
+        context=context,
+        providers={"default": MultiIterationProvider()},
+        tools={"todo": SimpleTool()},
+        hooks=hooks,
+    )
+
+    # Return value must be ONLY the final iteration's text
+    assert "All checks complete. Everything looks good." in result
+
+    # Intermediate text from earlier iterations must NOT be present
+    assert "Starting analysis" not in result, (
+        f"Iteration 1 text leaked into return value: {result!r}"
+    )
+    assert "Running second check" not in result, (
+        f"Iteration 2 text leaked into return value: {result!r}"
+    )
