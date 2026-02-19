@@ -1012,7 +1012,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 content = result.get_serialized_output()
             return (tool_call.id, tool_call.name, content)
 
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             # Safety net: errors become error messages
             logger.error(f"Tool {tool_call.name} failed: {e}")
             error_msg = f"Internal error executing tool: {str(e)}"
