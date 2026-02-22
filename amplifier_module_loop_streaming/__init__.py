@@ -611,19 +611,28 @@ class StreamingOrchestrator:
                     tool_results = await asyncio.gather(*tool_tasks)
                 except asyncio.CancelledError:
                     # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
-                    # for ALL tool_calls to maintain tool_use/tool_result pairing
+                    # for ALL tool_calls to maintain tool_use/tool_result pairing.
+                    # Protect from further CancelledError using kernel
+                    # catch-continue-reraise pattern so all results are written.
                     logger.info(
                         "Tool execution cancelled - synthesizing cancelled results"
                     )
                     for tc in tool_calls:
-                        await context.add_message(
-                            {
-                                "role": "tool",
-                                "name": tc.name,
-                                "tool_call_id": tc.id,
-                                "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
-                            }
-                        )
+                        try:
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "name": tc.name,
+                                    "tool_call_id": tc.id,
+                                    "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
+                                }
+                            )
+                        except asyncio.CancelledError:
+                            logger.info(
+                                "CancelledError during synthetic result write - "
+                                "completing remaining writes to prevent "
+                                "orphaned tool_calls"
+                            )
                     # Re-raise to let the cancellation propagate
                     raise
 
@@ -632,7 +641,41 @@ class StreamingOrchestrator:
                     # MUST add tool results to context before returning
                     # Otherwise we leave orphaned tool_calls without matching tool_results
                     # which violates provider API contracts (Anthropic, OpenAI)
+                    # Protect from CancelledError using kernel catch-continue-reraise
+                    # pattern (coordinator.cleanup, hooks.emit) so all results are
+                    # written even if force-cancel arrives mid-loop.
+                    _cancel_error = None
                     for tool_call_id, tool_name, content in tool_results:
+                        try:
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "tool_call_id": tool_call_id,
+                                    "content": content,
+                                }
+                            )
+                        except asyncio.CancelledError:
+                            if _cancel_error is None:
+                                _cancel_error = asyncio.CancelledError()
+                                logger.info(
+                                    "CancelledError during tool result write - "
+                                    "completing remaining writes to prevent "
+                                    "orphaned tool_calls"
+                                )
+                    if _cancel_error is not None:
+                        raise _cancel_error
+                    # Exit the loop - orchestrator complete event will be emitted in execute()
+                    return
+
+                # Add all results to context in original order (sequential, deterministic)
+                # Note: Context manager handles compaction internally when get_messages_for_request() is called
+                # Protect from CancelledError using kernel catch-continue-reraise
+                # pattern so all results are written even if force-cancel arrives
+                # mid-loop.
+                _cancel_error = None
+                for tool_call_id, tool_name, content in tool_results:
+                    try:
                         await context.add_message(
                             {
                                 "role": "tool",
@@ -641,20 +684,16 @@ class StreamingOrchestrator:
                                 "content": content,
                             }
                         )
-                    # Exit the loop - orchestrator complete event will be emitted in execute()
-                    return
-
-                # Add all results to context in original order (sequential, deterministic)
-                # Note: Context manager handles compaction internally when get_messages_for_request() is called
-                for tool_call_id, tool_name, content in tool_results:
-                    await context.add_message(
-                        {
-                            "role": "tool",
-                            "name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "content": content,
-                        }
-                    )
+                    except asyncio.CancelledError:
+                        if _cancel_error is None:
+                            _cancel_error = asyncio.CancelledError()
+                            logger.info(
+                                "CancelledError during tool result write - "
+                                "completing remaining writes to prevent "
+                                "orphaned tool_calls"
+                            )
+                if _cancel_error is not None:
+                    raise _cancel_error
 
         # Check if we exceeded max iterations (only if not unlimited)
         if self.max_iterations != -1 and iteration >= self.max_iterations:
