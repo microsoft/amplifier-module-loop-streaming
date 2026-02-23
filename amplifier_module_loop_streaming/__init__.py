@@ -34,6 +34,23 @@ from amplifier_core.message_models import ToolSpec
 logger = logging.getLogger(__name__)
 
 
+def _normalize_tool_call(tc):
+    """Normalize a tool_call that may be a dict into an object with attribute access.
+
+    Providers may return tool_calls as plain dicts rather than ToolCall objects.
+    This ensures consistent attribute access (.id, .name, .arguments) regardless.
+    """
+    if isinstance(tc, dict):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=tc.get("id"),
+            name=tc.get("name") or tc.get("tool"),
+            arguments=tc.get("arguments") or {},
+        )
+    return tc
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """Mount the streaming orchestrator module."""
     config = config or {}
@@ -532,6 +549,9 @@ class StreamingOrchestrator:
                         else ""
                     )
 
+                # Normalize tool_calls: providers may return dicts instead of ToolCall objects
+                tool_calls = [_normalize_tool_call(tc) for tc in tool_calls]
+
                 # Store structured content from response.content (our Pydantic models)
                 response_content = getattr(response, "content", None)
                 if response_content and isinstance(response_content, list):
@@ -940,6 +960,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         Returns (tool_call_id, name, content) tuple.
         Never raises - errors become error messages.
         """
+        tool_call = _normalize_tool_call(tool_call)
         try:
             # Pre-tool hook
             pre_result = await hooks.emit(
@@ -1079,6 +1100,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         Guarantees that a tool response is always added to context, even if errors occur.
         This prevents orphaned tool calls that corrupt conversation state.
         """
+        tool_call = _normalize_tool_call(tool_call)
         response_added = False
 
         try:
