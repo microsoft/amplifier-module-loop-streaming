@@ -1007,14 +1007,27 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     tool_call.id, tool_call.name
                 )
 
+            # Set dispatch context on coordinator so tools (e.g. delegate) can
+            # read the framework-assigned tool_call_id and parallel_group_id.
+            # Uses setattr to avoid type errors on the dynamic private attribute.
+            if coordinator:
+                setattr(
+                    coordinator,
+                    "_tool_dispatch_context",
+                    {
+                        "tool_call_id": tool_call.id,
+                        "parallel_group_id": parallel_group_id,
+                    },
+                )
             # Execute
             try:
                 result = await tool.execute(tool_call.arguments)
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
             finally:
-                # Always unregister tool from cancellation token
+                # Clear dispatch context and unregister tool from cancellation token
                 if coordinator:
+                    setattr(coordinator, "_tool_dispatch_context", {})
                     coordinator.cancellation.register_tool_complete(tool_call.id)
 
             # Serialize result for logging
@@ -1148,11 +1161,23 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 response_added = True
                 return {"success": False, "error": "Tool not found"}
 
+            # Set dispatch context on coordinator so tools (e.g. delegate) can
+            # read the framework-assigned tool_call_id.  parallel_group_id is
+            # not available on this legacy path, so it is set to None.
+            if coordinator:
+                setattr(
+                    coordinator,
+                    "_tool_dispatch_context",
+                    {"tool_call_id": tool_call.id, "parallel_group_id": None},
+                )
             # Execute
             try:
                 result = await tool.execute(tool_call.arguments)
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
+            finally:
+                if coordinator:
+                    setattr(coordinator, "_tool_dispatch_context", {})
 
             # Serialize result for logging
             result_data = (
