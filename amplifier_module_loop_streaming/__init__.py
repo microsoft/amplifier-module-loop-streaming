@@ -163,6 +163,10 @@ class StreamingOrchestrator:
         else:
             status = "success" if full_response else "incomplete"
 
+        # Emit execution:end with response and status — fires on ALL exit paths
+        # (normal completion, cancellation, error, no provider, provider:request deny)
+        await hooks.emit("execution:end", {"response": full_response, "status": status})
+
         await hooks.emit(
             ORCHESTRATOR_COMPLETE,
             {
@@ -803,8 +807,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 )
                 logger.error(f"Error getting final response after max iterations: {e}")
 
-        # Emit execution end
-        await hooks.emit("execution:end", {})
+        # execution:end is emitted in execute() where response and status are known
 
     async def _stream_from_provider(
         self,
