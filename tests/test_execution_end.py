@@ -7,10 +7,12 @@ Covers:
 - No response: status="incomplete"
 - Error path: status="error", execution:end still fires
 - Cancellation path: status="cancelled", execution:end still fires
+- CancelledError propagation path: execution:end fires even when CancelledError bypasses except Exception
 - No provider available: execution:end still fires
 - execution:end fires exactly once (not duplicated)
 """
 
+import asyncio
 
 import pytest
 from amplifier_core.message_models import ChatResponse, TextBlock
@@ -229,3 +231,57 @@ async def test_execution_end_fires_exactly_once_on_success():
     assert len(end_events) == 1, (
         f"execution:end must fire exactly once, fired {len(end_events)} times"
     )
+
+
+# ---------------------------------------------------------------------------
+# CancelledError path — status="cancelled", execution:end still fires
+#
+# asyncio.CancelledError is a BaseException in Python 3.8+, NOT an Exception.
+# A bare `except Exception` block does NOT catch it, so execution:end would be
+# silently skipped whenever a provider raises CancelledError.  The fix is to
+# add explicit `except asyncio.CancelledError` + `finally` so execution:end is
+# guaranteed on every exit path.
+# ---------------------------------------------------------------------------
+
+
+class CancelledProvider(_BaseProvider):
+    """Provider that raises asyncio.CancelledError — simulates task cancellation."""
+
+    async def complete(self, request, **kwargs):
+        raise asyncio.CancelledError("task cancelled")
+
+    def parse_tool_calls(self, response):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_execution_end_fires_on_cancelled_error():
+    """execution:end fires with status='cancelled' when CancelledError propagates.
+
+    Regression guard for the missing `except asyncio.CancelledError` path.
+    Without the fix, execution:end is silently skipped because CancelledError
+    is a BaseException (Python 3.8+) that bypasses `except Exception` blocks.
+    """
+    orchestrator = _orch()
+    provider = CancelledProvider()
+    context = MockContextManager()
+    hooks = EventRecorder()
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.execute(
+            prompt="Test",
+            context=context,
+            providers={"default": provider},
+            tools={},
+            hooks=hooks,
+        )
+
+    end_events = _get_execution_end_events(hooks)
+    assert len(end_events) == 1, (
+        f"execution:end must fire on CancelledError path, fired {len(end_events)} times"
+    )
+    _, data = end_events[0]
+    assert data["status"] == "cancelled", (
+        f"Expected status='cancelled', got {data['status']!r}"
+    )
+    assert "response" in data

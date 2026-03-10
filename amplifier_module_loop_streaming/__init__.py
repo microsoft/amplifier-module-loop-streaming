@@ -142,6 +142,10 @@ class StreamingOrchestrator:
         iteration_count = 0
         last_iteration = -1
         error: Exception | None = None
+        # Initialized before try/except so the finally block always has a valid
+        # status to emit.  The except branches overwrite it; the finally block
+        # refines it for the normal-completion path.
+        status = "success"
 
         try:
             async for token, iteration in self._execute_stream(
@@ -152,20 +156,32 @@ class StreamingOrchestrator:
                     last_iteration = iteration
                 full_response += token
                 iteration_count = iteration
+        except asyncio.CancelledError:
+            # asyncio.CancelledError is a BaseException in Python 3.8+, NOT an
+            # Exception.  A bare `except Exception` block does NOT catch it, so
+            # without this clause execution:end would be silently skipped on
+            # task cancellation.  We set status here so the finally block emits
+            # the right value, then re-raise to let cancellation propagate.
+            status = "cancelled"
+            raise
         except Exception as e:
             error = e
-
-        # Always emit orchestrator complete event (observability)
-        if error:
             status = "error"
-        elif coordinator and coordinator.cancellation.is_cancelled:
-            status = "cancelled"
-        else:
-            status = "success" if full_response else "incomplete"
-
-        # Emit execution:end with response and status — fires on ALL exit paths
-        # (normal completion, cancellation, error, no provider, provider:request deny)
-        await hooks.emit("execution:end", {"response": full_response, "status": status})
+        finally:
+            # Refine status on the normal-completion path (neither except branch
+            # ran, so status is still "success" — check the cancellation flag and
+            # empty-response edge case).
+            if status == "success":
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    status = "cancelled"
+                elif not full_response:
+                    status = "incomplete"
+            # Emit execution:end — guaranteed to fire on ALL exit paths:
+            # normal completion, explicit error, CancelledError, no provider,
+            # and provider:request deny.
+            await hooks.emit(
+                "execution:end", {"response": full_response, "status": status}
+            )
 
         await hooks.emit(
             ORCHESTRATOR_COMPLETE,
@@ -1120,13 +1136,25 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         response_added = False
 
         try:
-            # Pre-tool hook
+            # Set dispatch context on coordinator so tools (e.g. delegate) can
+            # read the framework-assigned tool_call_id.  parallel_group_id is
+            # not available on this legacy path, so it is set to None.
+            if coordinator:
+                setattr(
+                    coordinator,
+                    "_tool_dispatch_context",
+                    {"tool_call_id": tool_call.id, "parallel_group_id": None},
+                )
+
+            # Pre-tool hook — parallel_group_id is None on this legacy path;
+            # included for schema consistency with the parallel execution path.
             pre_result = await hooks.emit(
                 TOOL_PRE,
                 {
                     "tool_name": tool_call.name,
                     "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
+                    "parallel_group_id": None,
                 },
             )
             if coordinator:
@@ -1160,16 +1188,6 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 )
                 response_added = True
                 return {"success": False, "error": "Tool not found"}
-
-            # Set dispatch context on coordinator so tools (e.g. delegate) can
-            # read the framework-assigned tool_call_id.  parallel_group_id is
-            # not available on this legacy path, so it is set to None.
-            if coordinator:
-                setattr(
-                    coordinator,
-                    "_tool_dispatch_context",
-                    {"tool_call_id": tool_call.id, "parallel_group_id": None},
-                )
             # Execute
             try:
                 result = await tool.execute(tool_call.arguments)
@@ -1184,7 +1202,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 result.model_dump() if hasattr(result, "model_dump") else str(result)
             )
 
-            # Post-tool hook
+            # Post-tool hook — parallel_group_id is None on this legacy path;
+            # included for schema consistency with the parallel execution path.
             post_result = await hooks.emit(
                 TOOL_POST,
                 {
@@ -1192,6 +1211,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
+                    "parallel_group_id": None,
                 },
             )
             if coordinator:
