@@ -26,6 +26,7 @@ from amplifier_core.events import PROVIDER_REQUEST
 from amplifier_core.events import TOOL_ERROR
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
+from amplifier_core.llm_errors import ContextLengthError
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import Message
@@ -261,6 +262,7 @@ class StreamingOrchestrator:
                 break
 
         iteration = 0
+        _provider_retries = 0
 
         while self.max_iterations == -1 or iteration < self.max_iterations:
             # Check for cancellation at iteration start
@@ -399,19 +401,61 @@ class StreamingOrchestrator:
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
                 # Use streaming if available
-                async for chunk in self._stream_from_provider(
-                    provider,
-                    chat_request,
-                    context,
-                    tools,
-                    hooks,
-                    coordinator,
-                    provider_name=provider_name,
-                ):
-                    # Check for immediate cancellation between chunks
-                    if coordinator and coordinator.cancellation.is_immediate:
-                        return
-                    yield (chunk, iteration)
+                try:
+                    async for chunk in self._stream_from_provider(
+                        provider,
+                        chat_request,
+                        context,
+                        tools,
+                        hooks,
+                        coordinator,
+                        provider_name=provider_name,
+                    ):
+                        # Check for immediate cancellation between chunks
+                        if coordinator and coordinator.cancellation.is_immediate:
+                            return
+                        yield (chunk, iteration)
+                except ContextLengthError as e:
+                    await hooks.emit(
+                        PROVIDER_ERROR,
+                        {
+                            "provider": provider_name,
+                            "error": {"type": "ContextLengthError", "msg": str(e)},
+                            "retryable": False,
+                            "status_code": getattr(e, "status_code", None),
+                        },
+                    )
+                    logger.error(
+                        "Context window exceeded: %s. "
+                        "Session transcript too large for model.",
+                        e,
+                    )
+                    yield (
+                        "\nError: Context window exceeded. "
+                        "The session transcript has grown too large for this "
+                        "model's context window. "
+                        "Please start a new session to continue.",
+                        iteration,
+                    )
+                    break
+                except LLMError as e:
+                    if e.retryable and _provider_retries < 3:
+                        _provider_retries += 1
+                        delay = min(2 ** _provider_retries, 30)
+                        logger.warning(
+                            "Retryable provider error (attempt %d/3), "
+                            "retrying in %ds: %s",
+                            _provider_retries,
+                            delay,
+                            e,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    # Non-retryable or retries exhausted — let it propagate
+                    raise
+
+                # Success — reset retry counter
+                _provider_retries = 0
 
                 # Update rate limit timestamp after streaming completes
                 self._last_provider_call_end = time.monotonic()
@@ -433,6 +477,29 @@ class StreamingOrchestrator:
                     kwargs["extended_thinking"] = True
                 try:
                     response = await provider.complete(chat_request, **kwargs)
+                except ContextLengthError as e:
+                    await hooks.emit(
+                        PROVIDER_ERROR,
+                        {
+                            "provider": provider_name,
+                            "error": {"type": "ContextLengthError", "msg": str(e)},
+                            "retryable": False,
+                            "status_code": getattr(e, "status_code", None),
+                        },
+                    )
+                    logger.error(
+                        "Context window exceeded: %s. "
+                        "Session transcript too large for model.",
+                        e,
+                    )
+                    yield (
+                        "\nError: Context window exceeded. "
+                        "The session transcript has grown too large for this "
+                        "model's context window. "
+                        "Please start a new session to continue.",
+                        iteration,
+                    )
+                    break
                 except LLMError as e:
                     await hooks.emit(
                         PROVIDER_ERROR,
@@ -443,6 +510,18 @@ class StreamingOrchestrator:
                             "status_code": e.status_code,
                         },
                     )
+                    if e.retryable and _provider_retries < 3:
+                        _provider_retries += 1
+                        delay = min(2 ** _provider_retries, 30)
+                        logger.warning(
+                            "Retryable provider error (attempt %d/3), "
+                            "retrying in %ds: %s",
+                            _provider_retries,
+                            delay,
+                            e,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
                     raise
                 except Exception as e:
                     await hooks.emit(
@@ -453,6 +532,9 @@ class StreamingOrchestrator:
                         },
                     )
                     raise
+
+                # Success — reset retry counter
+                _provider_retries = 0
 
                 # Update rate limit timestamp after non-streaming response
                 self._last_provider_call_end = time.monotonic()
