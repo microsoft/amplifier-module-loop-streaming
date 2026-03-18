@@ -20,6 +20,7 @@ from amplifier_core import ToolResult
 from amplifier_core.events import CONTENT_BLOCK_END
 from amplifier_core.events import CONTENT_BLOCK_START
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
+from amplifier_core.events import PROMPT_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
 from amplifier_core.events import PROVIDER_ERROR
 from amplifier_core.events import PROVIDER_REQUEST
@@ -181,6 +182,15 @@ class StreamingOrchestrator:
             # and provider:request deny.
             await hooks.emit(
                 "execution:end", {"response": full_response, "status": status}
+            )
+
+        if not error:
+            await hooks.emit(
+                PROMPT_COMPLETE,
+                {
+                    "response_preview": (full_response or "")[:200],
+                    "length": len(full_response or ""),
+                },
             )
 
         await hooks.emit(
