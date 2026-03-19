@@ -27,6 +27,7 @@ from amplifier_core.events import PROVIDER_REQUEST
 from amplifier_core.events import TOOL_ERROR
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
+from amplifier_core.llm_errors import InvalidRequestError
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import Message
@@ -271,6 +272,8 @@ class StreamingOrchestrator:
                 break
 
         iteration = 0
+        _proactive_heal_done = False  # Guard: proactive orphan scan runs at most once
+        _reactive_heal_done = False  # Guard: reactive orphan catch runs at most once
 
         while self.max_iterations == -1 or iteration < self.max_iterations:
             # Check for cancellation at iteration start
@@ -296,6 +299,18 @@ class StreamingOrchestrator:
             # Pass provider for dynamic budget calculation based on model's context window
             message_dicts = await context.get_messages_for_request(provider=provider)
             message_dicts = list(message_dicts)  # Convert to list for modification
+
+            # Proactive healing: fix orphaned tool calls before they reach the
+            # provider.  This handles resumed sessions where the previous run
+            # was interrupted mid-tool-execution.  We only attempt once per
+            # execute() call to avoid infinite loops.
+            if not _proactive_heal_done:
+                orphans = self._find_orphaned_tool_calls(message_dicts)
+                if orphans:
+                    _proactive_heal_done = True
+                    await self._heal_orphaned_tool_calls(orphans, context, hooks)
+                    iteration -= 1  # Don't count healing pass as an iteration
+                    continue  # Re-fetch messages (now includes synthetic results)
 
             # Append ephemeral injection if present (temporary, not stored)
             if (
@@ -409,19 +424,54 @@ class StreamingOrchestrator:
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
                 # Use streaming if available
-                async for chunk in self._stream_from_provider(
-                    provider,
-                    chat_request,
-                    context,
-                    tools,
-                    hooks,
-                    coordinator,
-                    provider_name=provider_name,
-                ):
-                    # Check for immediate cancellation between chunks
-                    if coordinator and coordinator.cancellation.is_immediate:
-                        return
-                    yield (chunk, iteration)
+                try:
+                    async for chunk in self._stream_from_provider(
+                        provider,
+                        chat_request,
+                        context,
+                        tools,
+                        hooks,
+                        coordinator,
+                        provider_name=provider_name,
+                    ):
+                        # Check for immediate cancellation between chunks
+                        if coordinator and coordinator.cancellation.is_immediate:
+                            return
+                        yield (chunk, iteration)
+                except LLMError as e:
+                    # Reactive healing for streaming path
+                    if (
+                        isinstance(e, InvalidRequestError)
+                        and "tool_use" in str(e)
+                        and "tool_result" in str(e)
+                        and not _reactive_heal_done
+                    ):
+                        logger.warning(
+                            "[ORCHESTRATOR] Streaming provider rejected "
+                            "orphaned tool_use, healing reactively: %s",
+                            e,
+                        )
+                        orphans = self._find_orphaned_tool_calls(message_dicts)
+                        if orphans:
+                            await self._heal_orphaned_tool_calls(
+                                orphans, context, hooks
+                            )
+                            _reactive_heal_done = True
+                            continue  # Retry with healed context
+
+                    await hooks.emit(
+                        PROVIDER_ERROR,
+                        {
+                            "provider": provider_name,
+                            "error": {
+                                "type": type(e).__name__,
+                                "msg": str(e),
+                            },
+                            "retryable": e.retryable,
+                            "status_code": e.status_code,
+                        },
+                    )
+                    raise
 
                 # Update rate limit timestamp after streaming completes
                 self._last_provider_call_end = time.monotonic()
@@ -444,6 +494,28 @@ class StreamingOrchestrator:
                 try:
                     response = await provider.complete(chat_request, **kwargs)
                 except LLMError as e:
+                    # Reactive healing: if the provider rejects orphaned
+                    # tool_use blocks (proactive check somehow missed them),
+                    # heal context and retry once.
+                    if (
+                        isinstance(e, InvalidRequestError)
+                        and "tool_use" in str(e)
+                        and "tool_result" in str(e)
+                        and not _reactive_heal_done
+                    ):
+                        logger.warning(
+                            "[ORCHESTRATOR] Provider rejected orphaned "
+                            "tool_use, healing reactively: %s",
+                            e,
+                        )
+                        orphans = self._find_orphaned_tool_calls(message_dicts)
+                        if orphans:
+                            await self._heal_orphaned_tool_calls(
+                                orphans, context, hooks
+                            )
+                            _reactive_heal_done = True
+                            continue  # Retry with healed context
+
                     await hooks.emit(
                         PROVIDER_ERROR,
                         {
@@ -834,6 +906,131 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 logger.error(f"Error getting final response after max iterations: {e}")
 
         # execution:end is emitted in execute() where response and status are known
+
+    # ---- Orphaned tool-call healing ----------------------------------------
+    #
+    # When a session is interrupted mid-tool-execution (hard cancel, env
+    # failure, crash), the assistant message with tool_use blocks is persisted
+    # but the corresponding tool_result messages are not.  On the next
+    # interaction the provider rejects the request with:
+    #
+    #   "tool_use ids were found without tool_result blocks immediately after"
+    #
+    # The two methods below detect and repair these orphans so the session can
+    # continue without manual intervention.
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def _find_orphaned_tool_calls(messages: list[dict]) -> dict[str, str]:
+        """Find tool_call IDs in *messages* that lack a matching tool_result.
+
+        Scans raw message dicts (as returned by ``context.get_messages_for_request``)
+        for tool calls in assistant messages that have no corresponding tool
+        result message anywhere later in the history.
+
+        Returns:
+            Dict mapping ``{orphaned_tool_call_id: tool_name}``.
+        """
+        called: dict[str, str] = {}  # id -> tool name
+        result_ids: set[str] = set()
+
+        for msg in messages:
+            role = msg.get("role", "")
+
+            if role == "assistant":
+                # --- tool_calls array (OpenAI / kernel format) ---
+                for tc in msg.get("tool_calls", []):
+                    tc_id = (
+                        tc.get("id")
+                        if isinstance(tc, dict)
+                        else getattr(tc, "id", None)
+                    )
+                    tc_name = (
+                        tc.get("name", "unknown")
+                        if isinstance(tc, dict)
+                        else getattr(tc, "name", "unknown")
+                    )
+                    if tc_id:
+                        called[tc_id] = tc_name
+
+                # --- content blocks (may contain tool_use / tool_call dicts) ---
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") in ("tool_use", "tool_call"):
+                                block_id = block.get("id", "")
+                                block_name = block.get("name", "unknown")
+                                if block_id:
+                                    called[block_id] = block_name
+                        elif hasattr(block, "type") and getattr(
+                            block, "type", None
+                        ) in ("tool_use", "tool_call"):
+                            block_id = getattr(block, "id", "")
+                            block_name = getattr(block, "name", "unknown")
+                            if block_id:
+                                called[block_id] = block_name
+
+            elif role == "tool":
+                tc_id = msg.get("tool_call_id")
+                if tc_id:
+                    result_ids.add(tc_id)
+
+        return {id_: name for id_, name in called.items() if id_ not in result_ids}
+
+    async def _heal_orphaned_tool_calls(
+        self,
+        orphans: dict[str, str],
+        context,
+        hooks: HookRegistry,
+    ) -> None:
+        """Inject synthetic tool_result messages for *orphans* into *context*.
+
+        Each orphaned tool_call receives an error result explaining that the
+        tool execution was interrupted.  The results are persisted via
+        ``context.add_message`` so subsequent provider calls see a balanced
+        history.
+
+        Args:
+            orphans: Mapping of ``{tool_call_id: tool_name}`` from
+                :meth:`_find_orphaned_tool_calls`.
+            context: The session context manager.
+            hooks: Hook registry for event emission.
+        """
+        logger.warning(
+            "[ORCHESTRATOR] Healing %d orphaned tool call(s): %s",
+            len(orphans),
+            list(orphans.keys()),
+        )
+
+        for call_id, tool_name in orphans.items():
+            await context.add_message(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": tool_name,
+                    "content": json.dumps(
+                        {
+                            "error": "Tool execution was interrupted",
+                            "interrupted": True,
+                            "message": (
+                                "This tool call was in progress when the session "
+                                "was interrupted. The result was lost. You may "
+                                "need to re-invoke this tool."
+                            ),
+                        }
+                    ),
+                }
+            )
+
+        await hooks.emit(
+            "orchestrator:tool_calls_healed",
+            {
+                "healed_count": len(orphans),
+                "tool_call_ids": list(orphans.keys()),
+                "tool_names": list(orphans.values()),
+            },
+        )
 
     async def _stream_from_provider(
         self,
