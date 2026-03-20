@@ -33,13 +33,11 @@ allow-direct-references = true
 
 [dependency-groups]
 dev = [
-    "amplifier-core",
+    "amplifier-core>=1.0.10",
     "pytest>=8.0.0",
     "pytest-asyncio>=1.0.0",
 ]
 
-[tool.uv.sources]
-amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
