@@ -93,6 +93,115 @@ class StreamingOrchestrator:
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
 
+    def _repair_message_sequence(
+        self, message_dicts: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Ensure tool_results immediately follow their tool_call assistant messages.
+
+        When a user submits a new prompt during long-running tool execution (e.g.,
+        a 4-minute recipe), the user message can get interleaved between an
+        assistant message with tool_calls and its corresponding tool_results.
+
+        Anthropic (and OpenAI) require:
+            assistant (with tool_use) → tool_result(s) → next message
+
+        This method reorders messages to satisfy that contract, regardless of
+        how they arrived in context.
+
+        Returns:
+            A new list with correct tool_call → tool_result adjacency.
+            If no reordering is needed, returns the original list unchanged.
+        """
+        # Step 1: Build a map of tool_call_id → tool_result message
+        tool_result_msgs: dict[str, dict[str, Any]] = {}
+        for msg in message_dicts:
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                tool_result_msgs[msg["tool_call_id"]] = msg
+
+        if not tool_result_msgs:
+            return message_dicts  # No tool results at all, nothing to repair
+
+        # Step 2: Find all tool_call IDs from assistant messages
+        expected_tool_ids: set[str] = set()
+        for msg in message_dicts:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        expected_tool_ids.add(tc_id)
+
+        if not expected_tool_ids:
+            return message_dicts  # No tool calls, nothing to repair
+
+        # Step 3: Check if repair is needed — are all tool_results immediately
+        # after their assistant messages?
+        needs_repair = False
+        for i, msg in enumerate(message_dicts):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                tc_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+                # Check that the next len(tc_ids) messages are matching tool results
+                expected_pos = i + 1
+                for tc_id in tc_ids:
+                    if expected_pos >= len(message_dicts):
+                        needs_repair = True
+                        break
+                    next_msg = message_dicts[expected_pos]
+                    if (
+                        next_msg.get("role") != "tool"
+                        or next_msg.get("tool_call_id") not in tc_ids
+                    ):
+                        needs_repair = True
+                        break
+                    expected_pos += 1
+                if needs_repair:
+                    break
+
+        if not needs_repair:
+            return message_dicts
+
+        # Step 4: Rebuild the message list with correct ordering
+        # - Tool results are relocated to immediately follow their assistant message
+        # - Messages that aren't tool results keep their relative order
+        relocated_tool_result_ids: set[str] = set()
+        repaired: list[dict[str, Any]] = []
+
+        for msg in message_dicts:
+            # Skip tool results that belong to a known tool_call — they'll be
+            # re-inserted after the assistant message
+            if (
+                msg.get("role") == "tool"
+                and msg.get("tool_call_id") in expected_tool_ids
+            ):
+                continue
+
+            repaired.append(msg)
+
+            # After an assistant message with tool_calls, insert matching results
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id and tc_id in tool_result_msgs:
+                        repaired.append(tool_result_msgs[tc_id])
+                        relocated_tool_result_ids.add(tc_id)
+
+        # Log the repair for observability
+        missing_ids = expected_tool_ids - relocated_tool_result_ids
+        if relocated_tool_result_ids:
+            logger.warning(
+                f"[ORCHESTRATOR] Repaired message sequence: relocated "
+                f"{len(relocated_tool_result_ids)} tool result(s) to restore "
+                f"tool_call→tool_result adjacency. "
+                f"Relocated IDs: {relocated_tool_result_ids}"
+            )
+        if missing_ids:
+            logger.warning(
+                f"[ORCHESTRATOR] {len(missing_ids)} tool_call(s) still have "
+                f"no matching tool_result after repair: {missing_ids}. "
+                f"Provider-level repair may inject synthetic results."
+            )
+
+        return repaired
+
     async def _apply_rate_limit_delay(
         self, hooks: HookRegistry, iteration: int
     ) -> None:
@@ -374,6 +483,12 @@ class StreamingOrchestrator:
                         )
                 # Clear pending injections after applying
                 self._pending_ephemeral_injections = []
+
+            # Repair message sequence before sending to provider.
+            # This fixes the case where user messages get interleaved between
+            # tool_call assistant messages and their tool_results (e.g., when
+            # a user submits a new prompt during long-running tool execution).
+            message_dicts = self._repair_message_sequence(message_dicts)
 
             # Convert dicts to ChatRequest for provider
             messages_objects = [Message(**msg) for msg in message_dicts]
@@ -774,24 +889,22 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             )
 
             try:
+                # Repair message sequence before the final call (same fix as
+                # the main loop — interleaved user messages can corrupt the
+                # tool_call→tool_result adjacency here too).
+                message_dicts = self._repair_message_sequence(message_dicts)
+
                 # Convert dicts to ChatRequest
                 messages_objects = [Message(**msg) for msg in message_dicts]
 
-                # Convert tools to ToolSpec format for ChatRequest
-                tools_list = None
-                if tools:
-                    tools_list = [
-                        ToolSpec(
-                            name=t.name,
-                            description=t.description,
-                            parameters=t.input_schema,
-                        )
-                        for t in tools.values()
-                    ]
-
+                # Do NOT pass tools on the final max-iterations call.
+                # If the LLM responds with tool_use blocks here, there is no
+                # loop iteration to dispatch them — they would be orphaned in
+                # context, triggering the exact tool_use/tool_result mismatch
+                # error this module is trying to prevent.
                 max_iter_chat_request = ChatRequest(
                     messages=messages_objects,
-                    tools=tools_list,
+                    tools=None,
                     reasoning_effort=self.config.get("reasoning_effort"),
                 )
 
@@ -1114,8 +1227,14 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 content = result.get_serialized_output()
             return (tool_call.id, tool_call.name, content)
 
-        except (Exception, asyncio.CancelledError) as e:
-            # Safety net: errors become error messages
+        except asyncio.CancelledError:
+            # CancelledError must propagate — swallowing it breaks asyncio's
+            # cooperative cancellation protocol and prevents asyncio.gather()
+            # from correctly cancelling sibling tasks and propagating upward.
+            logger.info(f"Tool {tool_call.name} cancelled (CancelledError propagating)")
+            raise
+        except Exception as e:
+            # Safety net: non-cancellation errors become error messages
             logger.error(f"Tool {tool_call.name} failed: {e}")
             error_msg = f"Internal error executing tool: {str(e)}"
             await hooks.emit(
@@ -1305,14 +1424,36 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             return {"success": False, "error": str(e)}
 
     async def _has_pending_tools(self, context) -> bool:
-        """Check if there are pending tool calls."""
-        # Simplified - would need to track tool calls properly
+        """Check if there are pending tool calls in the streaming path.
+
+        WARNING: The streaming path (_stream_from_provider) does not currently
+        extract structured tool_call blocks from streamed responses. It only
+        collects text content. Until the streaming path is enhanced to parse
+        tool_use blocks from stream chunks, this will always return False.
+
+        If a provider with a .stream() method returns tool_use blocks, those
+        blocks will be stored as raw text (not structured tool_calls) and no
+        tools will be dispatched. The next LLM call will likely fail because
+        the context has an assistant message containing tool_use text without
+        matching tool_result messages.
+        """
+        logger.warning(
+            "[ORCHESTRATOR] _has_pending_tools called on streaming path. "
+            "Streaming tool dispatch is not implemented. Tool calls in "
+            "streamed responses will be silently dropped. Consider using "
+            "a provider without a .stream() method to ensure tool dispatch."
+        )
         return False
 
     async def _process_tools(self, context, tools, hooks) -> None:
-        """Process any pending tool calls."""
-        # Simplified - would process tracked tool calls
-        pass
+        """Process pending tool calls from the streaming path.
+
+        WARNING: Not implemented. See _has_pending_tools docstring.
+        """
+        logger.warning(
+            "[ORCHESTRATOR] _process_tools called on streaming path but "
+            "streaming tool dispatch is not implemented."
+        )
 
     def _select_provider(self, providers: dict[str, Any]) -> Any:
         """Select a provider based on priority."""
