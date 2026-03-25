@@ -92,6 +92,8 @@ class StreamingOrchestrator:
         self._last_provider_call_end: float | None = None  # Timestamp tracking
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
+        # Track whether we've already logged a message-sequence repair this turn
+        self._repair_logged: bool = False
 
     def _repair_message_sequence(
         self, message_dicts: list[dict[str, Any]]
@@ -184,21 +186,24 @@ class StreamingOrchestrator:
                         repaired.append(tool_result_msgs[tc_id])
                         relocated_tool_result_ids.add(tc_id)
 
-        # Log the repair for observability
+        # Log the repair for observability — only once per session to avoid
+        # spamming on every subsequent turn (the same reordering will be
+        # applied each time the corrupted history is sent to the provider).
         missing_ids = expected_tool_ids - relocated_tool_result_ids
-        if relocated_tool_result_ids:
-            logger.warning(
-                f"[ORCHESTRATOR] Repaired message sequence: relocated "
-                f"{len(relocated_tool_result_ids)} tool result(s) to restore "
-                f"tool_call→tool_result adjacency. "
-                f"Relocated IDs: {relocated_tool_result_ids}"
-            )
-        if missing_ids:
-            logger.warning(
-                f"[ORCHESTRATOR] {len(missing_ids)} tool_call(s) still have "
-                f"no matching tool_result after repair: {missing_ids}. "
-                f"Provider-level repair may inject synthetic results."
-            )
+        if not self._repair_logged:
+            if relocated_tool_result_ids:
+                logger.warning(
+                    f"[ORCHESTRATOR] Repaired message sequence: relocated "
+                    f"{len(relocated_tool_result_ids)} tool result(s) to "
+                    f"restore tool_call→tool_result adjacency."
+                )
+            if missing_ids:
+                logger.warning(
+                    f"[ORCHESTRATOR] {len(missing_ids)} tool_call(s) have "
+                    f"no matching tool_result — provider may inject "
+                    f"synthetic results."
+                )
+            self._repair_logged = True
 
         return repaired
 
