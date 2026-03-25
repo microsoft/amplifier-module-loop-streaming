@@ -93,22 +93,27 @@ class StreamingOrchestrator:
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
         # Track whether we've already logged a message-sequence repair this turn
-        self._repair_logged: bool = False
+        # Track tool_call IDs for which we've already persisted synthetic
+        # results to context.  Prevents duplicate synthesis across turns.
+        self._synthesized_tool_ids: set[str] = set()
+        # Tracks whether a one-time log about reordering has been emitted.
+        self._reorder_logged: bool = False
 
-    def _repair_message_sequence(
-        self, message_dicts: list[dict[str, Any]]
+    async def _repair_message_sequence(
+        self, message_dicts: list[dict[str, Any]], context
     ) -> list[dict[str, Any]]:
         """Ensure tool_results immediately follow their tool_call assistant messages.
 
-        When a user submits a new prompt during long-running tool execution (e.g.,
-        a 4-minute recipe), the user message can get interleaved between an
-        assistant message with tool_calls and its corresponding tool_results.
+        Handles two failure modes:
 
-        Anthropic (and OpenAI) require:
-            assistant (with tool_use) → tool_result(s) → next message
+        1. **Misordered results** — a user message was inserted between an
+           assistant's tool_call and its tool_result (e.g., user submitted a
+           new prompt during a long-running recipe).  Fixed by reordering.
 
-        This method reorders messages to satisfy that contract, regardless of
-        how they arrived in context.
+        2. **Completely missing results** — a tool was cancelled mid-execution
+           and never wrote a tool_result to context.  Fixed by synthesising a
+           persistent error result and writing it to context so future turns
+           don't hit the same gap.
 
         Returns:
             A new list with correct tool_call → tool_result adjacency.
@@ -120,28 +125,62 @@ class StreamingOrchestrator:
             if msg.get("role") == "tool" and msg.get("tool_call_id"):
                 tool_result_msgs[msg["tool_call_id"]] = msg
 
-        if not tool_result_msgs:
-            return message_dicts  # No tool results at all, nothing to repair
-
-        # Step 2: Find all tool_call IDs from assistant messages
+        # Step 2: Collect all tool_call IDs and their names from assistant messages
         expected_tool_ids: set[str] = set()
+        tool_call_names: dict[str, str] = {}
         for msg in message_dicts:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     tc_id = tc.get("id")
                     if tc_id:
                         expected_tool_ids.add(tc_id)
+                        tool_call_names[tc_id] = (
+                            tc.get("tool") or tc.get("name") or "unknown"
+                        )
 
         if not expected_tool_ids:
             return message_dicts  # No tool calls, nothing to repair
 
-        # Step 3: Check if repair is needed — are all tool_results immediately
-        # after their assistant messages?
+        # Step 3: Synthesise persistent results for completely missing tool_results.
+        # This must happen BEFORE the reordering check so the synthesised results
+        # are available for correct placement.
+        missing_ids = expected_tool_ids - set(tool_result_msgs.keys())
+        # Exclude IDs we've already synthesised in a prior turn
+        new_missing = missing_ids - self._synthesized_tool_ids
+        if new_missing:
+            for tc_id in new_missing:
+                tool_name = tool_call_names.get(tc_id, "unknown")
+                synthetic = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": tool_name,
+                    "content": (
+                        f"[Tool result unavailable — execution was interrupted "
+                        f"or cancelled. Tool: {tool_name}]"
+                    ),
+                }
+                # Persist to context so it's there for all future turns
+                await context.add_message(synthetic)
+                # Also add to our local map so the reorder step can place it
+                tool_result_msgs[tc_id] = synthetic
+                self._synthesized_tool_ids.add(tc_id)
+
+            logger.warning(
+                f"[ORCHESTRATOR] Synthesised {len(new_missing)} missing "
+                f"tool result(s) and persisted to context."
+            )
+
+        # Early exit: if there were no tool results at all before synthesis
+        # AND we didn't synthesise any, nothing to reorder.
+        if not tool_result_msgs:
+            return message_dicts
+
+        # Step 4: Check if reordering is needed — are all tool_results
+        # immediately after their assistant messages?
         needs_repair = False
         for i, msg in enumerate(message_dicts):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 tc_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
-                # Check that the next len(tc_ids) messages are matching tool results
                 expected_pos = i + 1
                 for tc_id in tc_ids:
                     if expected_pos >= len(message_dicts):
@@ -161,9 +200,7 @@ class StreamingOrchestrator:
         if not needs_repair:
             return message_dicts
 
-        # Step 4: Rebuild the message list with correct ordering
-        # - Tool results are relocated to immediately follow their assistant message
-        # - Messages that aren't tool results keep their relative order
+        # Step 5: Rebuild the message list with correct ordering.
         relocated_tool_result_ids: set[str] = set()
         repaired: list[dict[str, Any]] = []
 
@@ -186,24 +223,16 @@ class StreamingOrchestrator:
                         repaired.append(tool_result_msgs[tc_id])
                         relocated_tool_result_ids.add(tc_id)
 
-        # Log the repair for observability — only once per session to avoid
-        # spamming on every subsequent turn (the same reordering will be
-        # applied each time the corrupted history is sent to the provider).
-        missing_ids = expected_tool_ids - relocated_tool_result_ids
-        if not self._repair_logged:
-            if relocated_tool_result_ids:
-                logger.warning(
-                    f"[ORCHESTRATOR] Repaired message sequence: relocated "
-                    f"{len(relocated_tool_result_ids)} tool result(s) to "
-                    f"restore tool_call→tool_result adjacency."
-                )
-            if missing_ids:
-                logger.warning(
-                    f"[ORCHESTRATOR] {len(missing_ids)} tool_call(s) have "
-                    f"no matching tool_result — provider may inject "
-                    f"synthetic results."
-                )
-            self._repair_logged = True
+        # Log the reorder once per session — it will recur every turn because
+        # the underlying context is already corrupted, but the user only needs
+        # to see the warning once.
+        if relocated_tool_result_ids and not self._reorder_logged:
+            logger.warning(
+                f"[ORCHESTRATOR] Repaired message sequence: relocated "
+                f"{len(relocated_tool_result_ids)} tool result(s) to "
+                f"restore tool_call→tool_result adjacency."
+            )
+            self._reorder_logged = True
 
         return repaired
 
@@ -493,7 +522,9 @@ class StreamingOrchestrator:
             # This fixes the case where user messages get interleaved between
             # tool_call assistant messages and their tool_results (e.g., when
             # a user submits a new prompt during long-running tool execution).
-            message_dicts = self._repair_message_sequence(message_dicts)
+            # Also synthesises persistent results for completely missing
+            # tool_results (e.g., cancelled tool executions).
+            message_dicts = await self._repair_message_sequence(message_dicts, context)
 
             # Convert dicts to ChatRequest for provider
             messages_objects = [Message(**msg) for msg in message_dicts]
@@ -897,7 +928,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 # Repair message sequence before the final call (same fix as
                 # the main loop — interleaved user messages can corrupt the
                 # tool_call→tool_result adjacency here too).
-                message_dicts = self._repair_message_sequence(message_dicts)
+                message_dicts = await self._repair_message_sequence(
+                    message_dicts, context
+                )
 
                 # Convert dicts to ChatRequest
                 messages_objects = [Message(**msg) for msg in message_dicts]
