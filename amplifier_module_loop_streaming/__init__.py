@@ -257,18 +257,16 @@ class StreamingOrchestrator:
         # Add user message
         await context.add_message({"role": "user", "content": prompt})
 
-        # Select provider
-        provider = self._select_provider(providers)
-        if not provider:
+        # Build provider failover chain (ordered by priority)
+        provider_chain = self._select_provider_chain(providers)
+        if not provider_chain:
             yield ("Error: No providers available", 0)
             return
 
-        # Find provider name for event emission
-        provider_name = None
-        for name, prov in providers.items():
-            if prov is provider:
-                provider_name = name
-                break
+        # Start with the highest-priority provider
+        provider_name, provider = provider_chain[0]
+        # Build index for quick lookup when failing over
+        _provider_chain_idx = 0
 
         iteration = 0
 
@@ -409,19 +407,44 @@ class StreamingOrchestrator:
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
                 # Use streaming if available
-                async for chunk in self._stream_from_provider(
-                    provider,
-                    chat_request,
-                    context,
-                    tools,
-                    hooks,
-                    coordinator,
-                    provider_name=provider_name,
-                ):
-                    # Check for immediate cancellation between chunks
-                    if coordinator and coordinator.cancellation.is_immediate:
-                        return
-                    yield (chunk, iteration)
+                try:
+                    async for chunk in self._stream_from_provider(
+                        provider,
+                        chat_request,
+                        context,
+                        tools,
+                        hooks,
+                        coordinator,
+                        provider_name=provider_name,
+                    ):
+                        # Check for immediate cancellation between chunks
+                        if coordinator and coordinator.cancellation.is_immediate:
+                            return
+                        yield (chunk, iteration)
+                except LLMError as e:
+                    # Try failover to next provider
+                    next_provider = self._failover_provider(
+                        provider_chain, _provider_chain_idx, e, hooks
+                    )
+                    if next_provider is not None:
+                        _provider_chain_idx, provider_name, provider = next_provider
+                        await hooks.emit(
+                            PROVIDER_ERROR,
+                            {
+                                "provider": provider_name,
+                                "error": {"type": type(e).__name__, "msg": str(e)},
+                                "retryable": e.retryable,
+                                "status_code": e.status_code,
+                                "failover_to": provider_name,
+                            },
+                        )
+                        logger.warning(
+                            "Provider failed, failing over to %s: %s",
+                            provider_name,
+                            e,
+                        )
+                        continue  # Retry with new provider
+                    raise
 
                 # Update rate limit timestamp after streaming completes
                 self._last_provider_call_end = time.monotonic()
@@ -453,6 +476,18 @@ class StreamingOrchestrator:
                             "status_code": e.status_code,
                         },
                     )
+                    # Try failover to next provider
+                    next_provider = self._failover_provider(
+                        provider_chain, _provider_chain_idx, e, hooks
+                    )
+                    if next_provider is not None:
+                        _provider_chain_idx, provider_name, provider = next_provider
+                        logger.warning(
+                            "Provider failed, failing over to %s: %s",
+                            provider_name,
+                            e,
+                        )
+                        continue  # Retry with new provider
                     raise
                 except Exception as e:
                     await hooks.emit(
@@ -1314,28 +1349,56 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         # Simplified - would process tracked tool calls
         pass
 
-    def _select_provider(self, providers: dict[str, Any]) -> Any:
-        """Select a provider based on priority."""
-        if not providers:
-            return None
+    def _select_provider_chain(
+        self, providers: dict[str, Any]
+    ) -> list[tuple[str, Any]]:
+        """Return all providers ordered by priority for failover.
 
-        # Collect providers with their priority (default priority is 100)
-        provider_list = []
+        Returns:
+            List of ``(name, provider)`` tuples sorted by priority (lower = better).
+        """
+        if not providers:
+            return []
+
+        provider_list: list[tuple[int, str, Any]] = []
         for name, provider in providers.items():
-            # Try to get priority from provider's config or attributes
-            priority = 100  # Default priority
+            priority = 100
             if hasattr(provider, "priority"):
                 priority = provider.priority
             elif hasattr(provider, "config") and isinstance(provider.config, dict):
                 priority = provider.config.get("priority", 100)
-
             provider_list.append((priority, name, provider))
 
-        # Sort by priority (lower number = higher priority)
         provider_list.sort(key=lambda x: x[0])
+        return [(name, prov) for _, name, prov in provider_list]
 
-        # Return the highest priority provider
-        if provider_list:
-            return provider_list[0][2]
+    def _failover_provider(
+        self,
+        chain: list[tuple[str, Any]],
+        current_idx: int,
+        error: LLMError,
+        hooks: HookRegistry,
+    ) -> tuple[int, str, Any] | None:
+        """Try to find the next provider in the failover chain.
 
-        return None
+        Returns ``(new_index, name, provider)`` or ``None`` if no more
+        candidates remain.
+        """
+        next_idx = current_idx + 1
+        if next_idx >= len(chain):
+            return None
+
+        next_name, next_provider = chain[next_idx]
+        logger.info(
+            "Failing over from provider #%d to #%d (%s) after error: %s",
+            current_idx,
+            next_idx,
+            next_name,
+            error,
+        )
+        return (next_idx, next_name, next_provider)
+
+    def _select_provider(self, providers: dict[str, Any]) -> Any:
+        """Select the highest-priority provider (backward compat)."""
+        chain = self._select_provider_chain(providers)
+        return chain[0][1] if chain else None
