@@ -237,7 +237,7 @@ class StreamingOrchestrator:
                         CANCEL_REQUESTED,
                         {
                             "orchestrator": "loop-streaming",
-                            "state": coordinator.cancellation.state.value,
+                            "state": str(coordinator.cancellation.state),
                             "turn_count": iteration,
                         },
                     )
@@ -657,7 +657,7 @@ class StreamingOrchestrator:
                             CANCEL_REQUESTED,
                             {
                                 "orchestrator": "loop-streaming",
-                                "state": coordinator.cancellation.state.value,
+                                "state": str(coordinator.cancellation.state),
                                 "turn_count": iteration,
                             },
                         )
@@ -698,7 +698,7 @@ class StreamingOrchestrator:
                             CANCEL_REQUESTED,
                             {
                                 "orchestrator": "loop-streaming",
-                                "state": coordinator.cancellation.state.value,
+                                "state": str(coordinator.cancellation.state),
                                 "turn_count": iteration,
                             },
                         )
