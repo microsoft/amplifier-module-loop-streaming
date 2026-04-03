@@ -674,6 +674,13 @@ class StreamingOrchestrator:
                                 "turn_count": iteration,
                             },
                         )
+                    # Write synthetic assistant message to close the turn.
+                    # Without this, transcript has tool_results without a closing assistant
+                    # message, triggering FM3 (incomplete_assistant_turn) on resume.
+                    await context.add_message({
+                        "role": "assistant",
+                        "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
+                    })
                     # Re-raise to let the cancellation propagate
                     raise
 
@@ -715,6 +722,13 @@ class StreamingOrchestrator:
                             "turn_count": iteration,
                         },
                     )
+                    # Write synthetic assistant message to close the turn.
+                    # Without this, transcript has tool_results without a closing assistant
+                    # message, triggering FM3 (incomplete_assistant_turn) on resume.
+                    await context.add_message({
+                        "role": "assistant",
+                        "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
+                    })
                     # Exit the loop - orchestrator complete event will be emitted in execute()
                     return
 
@@ -1014,9 +1028,17 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
             # Register tool with cancellation token for visibility
             if coordinator:
-                coordinator.cancellation.register_tool_start(
-                    tool_call.id, tool_call.name
-                )
+                # Build semantic display name for delegate calls
+                display_name = tool_call.name
+                if tool_call.name == "delegate":
+                    try:
+                        _args = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(tool_call.arguments)
+                        _agent = _args.get("agent", "")
+                        if _agent:
+                            display_name = _agent
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+                coordinator.cancellation.register_tool_start(tool_call.id, display_name)
 
             # Execute
             try:
