@@ -34,7 +34,7 @@ allow-direct-references = true
 [dependency-groups]
 dev = [
     "amplifier-core",
-    "pytest>=8.0.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.0.0",
 ]
 
