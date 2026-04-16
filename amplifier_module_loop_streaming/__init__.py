@@ -471,6 +471,39 @@ class StreamingOrchestrator:
                         if response.usage:
                             event_data["usage"] = response.usage.model_dump()
                         await hooks.emit(CONTENT_BLOCK_END, event_data)
+                elif response.content and isinstance(response.content, list):
+                    # Fallback for providers that populate response.content
+                    # (Pydantic ContentBlock models) but not content_blocks
+                    # (raw SDK objects). Synthesize content_block events so
+                    # downstream hooks (e.g. streaming-ui token usage) fire.
+                    total_blocks = len(response.content)
+                    for idx, block in enumerate(response.content):
+                        block_dict = (
+                            block.model_dump()
+                            if hasattr(block, "model_dump")
+                            else block
+                        )
+                        block_type = (
+                            block_dict.get("type", "text")
+                            if isinstance(block_dict, dict)
+                            else "text"
+                        )
+                        await hooks.emit(
+                            CONTENT_BLOCK_START,
+                            {
+                                "block_type": block_type,
+                                "block_index": idx,
+                                "total_blocks": total_blocks,
+                            },
+                        )
+                        event_data = {
+                            "block_index": idx,
+                            "total_blocks": total_blocks,
+                            "block": block_dict,
+                        }
+                        if response.usage:
+                            event_data["usage"] = response.usage.model_dump()
+                        await hooks.emit(CONTENT_BLOCK_END, event_data)
 
                 # Parse tool calls
                 tool_calls = provider.parse_tool_calls(response)
@@ -677,10 +710,12 @@ class StreamingOrchestrator:
                     # Write synthetic assistant message to close the turn.
                     # Without this, transcript has tool_results without a closing assistant
                     # message, triggering FM3 (incomplete_assistant_turn) on resume.
-                    await context.add_message({
-                        "role": "assistant",
-                        "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
-                    })
+                    await context.add_message(
+                        {
+                            "role": "assistant",
+                            "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
+                        }
+                    )
                     # Re-raise to let the cancellation propagate
                     raise
 
@@ -725,10 +760,12 @@ class StreamingOrchestrator:
                     # Write synthetic assistant message to close the turn.
                     # Without this, transcript has tool_results without a closing assistant
                     # message, triggering FM3 (incomplete_assistant_turn) on resume.
-                    await context.add_message({
-                        "role": "assistant",
-                        "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
-                    })
+                    await context.add_message(
+                        {
+                            "role": "assistant",
+                            "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
+                        }
+                    )
                     # Exit the loop - orchestrator complete event will be emitted in execute()
                     return
 
@@ -1032,7 +1069,11 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 display_name = tool_call.name
                 if tool_call.name == "delegate":
                     try:
-                        _args = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(tool_call.arguments)
+                        _args = (
+                            tool_call.arguments
+                            if isinstance(tool_call.arguments, dict)
+                            else json.loads(tool_call.arguments)
+                        )
                         _agent = _args.get("agent", "")
                         if _agent:
                             display_name = _agent
