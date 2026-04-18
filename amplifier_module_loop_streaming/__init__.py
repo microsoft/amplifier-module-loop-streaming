@@ -933,6 +933,15 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     )
                 return
 
+            # Skip non-text block deltas (e.g. thinking block streaming chunks).
+            # Providers that stream extended-thinking models include a block_type
+            # field so callers can distinguish thinking deltas from text deltas.
+            # Without this guard, thinking content leaks into full_response and
+            # ultimately into parse_json extraction downstream.
+            chunk_block_type = chunk.get("block_type")
+            if chunk_block_type and chunk_block_type != "text":
+                continue
+
             token = chunk.get("content", "")
             if token:
                 yield token
@@ -958,17 +967,22 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         if not content:
             return ""
 
-        # Extract text from content blocks
-        # NOTE: Only extract from TextBlock, NOT ThinkingBlock
-        # Thinking blocks have visibility="internal" and are rendered separately in the UI
-        # Including them here causes thinking text to appear in main response (duplication)
+        # Extract text from content blocks.
+        # IMPORTANT: Use explicit block.type check, NOT hasattr(block, "text").
+        # content_models.ThinkingContent has a .text attribute (distinct from
+        # message_models.ThinkingBlock which uses .thinking). The hasattr-based
+        # filter was letting thinking text leak into the response string, which
+        # pollutes parse_json extraction in downstream recipe steps.
         text_parts = []
         for block in content:
-            if hasattr(block, "text"):
+            # Explicit type check — works for both enum (ContentBlockType.TEXT)
+            # and plain-str "type" fields (e.g., message_models.TextBlock).
+            block_type = getattr(block, "type", None)
+            # Handle both enum (block_type.value == "text") and raw str ("text")
+            type_value = getattr(block_type, "value", block_type) if block_type else None
+            if type_value == "text" and hasattr(block, "text"):
                 text_parts.append(block.text)
-            # Skip thinking blocks - they're rendered separately
-            # elif hasattr(block, "thinking"):
-            #     text_parts.append(block.thinking)
+            # Thinking blocks, tool_use blocks, etc. are all correctly excluded.
 
         return "\n\n".join(text_parts)
 
