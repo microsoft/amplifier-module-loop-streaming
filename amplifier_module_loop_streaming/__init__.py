@@ -1114,6 +1114,19 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         pass
                 coordinator.cancellation.register_tool_start(tool_call.id, display_name)
 
+            # Set per-task dispatch context so delegate tools can read the
+            # calling tool_call_id and parallel_group_id during execute().
+            # A task-keyed dict avoids races when multiple delegates run
+            # concurrently inside asyncio.gather().
+            if coordinator:
+                if not hasattr(coordinator, "_tool_dispatch_contexts"):
+                    coordinator._tool_dispatch_contexts = {}
+                _dispatch_task = asyncio.current_task()
+                coordinator._tool_dispatch_contexts[_dispatch_task] = {
+                    "tool_call_id": tool_call.id,
+                    "parallel_group_id": parallel_group_id,
+                }
+
             # Execute
             try:
                 result = await tool.execute(tool_call.arguments)
@@ -1123,6 +1136,11 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 # Always unregister tool from cancellation token
                 if coordinator:
                     coordinator.cancellation.register_tool_complete(tool_call.id)
+                    # Clear per-task dispatch context so completed tasks don't linger
+                    if hasattr(coordinator, "_tool_dispatch_contexts"):
+                        coordinator._tool_dispatch_contexts.pop(
+                            asyncio.current_task(), None
+                        )
 
             # Serialize result for logging
             result_data = (
@@ -1254,11 +1272,27 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 response_added = True
                 return {"success": False, "error": "Tool not found"}
 
+            # Set per-task dispatch context so delegate tools can read the
+            # calling tool_call_id during execute() (sequential path has no
+            # parallel_group_id so that field is None here).
+            if coordinator:
+                if not hasattr(coordinator, "_tool_dispatch_contexts"):
+                    coordinator._tool_dispatch_contexts = {}
+                _dispatch_task = asyncio.current_task()
+                coordinator._tool_dispatch_contexts[_dispatch_task] = {
+                    "tool_call_id": tool_call.id,
+                    "parallel_group_id": None,
+                }
+
             # Execute
             try:
                 result = await tool.execute(tool_call.arguments)
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
+            finally:
+                # Clear per-task dispatch context so completed tasks don't linger
+                if coordinator and hasattr(coordinator, "_tool_dispatch_contexts"):
+                    coordinator._tool_dispatch_contexts.pop(asyncio.current_task(), None)
 
             # Serialize result for logging
             result_data = (
