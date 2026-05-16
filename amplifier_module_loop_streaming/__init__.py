@@ -68,9 +68,11 @@ class StreamingOrchestrator:
         # -1 means unlimited iterations (default)
         max_iter_config = config.get("max_iterations", -1)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
-        self.stream_delay = config.get(
-            "stream_delay", 0.01
-        )  # Artificial delay for demo
+        # Per-token artificial delay (seconds) injected after each non-whitespace
+        # token in _tokenize_stream(). Default 0.0 so headless callers (sub-sessions,
+        # automated agents) pay no synthetic latency. Set to e.g. 0.01 to opt in to
+        # token-by-token typing animation for human-facing terminal UX.
+        self.stream_delay = config.get("stream_delay", 0.0)
         self.extended_thinking = config.get("extended_thinking", False)
         self.min_delay_between_calls_ms = config.get("min_delay_between_calls_ms", 0)
         self._last_provider_call_end: float | None = None  # Timestamp tracking
@@ -946,7 +948,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             if token:
                 yield token
                 full_response += token
-                await asyncio.sleep(self.stream_delay)  # Artificial delay for demo
+                if self.stream_delay:
+                    await asyncio.sleep(self.stream_delay)
 
         # Add complete message to context
         if full_response:
@@ -979,7 +982,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             # and plain-str "type" fields (e.g., message_models.TextBlock).
             block_type = getattr(block, "type", None)
             # Handle both enum (block_type.value == "text") and raw str ("text")
-            type_value = getattr(block_type, "value", block_type) if block_type else None
+            type_value = (
+                getattr(block_type, "value", block_type) if block_type else None
+            )
             if type_value == "text" and hasattr(block, "text"):
                 text_parts.append(block.text)
             # Thinking blocks, tool_use blocks, etc. are all correctly excluded.
@@ -988,8 +993,20 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
     async def _tokenize_stream(self, text: str) -> AsyncIterator[str]:
         """
-        Simulate token-by-token streaming from complete text while preserving whitespace.
-        In production, this would be real streaming from the provider.
+        Yield text token-by-token, optionally throttled by ``self.stream_delay``
+        for human-facing typing-animation UX.
+
+        When ``stream_delay == 0.0`` (the default), this is a near-zero-overhead
+        pass-through used to satisfy callers that consume the orchestrator's
+        output stream incrementally. When ``stream_delay > 0.0``, each
+        non-whitespace token is followed by ``await asyncio.sleep(stream_delay)``
+        — used by the streaming-ui hook to animate output in interactive
+        terminals.
+
+        This is invoked from the non-streaming code path (when ``provider`` has
+        no ``stream`` method), after the full response is already in hand. It
+        does NOT do real streaming from the provider; for that, see
+        ``_stream_from_provider``.
 
         Preserves:
         - Leading whitespace (critical for code block indentation)
@@ -1006,8 +1023,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
             for token in tokens:
                 yield token
-                # Only delay on non-whitespace tokens for natural streaming effect
-                if token.strip():
+                # Only delay on non-whitespace tokens for natural streaming effect;
+                # skip entirely when stream_delay is 0.0 (the default) so headless
+                # callers pay no event-loop overhead.
+                if token.strip() and self.stream_delay:
                     await asyncio.sleep(self.stream_delay)
 
             # Yield newline after each line except the last
