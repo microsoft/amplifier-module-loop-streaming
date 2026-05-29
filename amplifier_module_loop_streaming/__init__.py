@@ -448,82 +448,64 @@ class StreamingOrchestrator:
                 # Update rate limit timestamp after non-streaming response
                 self._last_provider_call_end = time.monotonic()
 
-                # If the provider already emitted real content_block:start /
-                # delta / end events on the hook bus (e.g. the Anthropic
-                # provider's streaming path now does this), don't synthesize
-                # faux ones here — they'd duplicate the ones a renderer
-                # already painted from. Providers signal this by setting
-                # response.metadata["provider_emitted_blocks"] = True. The
-                # ChatResponse model allows extra metadata fields, so this
-                # adds no protocol surface.
-                #
-                # v2 fix: suppress BOTH the content_blocks branch AND the
-                # response.content fallback branch. v1 only suppressed the
-                # first; the elif still fired and produced the duplicate
-                # thinking-block display reported from DTU testing.
-                _provider_emitted = (
-                    getattr(response, "metadata", None) or {}
-                ).get("provider_emitted_blocks")
-
-                if not _provider_emitted:
-                    # Emit content block events if present
-                    content_blocks = getattr(response, "content_blocks", None)
-                    if content_blocks:
-                        total_blocks = len(content_blocks)
-                        for idx, block in enumerate(content_blocks):
-                            # Emit block start
-                            await hooks.emit(
-                                CONTENT_BLOCK_START,
-                                {
-                                    "block_type": block.type.value,
-                                    "block_index": idx,
-                                    "total_blocks": total_blocks,
-                                    "metadata": getattr(block, "raw", None),
-                                },
-                            )
-
-                            # Emit block end with complete block, usage, and total count
-                            event_data = {
+                # Emit content block events if present
+                content_blocks = getattr(response, "content_blocks", None)
+                if content_blocks:
+                    total_blocks = len(content_blocks)
+                    for idx, block in enumerate(content_blocks):
+                        # Emit block start
+                        await hooks.emit(
+                            CONTENT_BLOCK_START,
+                            {
+                                "block_type": block.type.value,
                                 "block_index": idx,
                                 "total_blocks": total_blocks,
-                                "block": block.to_dict(),
-                            }
-                            if response.usage:
-                                event_data["usage"] = response.usage.model_dump()
-                            await hooks.emit(CONTENT_BLOCK_END, event_data)
-                    elif response.content and isinstance(response.content, list):
-                        # Fallback for providers that populate response.content
-                        # (Pydantic ContentBlock models) but not content_blocks
-                        # (raw SDK objects). Synthesize content_block events so
-                        # downstream hooks (e.g. streaming-ui token usage) fire.
-                        total_blocks = len(response.content)
-                        for idx, block in enumerate(response.content):
-                            block_dict = (
-                                block.model_dump()
-                                if hasattr(block, "model_dump")
-                                else block
-                            )
-                            block_type = (
-                                block_dict.get("type", "text")
-                                if isinstance(block_dict, dict)
-                                else "text"
-                            )
-                            await hooks.emit(
-                                CONTENT_BLOCK_START,
-                                {
-                                    "block_type": block_type,
-                                    "block_index": idx,
-                                    "total_blocks": total_blocks,
-                                },
-                            )
-                            event_data = {
+                                "metadata": getattr(block, "raw", None),
+                            },
+                        )
+
+                        # Emit block end with complete block, usage, and total count
+                        event_data = {
+                            "block_index": idx,
+                            "total_blocks": total_blocks,
+                            "block": block.to_dict(),
+                        }
+                        if response.usage:
+                            event_data["usage"] = response.usage.model_dump()
+                        await hooks.emit(CONTENT_BLOCK_END, event_data)
+                elif response.content and isinstance(response.content, list):
+                    # Fallback for providers that populate response.content
+                    # (Pydantic ContentBlock models) but not content_blocks
+                    # (raw SDK objects). Synthesize content_block events so
+                    # downstream hooks (e.g. streaming-ui token usage) fire.
+                    total_blocks = len(response.content)
+                    for idx, block in enumerate(response.content):
+                        block_dict = (
+                            block.model_dump()
+                            if hasattr(block, "model_dump")
+                            else block
+                        )
+                        block_type = (
+                            block_dict.get("type", "text")
+                            if isinstance(block_dict, dict)
+                            else "text"
+                        )
+                        await hooks.emit(
+                            CONTENT_BLOCK_START,
+                            {
+                                "block_type": block_type,
                                 "block_index": idx,
                                 "total_blocks": total_blocks,
-                                "block": block_dict,
-                            }
-                            if response.usage:
-                                event_data["usage"] = response.usage.model_dump()
-                            await hooks.emit(CONTENT_BLOCK_END, event_data)
+                            },
+                        )
+                        event_data = {
+                            "block_index": idx,
+                            "total_blocks": total_blocks,
+                            "block": block_dict,
+                        }
+                        if response.usage:
+                            event_data["usage"] = response.usage.model_dump()
+                        await hooks.emit(CONTENT_BLOCK_END, event_data)
 
                 # Parse tool calls
                 tool_calls = provider.parse_tool_calls(response)
