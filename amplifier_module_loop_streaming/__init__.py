@@ -448,8 +448,21 @@ class StreamingOrchestrator:
                 # Update rate limit timestamp after non-streaming response
                 self._last_provider_call_end = time.monotonic()
 
-                # Emit content block events if present
-                content_blocks = getattr(response, "content_blocks", None)
+                # If the provider already emitted real content_block:start /
+                # delta / end events on the hook bus (e.g. the Anthropic
+                # provider's streaming path now does this), don't synthesize
+                # faux ones here — they'd duplicate the ones a renderer
+                # already painted from. Providers signal this by setting
+                # response.metadata["provider_emitted_blocks"] = True. The
+                # ChatResponse model allows extra metadata fields, so this
+                # adds no protocol surface.
+                if (getattr(response, "metadata", None) or {}).get(
+                    "provider_emitted_blocks"
+                ):
+                    content_blocks = None
+                else:
+                    # Emit content block events if present
+                    content_blocks = getattr(response, "content_blocks", None)
                 if content_blocks:
                     total_blocks = len(content_blocks)
                     for idx, block in enumerate(content_blocks):
