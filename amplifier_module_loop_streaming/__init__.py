@@ -169,6 +169,10 @@ class StreamingOrchestrator:
         """
         # Reset cancellation event tracking for this execution
         self._cancel_requested_emitted = False
+        # Clear any steering messages that accumulated before this execute() call.
+        # Steers do not cross turn boundaries — a stale steer from a prior turn or
+        # a cancelled turn must never silently ride into a fresh turn. (spec §5.2)
+        self._steering_queue.clear()
         full_response = ""
         iteration_count = 0
         error: Exception | None = None
@@ -296,7 +300,11 @@ class StreamingOrchestrator:
                         "turn_count": iteration,
                     },
                 )
-                # Don't yield more content, just exit
+                # Don't yield more content, just exit.
+                # Clear any pending steers so they cannot leak into the next turn
+                # (cancellation means "stop now" — stale steers have no next injection
+                # point and must not silently ride a future, unrelated turn). (spec §5.2)
+                self._steering_queue.clear()
                 return
 
             iteration += 1
@@ -773,7 +781,10 @@ class StreamingOrchestrator:
                             "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
                         }
                     )
-                    # Re-raise to let the cancellation propagate
+                    # Re-raise to let the cancellation propagate.
+                    # Clear pending steers first — a steer queued during tool
+                    # execution must not leak into any future turn. (spec §5.2)
+                    self._steering_queue.clear()
                     raise
 
                 # Check for cancellation after tools complete (graceful cancellation)
@@ -823,7 +834,10 @@ class StreamingOrchestrator:
                             "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
                         }
                     )
-                    # Exit the loop - orchestrator complete event will be emitted in execute()
+                    # Exit the loop - orchestrator complete event will be emitted in execute().
+                    # Clear pending steers: cancellation closes the turn; any steer that
+                    # arrived after the last injection point must not ride a future turn. (spec §5.2)
+                    self._steering_queue.clear()
                     return
 
                 # Add all results to context in original order (sequential, deterministic)

@@ -49,6 +49,10 @@ class SteeringQueue:
                 break
         return messages
 
+    def clear(self) -> int:
+        """Discard all pending steers (e.g. on cancellation). Returns count discarded."""
+        return len(self.drain())
+
     @property
     def is_empty(self) -> bool:
         return self._queue.empty()
