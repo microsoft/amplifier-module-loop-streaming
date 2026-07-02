@@ -821,6 +821,74 @@ class TestCancellationClearsQueue:
             "O4: immediate cancel (CancelledError path) must clear the steering queue"
         )
 
+    async def test_streaming_immediate_cancel_clears_pending_steers(self) -> None:
+        """O9: immediate cancel on the streaming branch (~line 457) clears queue.
+
+        The streaming code path (provider exposes .stream) checks
+        cancellation.is_immediate between chunks in the execute loop. A steer
+        enqueued while streaming must be cleared on that exit — matching the
+        other three cancellation exits — so it cannot leak into a future turn.
+
+        This exercises the streaming branch specifically, which the multi-round
+        tests never reach (they use a NonStreamingProvider with no .stream).
+        We drive the two is_immediate reads on a single chunk deterministically:
+        the inner _stream_from_provider check reads False (so the token yields),
+        and the outer execute-loop check reads True (so the cancel exit fires).
+        """
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        orch = StreamingOrchestrator({})
+        ctx = MockContext()
+        hooks = MockHooks()
+
+        class FlipAfterFirstReadCancellation:
+            """is_immediate: False on 1st read (inner), True on 2nd (outer)."""
+
+            is_cancelled = False
+            state = "running"
+
+            def __init__(self) -> None:
+                self._reads = 0
+
+            @property
+            def is_immediate(self) -> bool:
+                self._reads += 1
+                return self._reads >= 2
+
+            def register_tool_start(self, tool_call_id: str, display_name: str) -> None:
+                pass
+
+            def register_tool_complete(self, tool_call_id: str) -> None:
+                pass
+
+            async def trigger_callbacks(self) -> None:
+                pass
+
+        coordinator = MockCoordinator()
+        coordinator.cancellation = FlipAfterFirstReadCancellation()  # type: ignore[assignment]
+
+        class SteeringStreamProvider:
+            async def stream(self, chat_request, tools=None):  # noqa: ANN001,ANN201
+                # Enqueue AFTER execute() entry clear, then yield one chunk so the
+                # outer loop takes the immediate-cancel exit on the next check.
+                orch.steer("steer_during_streaming_O9")
+                yield {"content": "partial"}
+
+        await orch.execute(
+            prompt="stream-then-immediate-cancel-O9",
+            context=ctx,
+            providers={"main": SteeringStreamProvider()},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        # Without fix: streaming immediate-cancel exit returns without clear()
+        # With fix: clear() before return -> queue empty
+        assert orch._steering_queue.is_empty, (
+            "O9: streaming immediate-cancel exit must clear the steering queue"
+        )
+
 
 # ---------------------------------------------------------------------------
 # O5-O8: Guard tests — PASS before AND after fix

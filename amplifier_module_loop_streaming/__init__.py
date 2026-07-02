@@ -455,6 +455,10 @@ class StreamingOrchestrator:
                 ):
                     # Check for immediate cancellation between chunks
                     if coordinator and coordinator.cancellation.is_immediate:
+                        # Clear pending steers: immediate cancellation ends the turn,
+                        # and any steer queued during streaming must not leak into a
+                        # future turn — matching the other cancellation exits. (spec §5.2)
+                        self._steering_queue.clear()
                         return
                     yield (chunk, iteration)
 
