@@ -33,6 +33,8 @@ from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolSpec
 
+from .steering import SteeringQueue
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,12 +50,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         lambda: [
             "execution:start",  # When orchestrator execution begins
             "execution:end",  # When orchestrator execution completes
+            "orchestrator:steering_injected",  # When a steer message is injected mid-turn
         ],
     )
 
     orchestrator = StreamingOrchestrator(config)
     await coordinator.mount("orchestrator", orchestrator)
-    logger.info("Mounted StreamingOrchestrator with observable events")
+    coordinator.register_capability("session.steer", orchestrator.steer)
+    logger.info("Mounted StreamingOrchestrator with steering capability")
     return
 
 
@@ -80,6 +84,8 @@ class StreamingOrchestrator:
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
         # Track whether cancel:requested has been emitted for the current execution
         self._cancel_requested_emitted: bool = False
+        # Bounded queue for mid-turn steering messages (session.steer capability)
+        self._steering_queue = SteeringQueue()
 
     async def _apply_rate_limit_delay(
         self, hooks: HookRegistry, iteration: int
@@ -112,6 +118,40 @@ class StreamingOrchestrator:
             )
             await asyncio.sleep(remaining_ms / 1000)
 
+    def steer(self, message: str) -> None:
+        """Queue a steering message for injection at the next iteration boundary.
+
+        Non-blocking. Raises ValueError (empty/whitespace) or SteeringQueueFull.
+        This is the target of the ``session.steer`` coordinator capability.
+        """
+        self._steering_queue.steer(message)
+
+    async def _drain_steering(self, context, hooks, iteration: int) -> int:
+        """Drain queued steering messages into context as user-role messages.
+
+        FIFO. Each message is appended via context.add_message({"role":"user",...})
+        so the very next get_messages_for_request() picks it up, and an
+        orchestrator:steering_injected event is emitted per message. Returns the
+        number of messages injected (0 = no-op, no events, streaming undisturbed).
+        """
+        messages = self._steering_queue.drain()
+        if not messages:
+            return 0
+        total = len(messages)
+        for idx, msg in enumerate(messages):
+            await context.add_message({"role": "user", "content": msg})
+            await hooks.emit(
+                "orchestrator:steering_injected",
+                {
+                    "orchestrator": "loop-streaming",
+                    "content": msg,
+                    "iteration": iteration,
+                    "queued_remaining": total - idx - 1,
+                    "metadata": None,
+                },
+            )
+        return total
+
     async def execute(
         self,
         prompt: str,
@@ -129,6 +169,10 @@ class StreamingOrchestrator:
         """
         # Reset cancellation event tracking for this execution
         self._cancel_requested_emitted = False
+        # Clear any steering messages that accumulated before this execute() call.
+        # Steers do not cross turn boundaries — a stale steer from a prior turn or
+        # a cancelled turn must never silently ride into a fresh turn. (spec §5.2)
+        self._steering_queue.clear()
         full_response = ""
         iteration_count = 0
         error: Exception | None = None
@@ -256,10 +300,20 @@ class StreamingOrchestrator:
                         "turn_count": iteration,
                     },
                 )
-                # Don't yield more content, just exit
+                # Don't yield more content, just exit.
+                # Clear any pending steers so they cannot leak into the next turn
+                # (cancellation means "stop now" — stale steers have no next injection
+                # point and must not silently ride a future, unrelated turn). (spec §5.2)
+                self._steering_queue.clear()
                 return
 
             iteration += 1
+
+            # Mid-turn steering: drain queued user messages BEFORE building the request,
+            # so they are part of this iteration's provider call. At iteration 1 this is
+            # "before the first LLM call"; at iteration N>1 this is "after the prior tool
+            # round, before the next provider call" — the single natural boundary.
+            await self._drain_steering(context, hooks, iteration)
 
             # Emit provider request BEFORE getting messages (allows hook injections)
             result = await hooks.emit(
@@ -401,6 +455,10 @@ class StreamingOrchestrator:
                 ):
                     # Check for immediate cancellation between chunks
                     if coordinator and coordinator.cancellation.is_immediate:
+                        # Clear pending steers: immediate cancellation ends the turn,
+                        # and any steer queued during streaming must not leak into a
+                        # future turn — matching the other cancellation exits. (spec §5.2)
+                        self._steering_queue.clear()
                         return
                     yield (chunk, iteration)
 
@@ -414,7 +472,11 @@ class StreamingOrchestrator:
                     await self._process_tools(context, tools, hooks)
                     continue
                 else:
-                    # No more tools, we're done
+                    # Last-drain edge: if a steer arrived during the final generation,
+                    # loop once more so the model acts on it this turn. The top-of-
+                    # iteration drain performs the actual injection.
+                    if not self._steering_queue.is_empty:
+                        continue
                     break
             else:
                 # Fallback to non-streaming
@@ -579,6 +641,11 @@ class StreamingOrchestrator:
                         assistant_msg["metadata"] = response.metadata
 
                     await context.add_message(assistant_msg)
+                    # Last-drain edge: if a steer arrived during the final generation,
+                    # loop once more so the model acts on it this turn. The top-of-
+                    # iteration drain performs the actual injection.
+                    if not self._steering_queue.is_empty:
+                        continue
                     break
 
                 # Add assistant message with tool calls
@@ -718,7 +785,10 @@ class StreamingOrchestrator:
                             "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
                         }
                     )
-                    # Re-raise to let the cancellation propagate
+                    # Re-raise to let the cancellation propagate.
+                    # Clear pending steers first — a steer queued during tool
+                    # execution must not leak into any future turn. (spec §5.2)
+                    self._steering_queue.clear()
                     raise
 
                 # Check for cancellation after tools complete (graceful cancellation)
@@ -768,7 +838,10 @@ class StreamingOrchestrator:
                             "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
                         }
                     )
-                    # Exit the loop - orchestrator complete event will be emitted in execute()
+                    # Exit the loop - orchestrator complete event will be emitted in execute().
+                    # Clear pending steers: cancellation closes the turn; any steer that
+                    # arrived after the last injection point must not ride a future turn. (spec §5.2)
+                    self._steering_queue.clear()
                     return
 
                 # Add all results to context in original order (sequential, deterministic)
@@ -1292,7 +1365,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             finally:
                 # Clear per-task dispatch context so completed tasks don't linger
                 if coordinator and hasattr(coordinator, "_tool_dispatch_contexts"):
-                    coordinator._tool_dispatch_contexts.pop(asyncio.current_task(), None)
+                    coordinator._tool_dispatch_contexts.pop(
+                        asyncio.current_task(), None
+                    )
 
             # Serialize result for logging
             result_data = (
