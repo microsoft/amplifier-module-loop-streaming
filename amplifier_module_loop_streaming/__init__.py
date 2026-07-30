@@ -13,6 +13,7 @@ import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
+from typing import ClassVar
 
 from amplifier_core import HookRegistry
 from amplifier_core import ModuleCoordinator
@@ -38,6 +39,37 @@ from .steering import SteeringQueue
 logger = logging.getLogger(__name__)
 
 
+def _flatten_message_for_evaluator(msg: dict) -> str:
+    """Render one stored (dict) message as plain text for the goal evaluator.
+
+    Ported verbatim from amplifier-app-cli's `_flatten_message_for_evaluator`
+    (see docs/designs/goal-command.md). Kept as a module-level function since
+    it needs no orchestrator state.
+    """
+    role = msg.get("role", "unknown")
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_call":
+                parts.append(f"[called tool: {block.get('name', '?')}]")
+            elif btype == "tool_result":
+                parts.append("[tool result omitted]")
+            # thinking/redacted_thinking/reasoning blocks are intentionally
+            # skipped -- the evaluator only judges what was surfaced.
+        text = "\n".join(p for p in parts if p)
+    else:
+        text = str(content)
+    return f"{role}: {text}" if text else ""
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """Mount the streaming orchestrator module."""
     config = config or {}
@@ -51,6 +83,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "execution:start",  # When orchestrator execution begins
             "execution:end",  # When orchestrator execution completes
             "orchestrator:steering_injected",  # When a steer message is injected mid-turn
+            "orchestrator:goal_progress",  # /goal auto-continue loop progress (see docs/designs/goal-command.md)
         ],
     )
 
@@ -66,6 +99,34 @@ class StreamingOrchestrator:
     Streaming implementation of the agent loop.
     Yields tokens as they're generated for real-time display.
     """
+
+    # === /goal support (spike: docs/designs/goal-command.md) ===
+    #
+    # Ported from amplifier-app-cli's app-layer spike (main.py's
+    # `_evaluate_goal` / `_execute_with_interrupt_and_goal`). Moving it here
+    # means any orchestrator caller -- interactive REPL or headless
+    # `--mode single` -- gets the auto-continue loop for free, because both
+    # paths funnel through `execute()`.
+    _GOAL_EVALUATOR_SYSTEM_PROMPT = (
+        "You are a strict, tool-less evaluator. You will be shown a GOAL "
+        "CONDITION and a transcript of an assistant's work so far in a "
+        "coding/agent session. Decide whether the GOAL CONDITION has been "
+        "satisfied by that work.\n\n"
+        "Respond with EXACTLY two lines and nothing else:\n"
+        "Line 1: the single word YES or NO (verbatim, nothing else)\n"
+        "Line 2: one sentence explaining why\n"
+    )
+
+    # Best-effort cheap-model hints per provider-name substring. Spike-level
+    # heuristic only -- mirrors amplifier-app-cli's hint table.
+    _GOAL_CHEAP_MODEL_HINTS: ClassVar[dict[str, str]] = {
+        "anthropic": "claude-haiku-4-5",
+        "openai": "gpt-5-mini",
+        "azure-openai": "gpt-5-mini",
+        "azure_openai": "gpt-5-mini",
+    }
+
+    _GOAL_MAX_TRANSCRIPT_MESSAGES = 40
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -86,6 +147,13 @@ class StreamingOrchestrator:
         self._cancel_requested_emitted: bool = False
         # Bounded queue for mid-turn steering messages (session.steer capability)
         self._steering_queue = SteeringQueue()
+        # Deferred ORCHESTRATOR_COMPLETE payload for the goal auto-continue loop
+        # (spike: docs/designs/goal-command.md). See _execute_one_turn's
+        # `goal_turn` param and _flush_pending_complete() for why this is
+        # deferred rather than emitted immediately.
+        self._pending_orchestrator_complete: (
+            tuple[HookRegistry, dict[str, Any]] | None
+        ) = None
 
     async def _apply_rate_limit_delay(
         self, hooks: HookRegistry, iteration: int
@@ -166,10 +234,181 @@ class StreamingOrchestrator:
 
         Note: This is a simplified version. A real streaming implementation would
         need to modify the core interfaces to support AsyncIterator returns.
+
+        SPIKE (docs/designs/goal-command.md): after the first turn, if
+        ``coordinator.session_state["goal"]`` is set, this method pursues the
+        goal itself -- evaluating after each turn and automatically running
+        another turn when not yet satisfied -- so the auto-continue loop
+        works for *any* caller (interactive REPL or headless `--mode single`),
+        not just the app layer that happens to wrap it in a REPL. When no
+        goal is active this is a single pass-through call: zero behavior
+        change from the pre-goal implementation.
+        """
+        # Peek at goal state *before* the first turn. Goal state can only be
+        # set (by the app layer's /goal command) before execute() is called,
+        # and can only be cleared (never newly set) from within this method's
+        # own goal loop below -- so whether a goal is active for this whole
+        # execute() invocation is a stable fact determinable once, up front.
+        # This lets us tell _execute_one_turn whether ORCHESTRATOR_COMPLETE
+        # emission must be deferred (see its `goal_turn` param and
+        # _flush_pending_complete below) -- deferred because "was this turn
+        # the *final* one" isn't knowable until the evaluator judges its
+        # result, which happens only after the turn (and its completion
+        # event) would otherwise already have fired.
+        initial_goal = coordinator.session_state.get("goal") if coordinator else None
+        goal_turn = (initial_goal["turns_used"] + 1) if initial_goal else None
+
+        full_response = await self._execute_one_turn(
+            prompt, context, providers, tools, hooks, coordinator, goal_turn=goal_turn
+        )
+
+        if coordinator is None:
+            return full_response
+
+        while True:
+            goal = coordinator.session_state.get("goal")
+            if not goal:
+                # No goal active (either never was, or cleared elsewhere
+                # mid-turn). Flush any deferred completion as final; a no-op
+                # when nothing is pending (the common, non-goal path -- zero
+                # behavior change).
+                await self._flush_pending_complete(goal_final=True)
+                return full_response
+
+            if coordinator.cancellation.is_cancelled:
+                coordinator.session_state["goal"] = None
+                await self._flush_pending_complete(goal_final=True)
+                await hooks.emit(
+                    "orchestrator:goal_progress",
+                    {
+                        "orchestrator": "loop-streaming",
+                        "state": "cancelled",
+                        "turn": goal["turns_used"],
+                        "cap": goal.get("cap") or None,
+                        "reason": f"condition was: {goal['condition']}",
+                        "metadata": None,
+                    },
+                )
+                return full_response
+
+            goal["turns_used"] += 1
+            # cap is optional: None/0/absent means unlimited (parity default).
+            # A positive int is a hard, Python-enforced mechanical cap.
+            cap = goal.get("cap") or None
+            if cap and goal["turns_used"] >= cap:
+                coordinator.session_state["goal"] = None
+                await self._flush_pending_complete(goal_final=True)
+                await hooks.emit(
+                    "orchestrator:goal_progress",
+                    {
+                        "orchestrator": "loop-streaming",
+                        "state": "cap_hit",
+                        "turn": goal["turns_used"],
+                        "cap": cap,
+                        "reason": None,
+                        "metadata": None,
+                    },
+                )
+                return full_response
+
+            try:
+                satisfied, reason = await self._evaluate_goal(
+                    goal["condition"], context, providers, hooks, coordinator
+                )
+            except Exception as e:
+                # FAIL LOUD: never silently keep going, never silently
+                # declare success. Clear the goal and report the error.
+                coordinator.session_state["goal"] = None
+                await self._flush_pending_complete(goal_final=True)
+                await hooks.emit(
+                    "orchestrator:goal_progress",
+                    {
+                        "orchestrator": "loop-streaming",
+                        "state": "error",
+                        "turn": goal["turns_used"],
+                        "cap": cap,
+                        "reason": str(e),
+                        "metadata": None,
+                    },
+                )
+                return full_response
+
+            goal["last_reason"] = reason
+
+            if satisfied:
+                coordinator.session_state["goal"] = None
+                await self._flush_pending_complete(goal_final=True)
+                await hooks.emit(
+                    "orchestrator:goal_progress",
+                    {
+                        "orchestrator": "loop-streaming",
+                        "state": "achieved",
+                        "turn": goal["turns_used"],
+                        "cap": cap,
+                        "reason": reason,
+                        "metadata": None,
+                    },
+                )
+                return full_response
+
+            await self._flush_pending_complete(goal_final=False)
+            await hooks.emit(
+                "orchestrator:goal_progress",
+                {
+                    "orchestrator": "loop-streaming",
+                    "state": "continuing",
+                    "turn": goal["turns_used"],
+                    "cap": cap,
+                    "reason": reason,
+                    "metadata": None,
+                },
+            )
+
+            full_response = await self._execute_one_turn(
+                reason,
+                context,
+                providers,
+                tools,
+                hooks,
+                coordinator,
+                goal_turn=goal["turns_used"] + 1,
+            )
+
+    async def _execute_one_turn(
+        self,
+        prompt: str,
+        context,
+        providers: dict[str, Any],
+        tools: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
+        *,
+        goal_turn: int | None = None,
+    ) -> str:
+        """Run exactly one turn (the pre-goal-loop behavior of ``execute()``).
+
+        This is the unmodified inner execution: accumulate ``_execute_stream``
+        output, emit ``ORCHESTRATOR_COMPLETE``, return the response. The goal
+        loop in ``execute()`` calls this once per turn, including the
+        evaluator-driven auto-continue turns.
+
+        Args:
+            goal_turn: When this turn is part of an active /goal auto-continue
+                pursuit (spike: docs/designs/goal-command.md), the 1-based
+                goal-turn number; ``None`` when no goal is active. When
+                ``None`` (the default), ``ORCHESTRATOR_COMPLETE`` is emitted
+                immediately as before -- zero behavior change. When set, the
+                caller (``execute()``'s goal loop) doesn't yet know whether
+                this is the *final* turn of the pursuit (that depends on the
+                evaluator judging this turn's result, which hasn't happened
+                yet), so emission is deferred via
+                ``self._pending_orchestrator_complete`` -- the caller must
+                call ``self._flush_pending_complete(goal_final=...)`` once it
+                knows.
         """
         # Reset cancellation event tracking for this execution
         self._cancel_requested_emitted = False
-        # Clear any steering messages that accumulated before this execute() call.
+        # Clear any steering messages that accumulated before this turn.
         # Steers do not cross turn boundaries — a stale steer from a prior turn or
         # a cancelled turn must never silently ride into a fresh turn. (spec §5.2)
         self._steering_queue.clear()
@@ -194,19 +433,162 @@ class StreamingOrchestrator:
         else:
             status = "success" if full_response else "incomplete"
 
-        await hooks.emit(
-            ORCHESTRATOR_COMPLETE,
-            {
-                "orchestrator": "loop-streaming",
-                "turn_count": iteration_count,
-                "status": status,
-            },
-        )
+        payload = {
+            "orchestrator": "loop-streaming",
+            "turn_count": iteration_count,
+            "status": status,
+            # Discriminator fields (spike: docs/designs/goal-command.md) so
+            # consumers that treat ORCHESTRATOR_COMPLETE as "end of turn"
+            # (e.g. amplifierd's MetadataSaveHook, amplifier-voice's
+            # delegate_agent_completed mapping) can filter to the single
+            # emission that corresponds to a real user turn, instead of
+            # counting every goal-continuation iteration.
+            "goal_turn": goal_turn,
+            "goal_final": goal_turn is None,
+        }
+        if goal_turn is None:
+            await hooks.emit(ORCHESTRATOR_COMPLETE, payload)
+        else:
+            self._pending_orchestrator_complete = (hooks, payload)
 
         if error:
             raise error
 
         return full_response
+
+    async def _flush_pending_complete(self, *, goal_final: bool) -> None:
+        """Emit a deferred ``ORCHESTRATOR_COMPLETE`` from ``_execute_one_turn``.
+
+        No-op when nothing is pending (the common, non-goal path). See the
+        ``goal_turn`` param of ``_execute_one_turn`` for why emission is
+        deferred for goal-driven turns.
+        """
+        pending = self._pending_orchestrator_complete
+        if pending is None:
+            return
+        self._pending_orchestrator_complete = None
+        hooks, payload = pending
+        payload["goal_final"] = goal_final
+        await hooks.emit(ORCHESTRATOR_COMPLETE, payload)
+
+    async def _evaluate_goal(
+        self,
+        condition: str,
+        context,
+        providers: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
+    ) -> tuple[bool, str]:
+        """Ask a cheap, tool-less model whether ``condition`` is satisfied.
+
+        Ported from amplifier-app-cli's `_evaluate_goal` (see
+        docs/designs/goal-command.md). Returns (satisfied, reason). Raises on
+        any failure -- no fallbacks; the caller (execute()'s goal loop) stops
+        the goal loop loudly on any exception here.
+
+        Mirrors ``_execute_stream``'s own provider-call instrumentation
+        (PROVIDER_REQUEST + process_hook_result deny-check, PROVIDER_ERROR on
+        failure -- see :~605-609, :~732-750) around this method's provider
+        call, so hooks that gate LLM calls (approval, cost-aware routing,
+        rate limiting) see and can govern the evaluator's call too, instead
+        of it silently bypassing the hook pipeline entirely.
+        """
+        if not context or not hasattr(context, "get_messages"):
+            raise RuntimeError("no context manager available to read the conversation")
+        all_messages = await context.get_messages()
+
+        truncated = False
+        messages = all_messages
+        if len(messages) > self._GOAL_MAX_TRANSCRIPT_MESSAGES:
+            messages = messages[-self._GOAL_MAX_TRANSCRIPT_MESSAGES :]
+            truncated = True
+
+        transcript_text = "\n\n".join(
+            t for t in (_flatten_message_for_evaluator(m) for m in messages) if t
+        )
+
+        if not providers:
+            raise RuntimeError("no provider mounted for evaluation")
+        provider_name, provider = next(iter(providers.items()))
+
+        model_override = None
+        for hint_key, hint_model in self._GOAL_CHEAP_MODEL_HINTS.items():
+            if hint_key in provider_name.lower():
+                model_override = hint_model
+                break
+
+        user_prompt = (
+            f"GOAL CONDITION:\n{condition}\n\n"
+            f"CONVERSATION SO FAR"
+            f"{' (truncated, most recent messages shown)' if truncated else ''}:\n"
+            f"{transcript_text}\n\n"
+            "Has the GOAL CONDITION been satisfied? Respond in the required "
+            "two-line format."
+        )
+
+        eval_messages = [
+            Message(role="system", content=self._GOAL_EVALUATOR_SYSTEM_PROMPT),
+            Message(role="user", content=user_prompt),
+        ]
+        chat_request = ChatRequest(
+            messages=eval_messages, tools=None, model=model_override
+        )
+
+        # Mirror _execute_stream's provider:request instrumentation so hooks
+        # that gate LLM calls (approval, cost-aware routing, rate limiting)
+        # see and can govern the evaluator's call too.
+        request_result = await hooks.emit(
+            PROVIDER_REQUEST, {"provider": provider_name, "iteration": 0}
+        )
+        if coordinator:
+            request_result = await coordinator.process_hook_result(
+                request_result, "provider:request", "orchestrator"
+            )
+            if request_result.action == "deny":
+                raise RuntimeError(
+                    f"evaluator call denied by hook: {request_result.reason}"
+                )
+
+        try:
+            response = await provider.complete(chat_request)
+        except LLMError as e:
+            await hooks.emit(
+                PROVIDER_ERROR,
+                {
+                    "provider": provider_name,
+                    "error": {"type": type(e).__name__, "msg": str(e)},
+                    "retryable": e.retryable,
+                    "status_code": e.status_code,
+                },
+            )
+            raise
+        except Exception as e:
+            await hooks.emit(
+                PROVIDER_ERROR,
+                {
+                    "provider": provider_name,
+                    "error": {"type": type(e).__name__, "msg": str(e)},
+                },
+            )
+            raise
+
+        response_text = ""
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                response_text += getattr(block, "text", "")
+
+        lines = [
+            line.strip() for line in response_text.strip().splitlines() if line.strip()
+        ]
+        if not lines:
+            raise ValueError("evaluator returned an empty response")
+
+        verdict = lines[0].strip().upper()
+        if verdict not in ("YES", "NO"):
+            raise ValueError(f"unparseable evaluator verdict: {lines[0]!r}")
+
+        reason = lines[1] if len(lines) > 1 else "(evaluator gave no reason)"
+        return verdict == "YES", reason
 
     async def _execute_stream(
         self,
