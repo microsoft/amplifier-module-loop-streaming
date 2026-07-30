@@ -13,6 +13,7 @@ import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
+from typing import ClassVar
 
 from amplifier_core import HookRegistry
 from amplifier_core import ModuleCoordinator
@@ -36,6 +37,37 @@ from amplifier_core.message_models import ToolSpec
 from .steering import SteeringQueue
 
 logger = logging.getLogger(__name__)
+
+
+def _flatten_message_for_evaluator(msg: dict) -> str:
+    """Render one stored (dict) message as plain text for the goal evaluator.
+
+    Ported verbatim from amplifier-app-cli's `_flatten_message_for_evaluator`
+    (see docs/designs/goal-command.md). Kept as a module-level function since
+    it needs no orchestrator state.
+    """
+    role = msg.get("role", "unknown")
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_call":
+                parts.append(f"[called tool: {block.get('name', '?')}]")
+            elif btype == "tool_result":
+                parts.append("[tool result omitted]")
+            # thinking/redacted_thinking/reasoning blocks are intentionally
+            # skipped -- the evaluator only judges what was surfaced.
+        text = "\n".join(p for p in parts if p)
+    else:
+        text = str(content)
+    return f"{role}: {text}" if text else ""
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -66,6 +98,34 @@ class StreamingOrchestrator:
     Streaming implementation of the agent loop.
     Yields tokens as they're generated for real-time display.
     """
+
+    # === /goal support (spike: docs/designs/goal-command.md) ===
+    #
+    # Ported from amplifier-app-cli's app-layer spike (main.py's
+    # `_evaluate_goal` / `_execute_with_interrupt_and_goal`). Moving it here
+    # means any orchestrator caller -- interactive REPL or headless
+    # `--mode single` -- gets the auto-continue loop for free, because both
+    # paths funnel through `execute()`.
+    _GOAL_EVALUATOR_SYSTEM_PROMPT = (
+        "You are a strict, tool-less evaluator. You will be shown a GOAL "
+        "CONDITION and a transcript of an assistant's work so far in a "
+        "coding/agent session. Decide whether the GOAL CONDITION has been "
+        "satisfied by that work.\n\n"
+        "Respond with EXACTLY two lines and nothing else:\n"
+        "Line 1: the single word YES or NO (verbatim, nothing else)\n"
+        "Line 2: one sentence explaining why\n"
+    )
+
+    # Best-effort cheap-model hints per provider-name substring. Spike-level
+    # heuristic only -- mirrors amplifier-app-cli's hint table.
+    _GOAL_CHEAP_MODEL_HINTS: ClassVar[dict[str, str]] = {
+        "anthropic": "claude-haiku-4-5",
+        "openai": "gpt-5-mini",
+        "azure-openai": "gpt-5-mini",
+        "azure_openai": "gpt-5-mini",
+    }
+
+    _GOAL_MAX_TRANSCRIPT_MESSAGES = 40
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -166,10 +226,90 @@ class StreamingOrchestrator:
 
         Note: This is a simplified version. A real streaming implementation would
         need to modify the core interfaces to support AsyncIterator returns.
+
+        SPIKE (docs/designs/goal-command.md): after the first turn, if
+        ``coordinator.session_state["goal"]`` is set, this method pursues the
+        goal itself -- evaluating after each turn and automatically running
+        another turn when not yet satisfied -- so the auto-continue loop
+        works for *any* caller (interactive REPL or headless `--mode single`),
+        not just the app layer that happens to wrap it in a REPL. When no
+        goal is active this is a single pass-through call: zero behavior
+        change from the pre-goal implementation.
+        """
+        full_response = await self._execute_one_turn(
+            prompt, context, providers, tools, hooks, coordinator
+        )
+
+        if coordinator is None:
+            return full_response
+
+        while True:
+            goal = coordinator.session_state.get("goal")
+            if not goal:
+                return full_response
+
+            if coordinator.cancellation.is_cancelled:
+                coordinator.session_state["goal"] = None
+                print(
+                    f"\u2717 goal: cancelled \u2014 condition was: {goal['condition']}"
+                )
+                return full_response
+
+            goal["turns_used"] += 1
+            # cap is optional: None/0/absent means unlimited (parity default).
+            # A positive int is a hard, Python-enforced mechanical cap.
+            cap = goal.get("cap") or None
+            if cap and goal["turns_used"] >= cap:
+                coordinator.session_state["goal"] = None
+                print(f"\u26a0 goal: hit turn cap ({cap}) \u2014 stopping.")
+                return full_response
+
+            try:
+                satisfied, reason = await self._evaluate_goal(
+                    goal["condition"], context, providers
+                )
+            except Exception as e:
+                # FAIL LOUD: never silently keep going, never silently
+                # declare success. Clear the goal and report the error.
+                coordinator.session_state["goal"] = None
+                print(f"\u2717 goal: evaluator failed \u2014 {e}")
+                return full_response
+
+            goal["last_reason"] = reason
+
+            if satisfied:
+                coordinator.session_state["goal"] = None
+                print(f"\u2713 goal achieved: {reason}")
+                return full_response
+
+            turn_label = (
+                f"{goal['turns_used']}/{cap}" if cap else f"{goal['turns_used']}"
+            )
+            print(f"\u27f3 goal: turn {turn_label} \u2014 {reason}")
+
+            full_response = await self._execute_one_turn(
+                reason, context, providers, tools, hooks, coordinator
+            )
+
+    async def _execute_one_turn(
+        self,
+        prompt: str,
+        context,
+        providers: dict[str, Any],
+        tools: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
+    ) -> str:
+        """Run exactly one turn (the pre-goal-loop behavior of ``execute()``).
+
+        This is the unmodified inner execution: accumulate ``_execute_stream``
+        output, emit ``ORCHESTRATOR_COMPLETE``, return the response. The goal
+        loop in ``execute()`` calls this once per turn, including the
+        evaluator-driven auto-continue turns.
         """
         # Reset cancellation event tracking for this execution
         self._cancel_requested_emitted = False
-        # Clear any steering messages that accumulated before this execute() call.
+        # Clear any steering messages that accumulated before this turn.
         # Steers do not cross turn boundaries — a stale steer from a prior turn or
         # a cancelled turn must never silently ride into a fresh turn. (spec §5.2)
         self._steering_queue.clear()
@@ -207,6 +347,77 @@ class StreamingOrchestrator:
             raise error
 
         return full_response
+
+    async def _evaluate_goal(
+        self, condition: str, context, providers: dict[str, Any]
+    ) -> tuple[bool, str]:
+        """Ask a cheap, tool-less model whether ``condition`` is satisfied.
+
+        Ported from amplifier-app-cli's `_evaluate_goal` (see
+        docs/designs/goal-command.md). Returns (satisfied, reason). Raises on
+        any failure -- no fallbacks; the caller (execute()'s goal loop) stops
+        the goal loop loudly on any exception here.
+        """
+        if not context or not hasattr(context, "get_messages"):
+            raise RuntimeError("no context manager available to read the conversation")
+        all_messages = await context.get_messages()
+
+        truncated = False
+        messages = all_messages
+        if len(messages) > self._GOAL_MAX_TRANSCRIPT_MESSAGES:
+            messages = messages[-self._GOAL_MAX_TRANSCRIPT_MESSAGES :]
+            truncated = True
+
+        transcript_text = "\n\n".join(
+            t for t in (_flatten_message_for_evaluator(m) for m in messages) if t
+        )
+
+        if not providers:
+            raise RuntimeError("no provider mounted for evaluation")
+        provider_name, provider = next(iter(providers.items()))
+
+        model_override = None
+        for hint_key, hint_model in self._GOAL_CHEAP_MODEL_HINTS.items():
+            if hint_key in provider_name.lower():
+                model_override = hint_model
+                break
+
+        user_prompt = (
+            f"GOAL CONDITION:\n{condition}\n\n"
+            f"CONVERSATION SO FAR"
+            f"{' (truncated, most recent messages shown)' if truncated else ''}:\n"
+            f"{transcript_text}\n\n"
+            "Has the GOAL CONDITION been satisfied? Respond in the required "
+            "two-line format."
+        )
+
+        eval_messages = [
+            Message(role="system", content=self._GOAL_EVALUATOR_SYSTEM_PROMPT),
+            Message(role="user", content=user_prompt),
+        ]
+        chat_request = ChatRequest(
+            messages=eval_messages, tools=None, model=model_override
+        )
+
+        response = await provider.complete(chat_request)
+
+        response_text = ""
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                response_text += getattr(block, "text", "")
+
+        lines = [
+            line.strip() for line in response_text.strip().splitlines() if line.strip()
+        ]
+        if not lines:
+            raise ValueError("evaluator returned an empty response")
+
+        verdict = lines[0].strip().upper()
+        if verdict not in ("YES", "NO"):
+            raise ValueError(f"unparseable evaluator verdict: {lines[0]!r}")
+
+        reason = lines[1] if len(lines) > 1 else "(evaluator gave no reason)"
+        return verdict == "YES", reason
 
     async def _execute_stream(
         self,
