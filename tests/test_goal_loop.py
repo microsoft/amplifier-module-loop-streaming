@@ -170,6 +170,15 @@ class FakeProvider:
         # answered (used to snapshot orchestrator state, e.g.
         # goal_dict["no_tool_turns"], at each evaluation point).
         self.on_eval_call: Callable[[], None] | None = None
+        # DEFECT 2 regression tracking: the `model` kwarg (if any) actually
+        # received by `complete()`, per call kind. Populated regardless of
+        # whether the call came from the evaluator, stall judge, or
+        # summary -- lets tests assert the cheap-model override actually
+        # reaches the provider call, not just `ChatRequest.model`.
+        self.eval_call_models: list[str | None] = []
+        self.judge_call_models: list[str | None] = []
+        self.summary_call_models: list[str | None] = []
+        self.summary_call_count = 0
 
     async def complete(self, chat_request, **kwargs):
         system_msg = next(
@@ -184,16 +193,20 @@ class FakeProvider:
         if "tool-less evaluator" in system_text:
             if self.on_eval_call:
                 self.on_eval_call()
+            self.eval_call_models.append(kwargs.get("model"))
             satisfied, reason = self.eval_queue.pop(0)
             verdict = "YES" if satisfied else "NO"
             return _llm_text_response(f"{verdict}\n{reason}")
 
         if "tool-less judge" in system_text:
+            self.judge_call_models.append(kwargs.get("model"))
             is_stall, detail = self.judge_queue.pop(0)
             verdict = "YES" if is_stall else "NO"
             return _llm_text_response(f"{verdict}\n{detail}")
 
         if "factual recaps" in system_text:
+            self.summary_call_count += 1
+            self.summary_call_models.append(kwargs.get("model"))
             return _llm_text_response(self.summary_text)
 
         # Plain turn-conversation call.
@@ -657,3 +670,458 @@ class TestNoGoalPassthrough:
 
         assert provider.turn_queue == []
         assert hooks.goal_progress_events() == []
+
+
+# ---------------------------------------------------------------------------
+# 6. DEFECT 1 regression: stall detector must re-arm after escalation, even
+#    when the turn completing the second zero-tool streak also hits the cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStallRearmsAfterEscalation:
+    """Regression test for DEFECT 1.
+
+    Real session 48adf75a (cap=8, unsatisfiable goal): turns 1-4 zero tool
+    calls -> stall judge trips -> escalates for turn 5. Turn 5 (the
+    escalation turn) makes a tool call, correctly resetting the zero-tool
+    streak. Turns 6, 7, 8 spin again with zero tool calls -- turn 8 should
+    have re-tripped the stall judge, but turn 8 was ALSO the configured
+    cap, and the cap check ran (and returned) before the stall
+    bookkeeping/judge-consultation block ever executed for that turn. The
+    judge was never re-consulted and the run silently reported "cap_hit"
+    instead of "stalled", burning the full turn budget for nothing.
+
+    This test reproduces the same shape -- spin -> escalate -> tool call
+    -> spin again -- with the cap chosen to land exactly on the turn that
+    completes the second zero-tool streak, and asserts both that the judge
+    IS consulted a second time and that the terminal state is "stalled",
+    not "cap_hit". Must FAIL against pre-fix code (only 1 of 2 queued
+    judge answers gets consumed, and the terminal state is "cap_hit").
+    """
+
+    async def test_second_trip_at_cap_boundary_reports_stalled_not_cap_hit(
+        self,
+    ) -> None:
+        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            # Cap lands exactly on the turn that completes the SECOND
+            # zero-tool streak: initial(t0) + A + B (trips judge #1 ->
+            # escalate) + escalation (1 tool call, resets streak) + C + D
+            # (should trip judge #2). That's turn 6.
+            "cap": 6,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.turn_queue.append(MockTurnResponse(text="A"))
+        provider.turn_queue.append(MockTurnResponse(text="B"))
+        # Escalation turn: a tool-call round (empty text + tool_calls) then
+        # the follow-up final response after the tool executes -- mirrors
+        # the two-provider-call shape used elsewhere in this file (see
+        # TestNoToolTurnsBookkeeping) for any turn that actually runs a
+        # tool. `self._tool_calls_this_turn` is only incremented when a
+        # tool is *executed*, so a single response object that sets both
+        # non-empty text AND tool_calls does not exercise the real code
+        # path.
+        provider.turn_queue.append(
+            MockTurnResponse(text="", tool_calls=[MockToolCall()])
+        )
+        provider.turn_queue.append(MockTurnResponse(text="escalation-followup"))
+        provider.turn_queue.append(MockTurnResponse(text="C"))
+        provider.turn_queue.append(MockTurnResponse(text="D"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing credentials"),  # after t0
+                (False, "blocked: missing credentials"),  # after A
+                (False, "blocked: missing credentials"),  # after B -> trip #1
+                (False, "blocked: missing credentials"),  # after escalation (reset)
+                (False, "blocked: missing credentials"),  # after C
+                (False, "blocked: missing credentials"),  # after D -> trip #2, at cap
+            ]
+        )
+        provider.judge_queue.extend(
+            [
+                (True, "same blocker recurring, no new progress"),
+                (True, "escalation did not help, still the same blocker"),
+            ]
+        )
+
+        result = await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            # The escalation turn's tool call must actually resolve to a
+            # real tool (so `_tool_calls_this_turn` increments and the
+            # zero-tool streak genuinely resets) -- an empty tools dict
+            # would make the call fail "tool not found" *before* the
+            # increment, silently defeating the reset this test exists to
+            # exercise.
+            tools={"mock_tool": MockTool()},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert isinstance(result, str)
+        # Both judge calls consumed -- the second consultation must happen
+        # even though this turn also hits the cap (DEFECT 1).
+        assert provider.judge_queue == [], (
+            "stall judge was never re-consulted after escalation -- "
+            "DEFECT 1 (cap check preempting the stall check)"
+        )
+        assert provider.eval_queue == []
+
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states[-1] == "stalled", (
+            f"expected terminal state 'stalled', got {states[-1]!r} -- the "
+            "run must not silently report 'cap_hit' when the judge confirms "
+            "a second stall at the cap boundary"
+        )
+        assert "cap_hit" not in states
+        assert goal_dict["escalated"] is True
+
+        stalled_event = hooks.goal_progress_events()[-1]
+        assert (
+            stalled_event["stall_detail"]
+            == "escalation did not help, still the same blocker"
+        )
+
+    async def test_rescue_still_works_when_cap_leaves_room(self) -> None:
+        """Sanity companion: when the cap does NOT coincide with the second
+        streak, an escalation that succeeds (tool call resets the streak,
+        goal is then achieved) still reaches "achieved", not "stalled" or
+        "cap_hit" -- confirms the fix doesn't disturb the rescue path
+        evidenced by sessions d34d7b31/c8b810b0.
+        """
+        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.turn_queue.append(MockTurnResponse(text="A"))
+        provider.turn_queue.append(MockTurnResponse(text="B"))
+        # Escalation turn: tool-call round + follow-up (see comment in the
+        # sibling test above for why this needs two queued responses).
+        provider.turn_queue.append(
+            MockTurnResponse(text="", tool_calls=[MockToolCall()])
+        )
+        provider.turn_queue.append(MockTurnResponse(text="escalation-followup"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing credentials"),
+                (False, "blocked: missing credentials"),
+                (False, "blocked: missing credentials"),
+                (True, "credentials provided by the rescue attempt, solved"),
+            ]
+        )
+        provider.judge_queue.append((True, "same blocker recurring, no new progress"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={"mock_tool": MockTool()},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert provider.judge_queue == []
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states[-1] == "achieved"
+        assert goal_dict["escalated"] is True
+
+
+# ---------------------------------------------------------------------------
+# 7. DEFECT 2 regression: cheap-model override must reach provider.complete()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCheapModelKwargPropagation:
+    async def test_evaluator_judge_and_summary_pass_model_kwarg(self) -> None:
+        """DEFECT 2 root cause: `_select_cheap_model`'s result was set on
+        `ChatRequest.model` but never passed as a `model=` kwarg to
+        `provider.complete()`. The actually-installed Anthropic provider's
+        `complete()` / `_complete_chat_request()` reads the effective model
+        from `kwargs.get("model", self.default_model)` -- it never reads
+        `request.model` -- so the override was silently dropped and every
+        evaluator/stall-judge/summary call ran on the session's default
+        (expensive) model. Asserts the kwarg is now present for all three
+        call kinds.
+        """
+        orch = _make_orchestrator({"goal_stall_threshold": 1})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.turn_queue.append(MockTurnResponse(text="A"))
+        provider.turn_queue.append(MockTurnResponse(text="escalation-turn"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked"),  # after t0 -- not a continuation, no bookkeeping
+                (False, "blocked"),  # after A -> threshold(1) trips -> judge #1
+                (True, "done"),  # after escalation turn -> achieved
+            ]
+        )
+        provider.judge_queue.append((True, "same blocker, escalate"))
+
+        # Provider name contains "anthropic" so _select_cheap_model resolves
+        # to the hint-table entry "claude-haiku-4-5".
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main-anthropic": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert provider.eval_call_models == [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5",
+        ]
+        assert provider.judge_call_models == ["claude-haiku-4-5"]
+        # continuations=2 (A, escalation turn) -- achieved-with-continuations
+        # still gets a summary (DEFECT 3 skip rule only applies at zero).
+        assert provider.summary_call_models == ["claude-haiku-4-5"]
+
+
+# ---------------------------------------------------------------------------
+# 8. DEFECT 3 regression: skip the summary call when there's nothing to say
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSkipSummaryWhenNothingToSummarize:
+    async def test_achieved_on_first_attempt_skips_summary_call(self) -> None:
+        """A goal achieved with zero continuations (satisfied on the very
+        first evaluation) has nothing worth recapping -- the summary LLM
+        call must be skipped entirely (measured cost: 5-12s of dead wait on
+        this exact happy path). Assert both that the payload's `summary`
+        is None AND that the FakeProvider's summary branch was never
+        invoked (proves the call was skipped, not merely swallowed).
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.eval_queue.append((True, "solved on the first attempt"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        achieved_event = hooks.goal_progress_events()[-1]
+        assert achieved_event["state"] == "achieved"
+        assert goal_dict["continuations"] == 0
+        assert achieved_event["summary"] is None
+        assert provider.summary_call_count == 0
+
+    async def test_stalled_run_still_gets_a_summary(self) -> None:
+        """Companion sanity check: a run that genuinely needed the loop
+        (here, ending in "stalled") is NOT affected by the skip rule --
+        the summary still runs, same as before.
+        """
+        orch = _make_orchestrator({"goal_stall_threshold": 1})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.turn_queue.append(MockTurnResponse(text="A"))
+        # Escalation turn (also zero tools -- immediately re-trips).
+        provider.turn_queue.append(MockTurnResponse(text="B-escalation"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked"),  # after t0
+                (False, "blocked"),  # after A -> trip #1 -> escalate
+                (False, "blocked"),  # after escalation turn -> trip #2
+            ]
+        )
+        provider.judge_queue.extend(
+            [
+                (True, "stall #1 -> escalate"),
+                (True, "stall #2 -> hard stop"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states[-1] == "stalled"
+        assert provider.summary_call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 9. Reason-history dedupe: rendered payload collapses repeated reasons
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReasonDedupe:
+    async def test_consecutive_identical_reasons_collapsed_in_payload(self) -> None:
+        """`reasons[]` on an unsatisfiable-goal run can be a string of
+        near-identical evaluator sentences -- consumers render this as a
+        list, so N verbatim copies is noise, not signal. The rendered
+        payload must collapse consecutive identical reasons into one entry
+        annotated with a repeat count; the raw per-turn history remains
+        untouched on the goal dict itself.
+        """
+        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for i in range(4):
+            provider.turn_queue.append(MockTurnResponse(text=f"t{i}"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+                (True, "credentials provided, solved"),
+            ]
+        )
+        provider.judge_queue.append(
+            (False, "genuinely still working the same blocker, not a stall")
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        # Raw history is untouched: 4 distinct entries recorded verbatim.
+        assert goal_dict["reasons"] == [
+            "blocked: missing API key",
+            "blocked: missing API key",
+            "blocked: missing API key",
+            "credentials provided, solved",
+        ]
+
+        achieved_event = hooks.goal_progress_events()[-1]
+        # Rendered payload collapses the 3 identical consecutive reasons
+        # into one entry annotated with a repeat count.
+        assert achieved_event["reasons"] == [
+            "blocked: missing API key (repeated 3x)",
+            "credentials provided, solved",
+        ]
+
+    async def test_no_repeats_passes_through_unchanged(self) -> None:
+        """Sanity check: when nothing repeats, the dedupe is a no-op."""
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "the file exists",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.turn_queue.append(MockTurnResponse(text="t1"))
+        provider.eval_queue.extend(
+            [
+                (False, "file not created yet"),
+                (True, "file now exists"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="create the file",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        achieved_event = hooks.goal_progress_events()[-1]
+        assert achieved_event["reasons"] == [
+            "file not created yet",
+            "file now exists",
+        ]

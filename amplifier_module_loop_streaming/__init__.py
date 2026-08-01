@@ -347,38 +347,26 @@ class StreamingOrchestrator:
 
             goal["turns_used"] += 1
             # cap is optional: None/0/absent means unlimited (parity default).
-            # A positive int is a hard, Python-enforced mechanical cap.
+            # A positive int is a hard, Python-enforced mechanical cap. This
+            # is only a *flag* here -- checked further down, AFTER
+            # evaluation and stall bookkeeping have both run for this turn.
+            #
+            # DEFECT 1 (fixed): this used to short-circuit the rest of the
+            # loop body immediately, before stall bookkeeping ever ran. That
+            # meant whenever the turn that would complete a *second*
+            # zero-tool streak also happened to hit the cap, the stall
+            # judge was never re-consulted and the run silently rode to
+            # "cap_hit" instead of "stalled" -- exactly what happened in
+            # real session 48adf75a (cap=8): escalate at turn 5, one tool
+            # call resets the streak, turns 6/7/8 spin again with
+            # near-identical evaluator reasons, and turn 8 -- which should
+            # have re-tripped the judge -- was also the cap, so the cap
+            # check won the race and the judge was never asked. The
+            # mechanical re-arm itself (reset-on-tool-use, reaccumulate)
+            # was already correct; the bug was purely in the ordering
+            # against the cap check.
             cap = goal.get("cap") or None
-            if cap and goal["turns_used"] >= cap:
-                # Run one final evaluation so the terminal event reports the
-                # true outcome instead of returning blind. If it turns out
-                # the condition was actually satisfied, report "achieved"
-                # rather than "cap_hit" -- the cap merely stopped the loop
-                # from re-checking again, it didn't fail the goal.
-                final_reason: str | None = None
-                satisfied_at_cap = False
-                try:
-                    satisfied_at_cap, final_reason = await self._evaluate_goal(
-                        goal["condition"], context, providers, hooks, coordinator
-                    )
-                    goal["last_reason"] = final_reason
-                    goal["reasons"].append(final_reason)
-                except Exception as e:
-                    logger.warning(f"/goal: final evaluation at cap failed: {e}")
-
-                coordinator.session_state["goal"] = None
-                await self._flush_pending_complete(goal_final=True)
-                final_state = "achieved" if satisfied_at_cap else "cap_hit"
-                summary = await self._summarize_goal_run(
-                    goal, providers, hooks, coordinator, final_state
-                )
-                await hooks.emit(
-                    "orchestrator:goal_progress",
-                    self._goal_progress_payload(
-                        goal, state=final_state, reason=final_reason, summary=summary
-                    ),
-                )
-                return full_response
+            cap_hit = bool(cap and goal["turns_used"] >= cap)
 
             try:
                 satisfied, reason = await self._evaluate_goal(
@@ -386,7 +374,12 @@ class StreamingOrchestrator:
                 )
             except Exception as e:
                 # FAIL LOUD: never silently keep going, never silently
-                # declare success. Clear the goal and report the error.
+                # declare success -- regardless of whether this turn also
+                # hit the cap. (Previously, an eval failure exactly at the
+                # cap boundary was swallowed into a bare "cap_hit" with no
+                # reason via a separate "final evaluation at cap" call;
+                # now there's only one evaluation call per turn, so a
+                # failure here is always reported honestly as "error".)
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
                 summary = await self._summarize_goal_run(
@@ -404,10 +397,17 @@ class StreamingOrchestrator:
             goal["reasons"].append(reason)
 
             if satisfied:
+                # Achieved regardless of cap_hit -- the cap merely stops the
+                # loop from re-checking again, it never fails a goal that
+                # was, in fact, satisfied on its last permitted turn.
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
-                summary = await self._summarize_goal_run(
-                    goal, providers, hooks, coordinator, "achieved"
+                summary = (
+                    await self._summarize_goal_run(
+                        goal, providers, hooks, coordinator, "achieved"
+                    )
+                    if self._goal_run_needs_summary(goal, "achieved")
+                    else None
                 )
                 await hooks.emit(
                     "orchestrator:goal_progress",
@@ -417,8 +417,15 @@ class StreamingOrchestrator:
                 )
                 return full_response
 
-            # Stall bookkeeping only applies once a continuation turn has
-            # actually run (see is_continuation_turn's comment above).
+            # Stall bookkeeping runs for every completed continuation turn
+            # -- INCLUDING the turn that also happens to hit the cap. This
+            # is the DEFECT 1 fix: the zero-tool streak, and the judge
+            # consultation it can trigger, must re-arm after an escalation
+            # regardless of where the cap happens to fall, or the detector
+            # can be silently starved by an unlucky cap value (see the
+            # comment above `cap_hit`).
+            is_stalled = False
+            stall_detail: str | None = None
             if is_continuation_turn:
                 if self._tool_calls_this_turn == 0:
                     goal["no_tool_turns"] += 1
@@ -446,65 +453,90 @@ class StreamingOrchestrator:
                         )
                         is_stalled, stall_detail = False, None
 
-                    if is_stalled:
-                        if not goal["escalated"]:
-                            # One-shot escalation: give the agent a single
-                            # explicit chance to change approach or admit the
-                            # goal can't be met as defined, before hard-stopping.
-                            goal["escalated"] = True
-                            await self._flush_pending_complete(goal_final=False)
-                            await hooks.emit(
-                                "orchestrator:goal_progress",
-                                self._goal_progress_payload(
-                                    goal, state="continuing", reason=reason
-                                ),
-                            )
-                            goal["continuations"] += 1
-                            stall_prompt = (
-                                f"You've been asked to work toward this goal: "
-                                f"{goal['condition']}\n\n"
-                                f"For the last {goal['no_tool_turns']} turns you "
-                                "haven't taken any actions (no tool calls), and "
-                                "the evaluator keeps reporting the same kind of "
-                                f"blocker: {reason}\n\n"
-                                "You appear stuck. Either try a genuinely "
-                                "different approach to make progress, or, if you "
-                                "believe this goal cannot be achieved as it's "
-                                "currently defined, say so plainly and explain "
-                                "specifically why -- don't just repeat what "
-                                "you've already said."
-                            )
-                            full_response = await self._execute_one_turn(
-                                stall_prompt,
-                                context,
-                                providers,
-                                tools,
-                                hooks,
-                                coordinator,
-                                goal_turn=goal["turns_used"] + 1,
-                            )
-                            is_continuation_turn = True
-                            continue
-                        else:
-                            # Escalation already used and it stalled again:
-                            # hard stop. This is a LOUD failure state, never
-                            # mistakable for success.
-                            coordinator.session_state["goal"] = None
-                            await self._flush_pending_complete(goal_final=True)
-                            summary = await self._summarize_goal_run(
-                                goal, providers, hooks, coordinator, "stalled"
-                            )
-                            await hooks.emit(
-                                "orchestrator:goal_progress",
-                                self._goal_progress_payload(
-                                    goal,
-                                    state="stalled",
-                                    reason=reason,
-                                    stall_detail=stall_detail,
-                                    summary=summary,
-                                ),
-                            )
-                            return full_response
+            if is_stalled and (goal["escalated"] or cap_hit):
+                # Either this is the second trip (escalation already used
+                # and it stalled again), or it's the first trip but there's
+                # no cap budget left to offer the one-shot rescue turn.
+                # Either way: hard stop, reported as "stalled" rather than
+                # "cap_hit" -- we now know definitively the run is stuck,
+                # which is more informative than "ran out of turns", even
+                # when the cap also happened to run out on this same turn.
+                # This is a LOUD failure state, never mistakable for success.
+                coordinator.session_state["goal"] = None
+                await self._flush_pending_complete(goal_final=True)
+                summary = await self._summarize_goal_run(
+                    goal, providers, hooks, coordinator, "stalled"
+                )
+                await hooks.emit(
+                    "orchestrator:goal_progress",
+                    self._goal_progress_payload(
+                        goal,
+                        state="stalled",
+                        reason=reason,
+                        stall_detail=stall_detail,
+                        summary=summary,
+                    ),
+                )
+                return full_response
+
+            if is_stalled:
+                # First trip, and cap budget remains: one-shot escalation --
+                # give the agent a single explicit chance to change approach
+                # or admit the goal can't be met as defined, before
+                # hard-stopping.
+                goal["escalated"] = True
+                await self._flush_pending_complete(goal_final=False)
+                await hooks.emit(
+                    "orchestrator:goal_progress",
+                    self._goal_progress_payload(
+                        goal, state="continuing", reason=reason
+                    ),
+                )
+                goal["continuations"] += 1
+                stall_prompt = (
+                    f"You've been asked to work toward this goal: "
+                    f"{goal['condition']}\n\n"
+                    f"For the last {goal['no_tool_turns']} turns you "
+                    "haven't taken any actions (no tool calls), and "
+                    "the evaluator keeps reporting the same kind of "
+                    f"blocker: {reason}\n\n"
+                    "You appear stuck. Either try a genuinely "
+                    "different approach to make progress, or, if you "
+                    "believe this goal cannot be achieved as it's "
+                    "currently defined, say so plainly and explain "
+                    "specifically why -- don't just repeat what "
+                    "you've already said."
+                )
+                full_response = await self._execute_one_turn(
+                    stall_prompt,
+                    context,
+                    providers,
+                    tools,
+                    hooks,
+                    coordinator,
+                    goal_turn=goal["turns_used"] + 1,
+                )
+                is_continuation_turn = True
+                continue
+
+            if cap_hit:
+                # Not stalled (or the mechanical streak hadn't reached
+                # threshold this turn) -- the cap simply ran out. `reason`
+                # is already known from the evaluation above; no separate
+                # "final" evaluation call is needed since evaluation now
+                # always runs before the cap is checked.
+                coordinator.session_state["goal"] = None
+                await self._flush_pending_complete(goal_final=True)
+                summary = await self._summarize_goal_run(
+                    goal, providers, hooks, coordinator, "cap_hit"
+                )
+                await hooks.emit(
+                    "orchestrator:goal_progress",
+                    self._goal_progress_payload(
+                        goal, state="cap_hit", reason=reason, summary=summary
+                    ),
+                )
+                return full_response
 
             await self._flush_pending_complete(goal_final=False)
             await hooks.emit(
@@ -673,7 +705,77 @@ class StreamingOrchestrator:
         return None
 
     @staticmethod
+    def _goal_run_needs_summary(goal: dict[str, Any], final_state: str) -> bool:
+        """Whether the terminal ``goal_progress`` event's ``summary`` field
+        is worth generating (DEFECT 3 fix).
+
+        Skips the common, everything-worked-first-try case: an ``achieved``
+        run with zero continuations has nothing to recap -- the condition
+        was satisfied on the very first evaluation, so the auto-continue
+        loop never actually ran. Paying for the fast-model summary call
+        there only adds latency (5-12s measured) to the happy path for no
+        benefit -- text like "...did this on the first attempt with no
+        continuations needed" tells the developer nothing the structured
+        `continuations: 0` field doesn't already say.
+
+        Every other terminal state -- ``stalled``, ``cap_hit``, ``error``,
+        or an ``achieved`` run that needed at least one continuation --
+        still gets a summary; there's an actual story to tell in each of
+        those. (``cancelled`` never reaches this: it's short-circuited
+        before any summary call, same as before.)
+        """
+        return not (final_state == "achieved" and not goal.get("continuations", 0))
+
+    @staticmethod
+    def _dedupe_consecutive_reasons(reasons: list[str]) -> list[str]:
+        """Collapse consecutive runs of identical/near-identical evaluator
+        reasons into a single entry annotated with a repeat count, for the
+        rendered ``goal_progress`` payload.
+
+        An unsatisfiable-goal run can produce 5-8 near-identical sentences
+        in a row (the evaluator keeps reporting the same blocker every
+        turn); consumers render ``reasons`` as a list, so N verbatim copies
+        is noise, not signal -- the signal is *that* it repeated and *how
+        many* times. "Near-identical" here means equal after collapsing
+        whitespace and case; the first occurrence's original text is kept
+        verbatim in the collapsed entry.
+
+        This only affects what gets rendered in the payload -- the raw,
+        uncollapsed per-turn history is untouched on ``goal["reasons"]``
+        itself (read by ``_judge_stall``, ``_summarize_goal_run``, and
+        anything else that wants the full detail).
+        """
+        if not reasons:
+            return []
+
+        def _norm(r: str) -> str:
+            return " ".join(r.split()).strip().lower()
+
+        collapsed: list[str] = []
+        run_text = reasons[0]
+        run_norm = _norm(reasons[0])
+        run_count = 1
+
+        for r in reasons[1:]:
+            if _norm(r) == run_norm:
+                run_count += 1
+            else:
+                collapsed.append(
+                    run_text
+                    if run_count == 1
+                    else f"{run_text} (repeated {run_count}x)"
+                )
+                run_text = r
+                run_norm = _norm(r)
+                run_count = 1
+
+        collapsed.append(
+            run_text if run_count == 1 else f"{run_text} (repeated {run_count}x)"
+        )
+        return collapsed
+
     def _goal_progress_payload(
+        self,
         goal: dict[str, Any],
         *,
         state: str,
@@ -694,7 +796,7 @@ class StreamingOrchestrator:
             "continuations": goal.get("continuations", 0),
             "cap": goal.get("cap") or None,
             "reason": reason,
-            "reasons": list(goal.get("reasons", [])),
+            "reasons": self._dedupe_consecutive_reasons(list(goal.get("reasons", []))),
             "stall_detail": stall_detail,
             "summary": summary,
             "metadata": None,
@@ -759,8 +861,21 @@ class StreamingOrchestrator:
                     f"stall judge call denied by hook: {request_result.reason}"
                 )
 
+        # DEFECT 2 fix: `model_override` was previously only set on
+        # `ChatRequest.model`, never passed as a `model=` kwarg to
+        # `provider.complete()`. The installed Anthropic provider's
+        # `complete()` / `_complete_chat_request()` reads the effective
+        # model from `kwargs.get("model", self.default_model)` -- it never
+        # reads `request.model` at all -- so the override was silently
+        # dropped and this call ran on the session's default (expensive)
+        # model every time. Passing it as a kwarg too, in addition to the
+        # ChatRequest field, is correct regardless of which convention a
+        # given provider implementation happens to honor.
+        complete_kwargs: dict[str, Any] = (
+            {"model": model_override} if model_override else {}
+        )
         try:
-            response = await provider.complete(chat_request)
+            response = await provider.complete(chat_request, **complete_kwargs)
         except LLMError as e:
             await hooks.emit(
                 PROVIDER_ERROR,
@@ -856,7 +971,13 @@ class StreamingOrchestrator:
                         f"summary call denied by hook: {request_result.reason}"
                     )
 
-            response = await provider.complete(chat_request)
+            # DEFECT 2 fix: see the matching comment in _judge_stall -- the
+            # ChatRequest.model field alone is not honored by the installed
+            # provider; the model must also be passed as a kwarg.
+            complete_kwargs: dict[str, Any] = (
+                {"model": model_override} if model_override else {}
+            )
+            response = await provider.complete(chat_request, **complete_kwargs)
             summary_text = ""
             for block in response.content:
                 if getattr(block, "type", None) == "text":
@@ -942,8 +1063,14 @@ class StreamingOrchestrator:
                     f"evaluator call denied by hook: {request_result.reason}"
                 )
 
+        # DEFECT 2 fix: see the matching comment in _judge_stall -- the
+        # ChatRequest.model field alone is not honored by the installed
+        # provider; the model must also be passed as a kwarg.
+        complete_kwargs: dict[str, Any] = (
+            {"model": model_override} if model_override else {}
+        )
         try:
-            response = await provider.complete(chat_request)
+            response = await provider.complete(chat_request, **complete_kwargs)
         except LLMError as e:
             await hooks.emit(
                 PROVIDER_ERROR,
