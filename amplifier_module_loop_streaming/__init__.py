@@ -153,16 +153,66 @@ class StreamingOrchestrator:
         "Line 2: one sentence explaining why\n"
     )
 
-    # Fast-model run-summary prompt (terminal goal_progress states only).
-    _GOAL_SUMMARY_SYSTEM_PROMPT = (
-        "You write short, factual recaps of an automated goal-pursuit run for "
-        "a developer to skim. You will be given the original goal condition, "
-        "how many times the run sent the assistant back for another attempt, "
-        "the sequence of reasons an evaluator gave for why the goal wasn't yet "
-        "met, and how the run ended. Write 2-3 plain sentences: what was "
-        "asked, what kept blocking it (if anything), and how it ended. No "
-        "preamble, no headers, no bullet points -- just the sentences."
-    )
+    # Fast-model run-summary prompts (terminal goal_progress states only),
+    # one per terminal state. The reader watched the entire run happen
+    # live, so the summary is never a recap of what they already saw --
+    # it's the one-sentence answer to the single question that particular
+    # ending raises (what blocked it / what's left / what broke). Replaces
+    # the earlier single 2-4 sentence generic-recap prompt, which restated
+    # things the CLI had already rendered turn by turn.
+    #
+    # ``achieved`` deliberately has no entry here: it never reaches this
+    # dict at all (see _goal_run_needs_summary). ``cancelled`` is
+    # short-circuited before any summary call in execute().
+    _GOAL_SUMMARY_SYSTEM_PROMPTS: ClassVar[dict[str, str]] = {
+        "stalled": (
+            "You write a single, short line for a developer who just watched "
+            "an automated goal-pursuit run end with no progress. They saw "
+            "every turn happen live -- do not recap the run or narrate "
+            "attempts. You will be given the goal condition and the sequence "
+            "of reasons an evaluator gave, turn by turn, for why the "
+            "condition kept going unmet. Name the ONE thing that blocked "
+            "progress -- lead with the blocker itself. If the goal is "
+            'impossible as stated, say so plainly. Never begin with "The '
+            'assistant" or "The evaluator" (both are implied), and never '
+            "restate the goal condition. Write in present tense. Respond "
+            "with exactly one sentence, no more than about 120 characters, "
+            "no preamble, no quotation marks."
+        ),
+        "cap_hit": (
+            "You write a single, short line for a developer whose automated "
+            "goal-pursuit run ran out of turns before an evaluator ever "
+            "confirmed the goal condition was met. They watched every turn "
+            "happen live -- do not recap the run. You will be given the "
+            "goal condition and the sequence of reasons the evaluator gave. "
+            "State only what REMAINS UNDONE -- frame it as remaining work, "
+            "never as history, and never assert or imply the goal was met. "
+            "If the work looked complete but was simply never confirmed, "
+            "say exactly that. This sentence is the sole input to the "
+            "developer's next decision -- rerun with a bigger cap, or "
+            "change approach -- so make the remaining work concrete. Never "
+            'begin with "The assistant" or "The evaluator", and never '
+            "restate the goal condition. Write in present tense. Respond "
+            "with exactly one sentence, no more than about 120 characters, "
+            "no preamble, no quotation marks."
+        ),
+        "error": (
+            "You write a single, short line for a developer whose automated "
+            "goal-pursuit run crashed because the evaluator itself failed. "
+            "You will be given the error that was raised. State only what "
+            "failed in the evaluator. No apology, no advice, no restating "
+            "the goal condition, no narrating the run. Never begin with "
+            '"The assistant" or "The evaluator" (both are implied). '
+            "Write in present tense. Respond with exactly one sentence, no "
+            "more than about 120 characters, no preamble, no quotation "
+            "marks."
+        ),
+    }
+
+    # Hard ceiling enforced in code on every generated run summary (see
+    # _enforce_summary_length below) -- the prompts above ask the model for
+    # ~120 characters, but a model instruction is not a guarantee.
+    _GOAL_SUMMARY_MAX_CHARS = 120
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -382,8 +432,17 @@ class StreamingOrchestrator:
                 # failure here is always reported honestly as "error".)
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
-                summary = await self._summarize_goal_run(
-                    goal, providers, hooks, coordinator, "error"
+                summary = (
+                    await self._summarize_goal_run(
+                        goal,
+                        providers,
+                        hooks,
+                        coordinator,
+                        "error",
+                        error_detail=str(e),
+                    )
+                    if self._goal_run_needs_summary("error")
+                    else None
                 )
                 await hooks.emit(
                     "orchestrator:goal_progress",
@@ -406,7 +465,7 @@ class StreamingOrchestrator:
                     await self._summarize_goal_run(
                         goal, providers, hooks, coordinator, "achieved"
                     )
-                    if self._goal_run_needs_summary(goal, "achieved")
+                    if self._goal_run_needs_summary("achieved")
                     else None
                 )
                 await hooks.emit(
@@ -464,8 +523,12 @@ class StreamingOrchestrator:
                 # This is a LOUD failure state, never mistakable for success.
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
-                summary = await self._summarize_goal_run(
-                    goal, providers, hooks, coordinator, "stalled"
+                summary = (
+                    await self._summarize_goal_run(
+                        goal, providers, hooks, coordinator, "stalled"
+                    )
+                    if self._goal_run_needs_summary("stalled")
+                    else None
                 )
                 await hooks.emit(
                     "orchestrator:goal_progress",
@@ -705,26 +768,39 @@ class StreamingOrchestrator:
         return None
 
     @staticmethod
-    def _goal_run_needs_summary(goal: dict[str, Any], final_state: str) -> bool:
+    def _goal_run_needs_summary(final_state: str) -> bool:
         """Whether the terminal ``goal_progress`` event's ``summary`` field
-        is worth generating (DEFECT 3 fix).
+        is worth generating for this final state.
 
-        Skips the common, everything-worked-first-try case: an ``achieved``
-        run with zero continuations has nothing to recap -- the condition
-        was satisfied on the very first evaluation, so the auto-continue
-        loop never actually ran. Paying for the fast-model summary call
-        there only adds latency (5-12s measured) to the happy path for no
-        benefit -- text like "...did this on the first attempt with no
-        continuations needed" tells the developer nothing the structured
-        `continuations: 0` field doesn't already say.
+        ``achieved`` never needs one, regardless of how many continuations
+        the run took (extended DEFECT 3 fix): the CLI renders no prose at
+        all on success -- the user watched the whole run happen live -- so
+        paying for the fast-model summary call there is pure latency (5-12s
+        measured) and cost for a value that's never displayed. This used to
+        only skip the zero-continuations case; it now skips unconditionally
+        for ``achieved``, since even a multi-continuation success has
+        nothing worth saying that the structured `continuations` field
+        doesn't already say.
 
-        Every other terminal state -- ``stalled``, ``cap_hit``, ``error``,
-        or an ``achieved`` run that needed at least one continuation --
-        still gets a summary; there's an actual story to tell in each of
-        those. (``cancelled`` never reaches this: it's short-circuited
-        before any summary call, same as before.)
+        Every other terminal state -- ``stalled``, ``cap_hit``, ``error`` --
+        is exactly the case where the summary tells the developer something
+        they could not see live (what blocked it / what's left / what
+        broke), so those always get one -- falling back to a deterministic
+        per-state string (see ``_goal_summary_fallback``) if generation
+        itself fails. (``cancelled`` never reaches this: it's
+        short-circuited before any summary call, same as before.)
         """
-        return not (final_state == "achieved" and not goal.get("continuations", 0))
+        return final_state != "achieved"
+
+    @staticmethod
+    def _normalize_reason(reason: str) -> str:
+        """Exact-ish normalization of one evaluator reason: collapse
+        whitespace, strip, lowercase. Deliberately NOT fuzzy/similarity
+        based -- shared by ``_dedupe_consecutive_reasons`` (rendering) and
+        ``_distinct_blocker_count`` (the give-up justification count), so
+        both agree on what counts as "the same" reason.
+        """
+        return " ".join(reason.split()).strip().lower()
 
     @staticmethod
     def _dedupe_consecutive_reasons(reasons: list[str]) -> list[str]:
@@ -737,8 +813,8 @@ class StreamingOrchestrator:
         turn); consumers render ``reasons`` as a list, so N verbatim copies
         is noise, not signal -- the signal is *that* it repeated and *how
         many* times. "Near-identical" here means equal after collapsing
-        whitespace and case; the first occurrence's original text is kept
-        verbatim in the collapsed entry.
+        whitespace and case (see ``_normalize_reason``); the first
+        occurrence's original text is kept verbatim in the collapsed entry.
 
         This only affects what gets rendered in the payload -- the raw,
         uncollapsed per-turn history is untouched on ``goal["reasons"]``
@@ -748,8 +824,7 @@ class StreamingOrchestrator:
         if not reasons:
             return []
 
-        def _norm(r: str) -> str:
-            return " ".join(r.split()).strip().lower()
+        _norm = StreamingOrchestrator._normalize_reason
 
         collapsed: list[str] = []
         run_text = reasons[0]
@@ -774,6 +849,32 @@ class StreamingOrchestrator:
         )
         return collapsed
 
+    @staticmethod
+    def _distinct_blocker_count(reasons: list[str]) -> int:
+        """Count of distinct evaluator-reason signatures across the
+        *entire* run, after the same exact-ish normalization used by
+        ``_dedupe_consecutive_reasons`` (whitespace/case only -- NOT fuzzy
+        similarity).
+
+        This is the sole justification a consumer has for distinguishing
+        "hit a wall" (the evaluator reported the same blocker every turn --
+        count of 1) from "flailing" (a different blocker each turn -- count
+        approaching the number of turns). Getting this number wrong is
+        worse than not reporting it at all, since it would assert a false
+        narrative about *why* the run gave up -- hence exact normalization
+        only, never a similarity heuristic that could quietly merge two
+        genuinely different blockers or split one blocker's rephrasing
+        into two.
+
+        Unlike ``_dedupe_consecutive_reasons`` (which only collapses
+        *consecutive* repeats for rendering), this counts distinct
+        signatures across the whole list regardless of position -- an
+        A-B-A pattern is 2 distinct blockers, not 3.
+        """
+        if not reasons:
+            return 0
+        return len({StreamingOrchestrator._normalize_reason(r) for r in reasons})
+
     def _goal_progress_payload(
         self,
         goal: dict[str, Any],
@@ -789,6 +890,7 @@ class StreamingOrchestrator:
         cancelled/error/stalled) produces an identical shape -- app-cli is
         built in parallel against this exact contract.
         """
+        reasons = list(goal.get("reasons", []))
         return {
             "orchestrator": "loop-streaming",
             "state": state,
@@ -796,9 +898,13 @@ class StreamingOrchestrator:
             "continuations": goal.get("continuations", 0),
             "cap": goal.get("cap") or None,
             "reason": reason,
-            "reasons": self._dedupe_consecutive_reasons(list(goal.get("reasons", []))),
+            "reasons": self._dedupe_consecutive_reasons(reasons),
             "stall_detail": stall_detail,
             "summary": summary,
+            # Additive field (see _distinct_blocker_count): count of
+            # distinct evaluator-reason signatures across the whole run --
+            # distinguishes "hit a wall" (1) from "flailing" (N).
+            "distinct_blockers": self._distinct_blocker_count(reasons),
             "metadata": None,
         }
 
@@ -915,6 +1021,53 @@ class StreamingOrchestrator:
         detail = lines[1] if len(lines) > 1 else "(judge gave no reason)"
         return verdict == "YES", detail
 
+    @staticmethod
+    def _enforce_summary_length(text: str, max_chars: int | None = None) -> str:
+        """Hard-truncate ``text`` to at most ``max_chars`` (default
+        ``_GOAL_SUMMARY_MAX_CHARS``), breaking at the last whole word rather
+        than mid-word.
+
+        The per-state system prompts ask the model for "no more than about
+        120 characters", but a model instruction is not a guarantee -- this
+        is the code-level backstop that actually enforces it.
+        """
+        cap = (
+            max_chars
+            if max_chars is not None
+            else StreamingOrchestrator._GOAL_SUMMARY_MAX_CHARS
+        )
+        text = text.strip()
+        if len(text) <= cap:
+            return text
+        truncated = text[:cap]
+        last_space = truncated.rfind(" ")
+        if last_space > 0:
+            truncated = truncated[:last_space]
+        return truncated.rstrip()
+
+    @staticmethod
+    def _goal_summary_fallback(goal: dict[str, Any], final_state: str) -> str | None:
+        """Deterministic per-state fallback string used when summary
+        generation fails outright, or the model returns empty text, so the
+        terminal ``goal_progress`` event's ``summary`` field is never
+        silently ``None`` for a state where the developer genuinely needs
+        an explanation.
+
+        ``achieved`` never reaches ``_summarize_goal_run`` at all (see
+        ``_goal_run_needs_summary``) so it has no fallback entry here; a
+        final state outside the known three returns ``None`` as a safety
+        net rather than inventing text for a state that shouldn't be
+        calling this in the first place.
+        """
+        if final_state == "stalled":
+            no_tool_turns = goal.get("no_tool_turns", 0)
+            return f"no progress across the last {no_tool_turns} turns"
+        if final_state == "cap_hit":
+            return "completion not confirmed before the cap"
+        if final_state == "error":
+            return "evaluator failed"
+        return None
+
     async def _summarize_goal_run(
         self,
         goal: dict[str, Any],
@@ -922,15 +1075,27 @@ class StreamingOrchestrator:
         hooks: HookRegistry,
         coordinator: ModuleCoordinator | None,
         final_state: str,
+        *,
+        error_detail: str | None = None,
     ) -> str | None:
-        """Best-effort fast-model recap of a completed /goal run, for the
-        terminal ``goal_progress`` event's ``summary`` field.
+        """Best-effort fast-model, one-sentence explanation of a completed
+        /goal run, for the terminal ``goal_progress`` event's ``summary``
+        field.
 
-        Never raises -- on any failure this logs and returns None so the
-        structured facts already in the payload (turn/continuations/reasons/
-        etc, which are the real data) are still emitted on schedule. Not
-        called for the ``cancelled`` state (a user-initiated abort needs no
-        explanation).
+        Uses the per-state prompt from ``_GOAL_SUMMARY_SYSTEM_PROMPTS`` --
+        ``final_state`` must be one of ``"stalled"``, ``"cap_hit"``, or
+        ``"error"`` (``achieved`` never reaches this method at all, see
+        ``_goal_run_needs_summary``; ``cancelled`` is short-circuited in
+        ``execute()`` before any summary call). ``error_detail`` is the
+        stringified exception, required for the ``"error"`` state's prompt.
+
+        Never raises and never returns ``None`` for a known final_state --
+        on any failure, or an empty model response, this falls back to a
+        deterministic per-state string (``_goal_summary_fallback``) so the
+        payload's ``summary`` field always carries *something* actionable
+        rather than silently going missing. The length cap is enforced in
+        code (``_enforce_summary_length``) regardless of what the model
+        actually returned.
         """
         try:
             if not providers:
@@ -938,21 +1103,31 @@ class StreamingOrchestrator:
             provider_name, provider = next(iter(providers.items()))
             model_override = self._select_cheap_model(provider_name)
 
-            reasons = goal.get("reasons", [])
-            reasons_text = (
-                "\n".join(f"{i + 1}. {r}" for i, r in enumerate(reasons))
-                if reasons
-                else "(no evaluator reasons recorded)"
-            )
-            user_prompt = (
-                f"GOAL CONDITION:\n{goal['condition']}\n\n"
-                f"Continuations (times sent back): {goal.get('continuations', 0)}\n"
-                f"Final state: {final_state}\n\n"
-                f"EVALUATOR REASONS in order:\n{reasons_text}\n\n"
-                "Write the 2-3 sentence recap now."
-            )
+            system_prompt = self._GOAL_SUMMARY_SYSTEM_PROMPTS[final_state]
+
+            if final_state == "error":
+                user_prompt = (
+                    f"GOAL CONDITION:\n{goal['condition']}\n\n"
+                    "ERROR RAISED BY THE EVALUATOR:\n"
+                    f"{error_detail or '(no error detail captured)'}\n\n"
+                    "Write the one-sentence line now."
+                )
+            else:
+                reasons = goal.get("reasons", [])
+                reasons_text = (
+                    "\n".join(f"{i + 1}. {r}" for i, r in enumerate(reasons))
+                    if reasons
+                    else "(no evaluator reasons recorded)"
+                )
+                user_prompt = (
+                    f"GOAL CONDITION:\n{goal['condition']}\n\n"
+                    f"Continuations (times sent back): {goal.get('continuations', 0)}\n"
+                    f"EVALUATOR REASONS in order:\n{reasons_text}\n\n"
+                    "Write the one-sentence line now."
+                )
+
             summary_messages = [
-                Message(role="system", content=self._GOAL_SUMMARY_SYSTEM_PROMPT),
+                Message(role="system", content=system_prompt),
                 Message(role="user", content=user_prompt),
             ]
             chat_request = ChatRequest(
@@ -982,12 +1157,16 @@ class StreamingOrchestrator:
             for block in response.content:
                 if getattr(block, "type", None) == "text":
                     summary_text += getattr(block, "text", "")
-            return summary_text.strip() or None
+            summary_text = summary_text.strip()
+            if not summary_text:
+                return self._goal_summary_fallback(goal, final_state)
+            return self._enforce_summary_length(summary_text)
         except Exception as e:
             logger.warning(
-                f"/goal: summary generation failed, continuing without it: {e}"
+                f"/goal: summary generation failed, falling back to a "
+                f"deterministic message: {e}"
             )
-            return None
+            return self._goal_summary_fallback(goal, final_state)
 
     async def _evaluate_goal(
         self,

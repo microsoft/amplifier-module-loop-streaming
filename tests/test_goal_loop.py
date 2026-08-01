@@ -179,6 +179,10 @@ class FakeProvider:
         self.judge_call_models: list[str | None] = []
         self.summary_call_models: list[str | None] = []
         self.summary_call_count = 0
+        # When set, the summary branch raises this instead of returning a
+        # response -- used to exercise _goal_summary_fallback's
+        # generation-failed path.
+        self.summary_should_raise: Exception | None = None
 
     async def complete(self, chat_request, **kwargs):
         system_msg = next(
@@ -204,9 +208,13 @@ class FakeProvider:
             verdict = "YES" if is_stall else "NO"
             return _llm_text_response(f"{verdict}\n{detail}")
 
-        if "factual recaps" in system_text:
+        if "single, short line for a developer" in system_text:
+            # All three per-state summary prompts (stalled/cap_hit/error)
+            # share this phrase -- see _GOAL_SUMMARY_SYSTEM_PROMPTS.
             self.summary_call_count += 1
             self.summary_call_models.append(kwargs.get("model"))
+            if self.summary_should_raise:
+                raise self.summary_should_raise
             return _llm_text_response(self.summary_text)
 
         # Plain turn-conversation call.
@@ -289,7 +297,8 @@ class TestContinuationCounting:
         states = [e["state"] for e in hooks.goal_progress_events()]
         assert states == ["continuing", "continuing", "achieved"]
 
-        # Every emitted payload matches the exact contract shape.
+        # Every emitted payload matches the exact contract shape (plus the
+        # additive distinct_blockers field -- see _distinct_blocker_count).
         for event in hooks.goal_progress_events():
             assert set(event.keys()) == {
                 "orchestrator",
@@ -301,13 +310,18 @@ class TestContinuationCounting:
                 "reasons",
                 "stall_detail",
                 "summary",
+                "distinct_blockers",
                 "metadata",
             }
 
-        # Terminal event carries the fast-model summary; non-terminal doesn't
-        # need one (it's simply None until the run ends).
+        # `achieved` never gets a summary, regardless of how many
+        # continuations the run took (extended DEFECT 3 fix, see
+        # _goal_run_needs_summary) -- the CLI renders no prose on success
+        # at all, so the summary call is skipped unconditionally, not just
+        # in the zero-continuations case.
         achieved_event = hooks.goal_progress_events()[-1]
-        assert achieved_event["summary"] == provider.summary_text
+        assert achieved_event["summary"] is None
+        assert provider.summary_call_count == 0
 
         # ORCHESTRATOR_COMPLETE payloads carry the continuations field too.
         complete_events = hooks.orchestrator_complete_events()
@@ -868,6 +882,12 @@ class TestCheapModelKwargPropagation:
         evaluator/stall-judge/summary call ran on the session's default
         (expensive) model. Asserts the kwarg is now present for all three
         call kinds.
+
+        The run ends "stalled" rather than "achieved" so that a summary
+        call actually happens: `achieved` never generates a summary at all
+        (see _goal_run_needs_summary), so it can't be used to prove the
+        override reaches the summary call -- only stalled/cap_hit/error
+        can.
         """
         orch = _make_orchestrator({"goal_stall_threshold": 1})
         ctx = MockContext()
@@ -885,16 +905,24 @@ class TestCheapModelKwargPropagation:
 
         provider.turn_queue.append(MockTurnResponse(text="t0"))
         provider.turn_queue.append(MockTurnResponse(text="A"))
+        # Escalation turn: still blocked, so the second no-tool streak
+        # re-trips the judge immediately (threshold=1) and, since already
+        # escalated, hard-stops as "stalled".
         provider.turn_queue.append(MockTurnResponse(text="escalation-turn"))
 
         provider.eval_queue.extend(
             [
                 (False, "blocked"),  # after t0 -- not a continuation, no bookkeeping
                 (False, "blocked"),  # after A -> threshold(1) trips -> judge #1
-                (True, "done"),  # after escalation turn -> achieved
+                (False, "blocked"),  # after escalation turn -> judge #2 -> stalled
             ]
         )
-        provider.judge_queue.append((True, "same blocker, escalate"))
+        provider.judge_queue.extend(
+            [
+                (True, "same blocker, escalate"),
+                (True, "escalation did not help, still blocked"),
+            ]
+        )
 
         # Provider name contains "anthropic" so _select_cheap_model resolves
         # to the hint-table entry "claude-haiku-4-5".
@@ -907,14 +935,18 @@ class TestCheapModelKwargPropagation:
             coordinator=coordinator,  # type: ignore[arg-type]
         )
 
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states[-1] == "stalled"
+
         assert provider.eval_call_models == [
             "claude-haiku-4-5",
             "claude-haiku-4-5",
             "claude-haiku-4-5",
         ]
-        assert provider.judge_call_models == ["claude-haiku-4-5"]
-        # continuations=2 (A, escalation turn) -- achieved-with-continuations
-        # still gets a summary (DEFECT 3 skip rule only applies at zero).
+        assert provider.judge_call_models == [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5",
+        ]
         assert provider.summary_call_models == ["claude-haiku-4-5"]
 
 
@@ -1125,3 +1157,432 @@ class TestReasonDedupe:
             "file not created yet",
             "file now exists",
         ]
+
+
+# ---------------------------------------------------------------------------
+# 10. Run-summary length cap: enforced in code, not trusted to the model
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceSummaryLength:
+    """Unit-level coverage of `_enforce_summary_length` in isolation --
+    exact, hardcoded expected output, independent of any orchestration.
+    """
+
+    def test_text_under_cap_is_unchanged(self) -> None:
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        text = "short and under the cap"
+        assert StreamingOrchestrator._enforce_summary_length(text) == text
+
+    def test_text_over_cap_truncates_at_word_boundary(self) -> None:
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        # 130 chars, well over the default 120-char cap, with clean word
+        # boundaries throughout so the expected truncation point is exact.
+        text = (
+            "the evaluator keeps reporting the exact same blocker every "
+            "single turn and no new progress has been made toward the "
+            "condition at all whatsoever"
+        )
+        assert len(text) > 120
+        result = StreamingOrchestrator._enforce_summary_length(text)
+        assert len(result) <= 120
+        # Truncated at the last whole word within the cap -- never a
+        # partial word, and never the raw text[:120] slice verbatim.
+        assert text.startswith(result)
+        assert not result.endswith(" ")
+        cutoff = text[:120]
+        assert result == cutoff[: cutoff.rfind(" ")]
+
+    def test_custom_max_chars_honored(self) -> None:
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        text = "one two three four five six seven eight nine ten"
+        result = StreamingOrchestrator._enforce_summary_length(text, max_chars=10)
+        assert len(result) <= 10
+        assert result == "one two"
+
+
+@pytest.mark.asyncio
+class TestSummaryLengthCapIntegration:
+    async def test_overlong_model_summary_is_truncated_in_emitted_payload(
+        self,
+    ) -> None:
+        """Wiring check: a model response longer than the cap must come out
+        of the emitted payload already truncated -- the cap is enforced by
+        the orchestrator, not merely documented in the prompt.
+        """
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.summary_text = (
+            "the evaluator keeps reporting the exact same blocker every "
+            "single turn and no new progress has been made toward the "
+            "condition at all whatsoever"
+        )
+        assert len(provider.summary_text) > 120
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for i in range(4):
+            provider.turn_queue.append(MockTurnResponse(text=f"t{i}"))
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+            ]
+        )
+        provider.judge_queue.extend(
+            [
+                (True, "same blocker, no progress"),
+                (True, "escalation did not help, still the same blocker"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        stalled_event = hooks.goal_progress_events()[-1]
+        assert stalled_event["state"] == "stalled"
+        assert len(stalled_event["summary"]) <= 120
+        assert stalled_event[
+            "summary"
+        ] == StreamingOrchestrator._enforce_summary_length(provider.summary_text)
+
+
+# ---------------------------------------------------------------------------
+# 11. Per-state deterministic fallback strings when generation fails
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPerStateFallbacks:
+    async def test_stalled_fallback_names_the_no_tool_turn_count(self) -> None:
+        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.summary_should_raise = RuntimeError("model unavailable")
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for i in range(4):
+            provider.turn_queue.append(MockTurnResponse(text=f"t{i}"))
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+            ]
+        )
+        provider.judge_queue.extend(
+            [
+                (True, "same blocker, no progress"),
+                (True, "escalation did not help, still the same blocker"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        stalled_event = hooks.goal_progress_events()[-1]
+        assert stalled_event["state"] == "stalled"
+        assert stalled_event["summary"] == (
+            f"no progress across the last {goal_dict['no_tool_turns']} turns"
+        )
+
+    async def test_cap_hit_fallback_is_deterministic(self) -> None:
+        """Minimal cap_hit scenario: cap=1 means the very first evaluation
+        (of the initial turn) already hits the cap, with zero continuations
+        -- the shortest possible path to "cap_hit".
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.summary_should_raise = RuntimeError("model unavailable")
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": 1,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.eval_queue.append((False, "not there yet"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        cap_hit_event = hooks.goal_progress_events()[-1]
+        assert cap_hit_event["state"] == "cap_hit"
+        assert cap_hit_event["summary"] == "completion not confirmed before the cap"
+
+    async def test_error_fallback_is_deterministic(self) -> None:
+        """No provider mounted at all -- `_evaluate_goal` raises immediately,
+        producing an "error" terminal state; the summary call then also has
+        no provider to call, so it falls back rather than crashing.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider = FakeProvider()
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={},  # no provider mounted -> _evaluate_goal raises
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        error_event = hooks.goal_progress_events()[-1]
+        assert error_event["state"] == "error"
+        assert error_event["summary"] == "evaluator failed"
+
+
+@pytest.mark.asyncio
+class TestPerStateSummaryGeneration:
+    """Confirms cap_hit and error select the correct per-state prompt and
+    successfully call through to the provider (companion to the stalled
+    case already covered by TestEscalationThenStall and
+    TestCheapModelKwargPropagation).
+    """
+
+    async def test_cap_hit_gets_a_real_generated_summary(self) -> None:
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": 1,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.eval_queue.append((False, "not there yet"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        cap_hit_event = hooks.goal_progress_events()[-1]
+        assert cap_hit_event["state"] == "cap_hit"
+        assert provider.summary_call_count == 1
+        assert cap_hit_event["summary"] == provider.summary_text
+
+    async def test_error_gets_a_real_generated_summary(self) -> None:
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        class BrokenContext(MockContext):
+            async def get_messages(self) -> list[dict]:
+                raise RuntimeError("transcript read failed")
+
+        ctx = BrokenContext()
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        error_event = hooks.goal_progress_events()[-1]
+        assert error_event["state"] == "error"
+        assert "transcript read failed" in error_event["reason"]
+        assert provider.summary_call_count == 1
+        assert error_event["summary"] == provider.summary_text
+
+
+# ---------------------------------------------------------------------------
+# 12. Distinct-blocker-signature count: "hit a wall" vs "flailing"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDistinctBlockerCount:
+    async def test_same_blocker_every_turn_counts_as_one(self) -> None:
+        """ "Hit a wall": every evaluator reason is the same blocker
+        (mod whitespace/case) -- distinct_blockers must be 1, regardless of
+        how many turns repeated it.
+        """
+        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for i in range(4):
+            provider.turn_queue.append(MockTurnResponse(text=f"t{i}"))
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing API key"),
+                (False, "  Blocked:   missing api key  "),  # same, mod case/ws
+                (False, "blocked: missing API key"),
+                (False, "blocked: missing API key"),
+            ]
+        )
+        provider.judge_queue.extend(
+            [
+                (True, "same blocker, no progress"),
+                (True, "escalation did not help, still the same blocker"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        stalled_event = hooks.goal_progress_events()[-1]
+        assert stalled_event["state"] == "stalled"
+        assert stalled_event["distinct_blockers"] == 1
+
+    async def test_different_blocker_each_turn_counts_all_of_them(self) -> None:
+        """ "Flailing": a different blocker every turn -- distinct_blockers
+        must equal the number of distinct reasons recorded, not collapse
+        them via similarity.
+        """
+        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for i in range(4):
+            provider.turn_queue.append(MockTurnResponse(text=f"t{i}"))
+        provider.eval_queue.extend(
+            [
+                (False, "missing credentials"),
+                (False, "wrong output format"),
+                (False, "network timeout"),
+                (False, "still not matching"),
+            ]
+        )
+        provider.judge_queue.extend(
+            [
+                (True, "different blocker every turn, judged a stall anyway"),
+                (True, "still flailing, hard stop"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        stalled_event = hooks.goal_progress_events()[-1]
+        assert stalled_event["state"] == "stalled"
+        assert stalled_event["distinct_blockers"] == 4
+
+    async def test_zero_reasons_is_zero(self) -> None:
+        """Edge case sanity: an event built before any evaluator reason
+        exists (shouldn't happen in practice, but the helper must not
+        crash) reports 0, not 1 or an exception.
+        """
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        assert StreamingOrchestrator._distinct_blocker_count([]) == 0
