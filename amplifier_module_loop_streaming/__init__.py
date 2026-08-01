@@ -12,27 +12,24 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
-from typing import Any
-from typing import ClassVar
+from typing import Any, ClassVar
 
-from amplifier_core import HookRegistry
-from amplifier_core import ModuleCoordinator
-from amplifier_core import ToolResult
-from amplifier_core.events import CANCEL_COMPLETED
-from amplifier_core.events import CANCEL_REQUESTED
-from amplifier_core.events import CONTENT_BLOCK_END
-from amplifier_core.events import CONTENT_BLOCK_START
-from amplifier_core.events import ORCHESTRATOR_COMPLETE
-from amplifier_core.events import PROMPT_SUBMIT
-from amplifier_core.events import PROVIDER_ERROR
-from amplifier_core.events import PROVIDER_REQUEST
-from amplifier_core.events import TOOL_ERROR
-from amplifier_core.events import TOOL_POST
-from amplifier_core.events import TOOL_PRE
+from amplifier_core import HookRegistry, ModuleCoordinator, ToolResult
+from amplifier_core.events import (
+    CANCEL_COMPLETED,
+    CANCEL_REQUESTED,
+    CONTENT_BLOCK_END,
+    CONTENT_BLOCK_START,
+    ORCHESTRATOR_COMPLETE,
+    PROMPT_SUBMIT,
+    PROVIDER_ERROR,
+    PROVIDER_REQUEST,
+    TOOL_ERROR,
+    TOOL_POST,
+    TOOL_PRE,
+)
 from amplifier_core.llm_errors import LLMError
-from amplifier_core.message_models import ChatRequest
-from amplifier_core.message_models import Message
-from amplifier_core.message_models import ToolSpec
+from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from .steering import SteeringQueue
 
@@ -91,7 +88,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     await coordinator.mount("orchestrator", orchestrator)
     coordinator.register_capability("session.steer", orchestrator.steer)
     logger.info("Mounted StreamingOrchestrator with steering capability")
-    return
 
 
 class StreamingOrchestrator:
@@ -119,6 +115,17 @@ class StreamingOrchestrator:
 
     # Best-effort cheap-model hints per provider-name substring. Spike-level
     # heuristic only -- mirrors amplifier-app-cli's hint table.
+    #
+    # NOTE on model-role routing (investigated for the stall-detection work,
+    # docs/designs/goal-command.md): Amplifier's routing-matrix `fast` role
+    # is a delegation-time concept -- it's only reachable through the
+    # `delegate` tool's sub-session spawning (`model_role` param). It is not
+    # exposed as a coordinator capability (see amplifier-core's
+    # CAPABILITY_REGISTRY.md -- the only standard capabilities are
+    # `session.spawn` / `session.resume`), so there is nothing for a module
+    # making a direct `provider.complete()` call, like this one, to reach.
+    # If a `model.route`-style capability is ever registered, this hint
+    # table (and `_select_cheap_model` below) is the place to swap it in.
     _GOAL_CHEAP_MODEL_HINTS: ClassVar[dict[str, str]] = {
         "anthropic": "claude-haiku-4-5",
         "openai": "gpt-5-mini",
@@ -128,11 +135,44 @@ class StreamingOrchestrator:
 
     _GOAL_MAX_TRANSCRIPT_MESSAGES = 40
 
+    # Stall-detection judge (see execute()'s stall-detection block). Only
+    # invoked when the mechanical no-tool-turns condition already holds, so
+    # it fires rarely and stays cheap.
+    _GOAL_STALL_SYSTEM_PROMPT = (
+        "You are a strict, tool-less judge. You will be shown a short history "
+        "of reasons an evaluator gave, across consecutive turns, for why a "
+        "goal condition was not yet satisfied -- during a stretch where the "
+        "assistant took no tool actions at all. Decide whether these reasons "
+        "describe the SAME unresolved blocker recurring with no sign of new "
+        "progress (a stall), as opposed to reasons that, even with no tools "
+        "run, show the assistant narrowing down, ruling things out, or making "
+        "genuine incremental progress toward the condition.\n\n"
+        "Respond with EXACTLY two lines and nothing else:\n"
+        "Line 1: the single word YES (this is a stall) or NO (not a stall), "
+        "verbatim\n"
+        "Line 2: one sentence explaining why\n"
+    )
+
+    # Fast-model run-summary prompt (terminal goal_progress states only).
+    _GOAL_SUMMARY_SYSTEM_PROMPT = (
+        "You write short, factual recaps of an automated goal-pursuit run for "
+        "a developer to skim. You will be given the original goal condition, "
+        "how many times the run sent the assistant back for another attempt, "
+        "the sequence of reasons an evaluator gave for why the goal wasn't yet "
+        "met, and how the run ended. Write 2-3 plain sentences: what was "
+        "asked, what kept blocking it (if anything), and how it ended. No "
+        "preamble, no headers, no bullet points -- just the sentences."
+    )
+
     def __init__(self, config: dict[str, Any]):
         self.config = config
         # -1 means unlimited iterations (default)
         max_iter_config = config.get("max_iterations", -1)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
+        # /goal stall detection: consecutive continuation turns with zero tool
+        # calls required before the stall judge is even consulted (see
+        # execute()'s stall-detection block and _judge_stall).
+        self.goal_stall_threshold = int(config.get("goal_stall_threshold", 3))
         # Per-token artificial delay (seconds) injected after each non-whitespace
         # token in _tokenize_stream(). Default 0.0 so headless callers (sub-sessions,
         # automated agents) pay no synthetic latency. Set to e.g. 0.01 to opt in to
@@ -141,6 +181,12 @@ class StreamingOrchestrator:
         self.extended_thinking = config.get("extended_thinking", False)
         self.min_delay_between_calls_ms = config.get("min_delay_between_calls_ms", 0)
         self._last_provider_call_end: float | None = None  # Timestamp tracking
+        # Per-turn tool-call counter (see _execute_tool_only /
+        # _execute_tool_with_result and execute()'s stall detection).
+        # Initialized here (not just reset in _execute_one_turn) so direct
+        # callers of the tool-execution methods never hit an
+        # AttributeError.
+        self._tool_calls_this_turn: int = 0
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
         # Track whether cancel:requested has been emitted for the current execution
@@ -256,6 +302,8 @@ class StreamingOrchestrator:
         # result, which happens only after the turn (and its completion
         # event) would otherwise already have fired.
         initial_goal = coordinator.session_state.get("goal") if coordinator else None
+        if initial_goal:
+            self._ensure_goal_defaults(initial_goal)
         goal_turn = (initial_goal["turns_used"] + 1) if initial_goal else None
 
         full_response = await self._execute_one_turn(
@@ -264,6 +312,13 @@ class StreamingOrchestrator:
 
         if coordinator is None:
             return full_response
+
+        # Tracks whether the turn just completed (and about to be evaluated)
+        # was itself a continuation turn. Stall bookkeeping (no_tool_turns)
+        # only ever counts continuation turns -- the very first turn is never
+        # part of that count, since it isn't a re-prompt. Set True right
+        # after each continuation _execute_one_turn call below.
+        is_continuation_turn = False
 
         while True:
             goal = coordinator.session_state.get("goal")
@@ -278,16 +333,15 @@ class StreamingOrchestrator:
             if coordinator.cancellation.is_cancelled:
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
+                # No fast-model summary for a user-initiated cancellation --
+                # nothing to explain.
                 await hooks.emit(
                     "orchestrator:goal_progress",
-                    {
-                        "orchestrator": "loop-streaming",
-                        "state": "cancelled",
-                        "turn": goal["turns_used"],
-                        "cap": goal.get("cap") or None,
-                        "reason": f"condition was: {goal['condition']}",
-                        "metadata": None,
-                    },
+                    self._goal_progress_payload(
+                        goal,
+                        state="cancelled",
+                        reason=f"condition was: {goal['condition']}",
+                    ),
                 )
                 return full_response
 
@@ -296,18 +350,33 @@ class StreamingOrchestrator:
             # A positive int is a hard, Python-enforced mechanical cap.
             cap = goal.get("cap") or None
             if cap and goal["turns_used"] >= cap:
+                # Run one final evaluation so the terminal event reports the
+                # true outcome instead of returning blind. If it turns out
+                # the condition was actually satisfied, report "achieved"
+                # rather than "cap_hit" -- the cap merely stopped the loop
+                # from re-checking again, it didn't fail the goal.
+                final_reason: str | None = None
+                satisfied_at_cap = False
+                try:
+                    satisfied_at_cap, final_reason = await self._evaluate_goal(
+                        goal["condition"], context, providers, hooks, coordinator
+                    )
+                    goal["last_reason"] = final_reason
+                    goal["reasons"].append(final_reason)
+                except Exception as e:
+                    logger.warning(f"/goal: final evaluation at cap failed: {e}")
+
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
+                final_state = "achieved" if satisfied_at_cap else "cap_hit"
+                summary = await self._summarize_goal_run(
+                    goal, providers, hooks, coordinator, final_state
+                )
                 await hooks.emit(
                     "orchestrator:goal_progress",
-                    {
-                        "orchestrator": "loop-streaming",
-                        "state": "cap_hit",
-                        "turn": goal["turns_used"],
-                        "cap": cap,
-                        "reason": None,
-                        "metadata": None,
-                    },
+                    self._goal_progress_payload(
+                        goal, state=final_state, reason=final_reason, summary=summary
+                    ),
                 )
                 return full_response
 
@@ -320,50 +389,130 @@ class StreamingOrchestrator:
                 # declare success. Clear the goal and report the error.
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
+                summary = await self._summarize_goal_run(
+                    goal, providers, hooks, coordinator, "error"
+                )
                 await hooks.emit(
                     "orchestrator:goal_progress",
-                    {
-                        "orchestrator": "loop-streaming",
-                        "state": "error",
-                        "turn": goal["turns_used"],
-                        "cap": cap,
-                        "reason": str(e),
-                        "metadata": None,
-                    },
+                    self._goal_progress_payload(
+                        goal, state="error", reason=str(e), summary=summary
+                    ),
                 )
                 return full_response
 
             goal["last_reason"] = reason
+            goal["reasons"].append(reason)
 
             if satisfied:
                 coordinator.session_state["goal"] = None
                 await self._flush_pending_complete(goal_final=True)
+                summary = await self._summarize_goal_run(
+                    goal, providers, hooks, coordinator, "achieved"
+                )
                 await hooks.emit(
                     "orchestrator:goal_progress",
-                    {
-                        "orchestrator": "loop-streaming",
-                        "state": "achieved",
-                        "turn": goal["turns_used"],
-                        "cap": cap,
-                        "reason": reason,
-                        "metadata": None,
-                    },
+                    self._goal_progress_payload(
+                        goal, state="achieved", reason=reason, summary=summary
+                    ),
                 )
                 return full_response
+
+            # Stall bookkeeping only applies once a continuation turn has
+            # actually run (see is_continuation_turn's comment above).
+            if is_continuation_turn:
+                if self._tool_calls_this_turn == 0:
+                    goal["no_tool_turns"] += 1
+                else:
+                    goal["no_tool_turns"] = 0
+
+                if goal["no_tool_turns"] >= self.goal_stall_threshold:
+                    # Condition (a) -- absence of action -- holds. Only now
+                    # do we pay for the (rare) stall-judge call to check
+                    # condition (b): is this a static, unresolved blocker, or
+                    # does it just look repetitive while genuinely
+                    # progressing? Both conditions are required to ever trip
+                    # -- text-similarity/repetition alone is never enough,
+                    # since legitimate agent work (e.g. re-running a test
+                    # after a fix) can look repetitive too.
+                    try:
+                        is_stalled, stall_detail = await self._judge_stall(
+                            goal, providers, hooks, coordinator
+                        )
+                    except Exception as e:
+                        # Fail open: a flaky judge call must never itself
+                        # manufacture a false stall.
+                        logger.warning(
+                            f"/goal: stall judge failed, continuing normally: {e}"
+                        )
+                        is_stalled, stall_detail = False, None
+
+                    if is_stalled:
+                        if not goal["escalated"]:
+                            # One-shot escalation: give the agent a single
+                            # explicit chance to change approach or admit the
+                            # goal can't be met as defined, before hard-stopping.
+                            goal["escalated"] = True
+                            await self._flush_pending_complete(goal_final=False)
+                            await hooks.emit(
+                                "orchestrator:goal_progress",
+                                self._goal_progress_payload(
+                                    goal, state="continuing", reason=reason
+                                ),
+                            )
+                            goal["continuations"] += 1
+                            stall_prompt = (
+                                f"You've been asked to work toward this goal: "
+                                f"{goal['condition']}\n\n"
+                                f"For the last {goal['no_tool_turns']} turns you "
+                                "haven't taken any actions (no tool calls), and "
+                                "the evaluator keeps reporting the same kind of "
+                                f"blocker: {reason}\n\n"
+                                "You appear stuck. Either try a genuinely "
+                                "different approach to make progress, or, if you "
+                                "believe this goal cannot be achieved as it's "
+                                "currently defined, say so plainly and explain "
+                                "specifically why -- don't just repeat what "
+                                "you've already said."
+                            )
+                            full_response = await self._execute_one_turn(
+                                stall_prompt,
+                                context,
+                                providers,
+                                tools,
+                                hooks,
+                                coordinator,
+                                goal_turn=goal["turns_used"] + 1,
+                            )
+                            is_continuation_turn = True
+                            continue
+                        else:
+                            # Escalation already used and it stalled again:
+                            # hard stop. This is a LOUD failure state, never
+                            # mistakable for success.
+                            coordinator.session_state["goal"] = None
+                            await self._flush_pending_complete(goal_final=True)
+                            summary = await self._summarize_goal_run(
+                                goal, providers, hooks, coordinator, "stalled"
+                            )
+                            await hooks.emit(
+                                "orchestrator:goal_progress",
+                                self._goal_progress_payload(
+                                    goal,
+                                    state="stalled",
+                                    reason=reason,
+                                    stall_detail=stall_detail,
+                                    summary=summary,
+                                ),
+                            )
+                            return full_response
 
             await self._flush_pending_complete(goal_final=False)
             await hooks.emit(
                 "orchestrator:goal_progress",
-                {
-                    "orchestrator": "loop-streaming",
-                    "state": "continuing",
-                    "turn": goal["turns_used"],
-                    "cap": cap,
-                    "reason": reason,
-                    "metadata": None,
-                },
+                self._goal_progress_payload(goal, state="continuing", reason=reason),
             )
 
+            goal["continuations"] += 1
             full_response = await self._execute_one_turn(
                 reason,
                 context,
@@ -373,6 +522,7 @@ class StreamingOrchestrator:
                 coordinator,
                 goal_turn=goal["turns_used"] + 1,
             )
+            is_continuation_turn = True
 
     async def _execute_one_turn(
         self,
@@ -412,6 +562,11 @@ class StreamingOrchestrator:
         # Steers do not cross turn boundaries — a stale steer from a prior turn or
         # a cancelled turn must never silently ride into a fresh turn. (spec §5.2)
         self._steering_queue.clear()
+        # Reset the per-turn tool-call counter (see _execute_tool_only /
+        # _execute_tool_with_result, the actual tool-execution paths that
+        # increment it) so execute()'s stall detection can read an accurate
+        # "did this turn run any tools" count once this method returns.
+        self._tool_calls_this_turn = 0
         full_response = ""
         iteration_count = 0
         error: Exception | None = None
@@ -433,6 +588,11 @@ class StreamingOrchestrator:
         else:
             status = "success" if full_response else "incomplete"
 
+        # Read the active goal's continuations count (if any) for the
+        # payload below. None when no goal is active -- same discriminator
+        # pattern as goal_turn/goal_final.
+        goal_state = coordinator.session_state.get("goal") if coordinator else None
+
         payload = {
             "orchestrator": "loop-streaming",
             "turn_count": iteration_count,
@@ -445,6 +605,11 @@ class StreamingOrchestrator:
             # counting every goal-continuation iteration.
             "goal_turn": goal_turn,
             "goal_final": goal_turn is None,
+            # Times sent back to the assistant so far in the active /goal
+            # pursuit; None when no goal is active (see goal_state lookup
+            # above -- additive field, same discriminator pattern as
+            # goal_turn/goal_final).
+            "continuations": goal_state.get("continuations") if goal_state else None,
         }
         if goal_turn is None:
             await hooks.emit(ORCHESTRATOR_COMPLETE, payload)
@@ -470,6 +635,238 @@ class StreamingOrchestrator:
         hooks, payload = pending
         payload["goal_final"] = goal_final
         await hooks.emit(ORCHESTRATOR_COMPLETE, payload)
+
+    @staticmethod
+    def _ensure_goal_defaults(goal: dict[str, Any]) -> None:
+        """Backfill goal-state keys added after the original 4 (condition,
+        turns_used, last_reason, cap) via ``setdefault``.
+
+        This is version tolerance on a plain dict -- an older caller (e.g. an
+        app-cli built against the original spike) that only sets the
+        original 4 keys must keep working unmodified. It is not a fallback
+        hiding an error: every key here has a well-defined zero value.
+        """
+        goal.setdefault("reasons", [])
+        goal.setdefault("continuations", 0)
+        goal.setdefault("no_tool_turns", 0)
+        goal.setdefault("escalated", False)
+
+    def _select_cheap_model(self, provider_name: str) -> str | None:
+        """Best-effort cheap/fast model selection for goal-loop LLM calls
+        (evaluator, stall judge, run summary).
+
+        Uses the hardcoded substring hint table because no coordinator
+        capability for model-role routing is reachable from here -- see the
+        note above ``_GOAL_CHEAP_MODEL_HINTS`` for what was investigated.
+        Logs a WARNING on a miss so silently falling back to the provider's
+        (potentially expensive) default model is visible instead of silent.
+        """
+        for hint_key, hint_model in self._GOAL_CHEAP_MODEL_HINTS.items():
+            if hint_key in provider_name.lower():
+                return hint_model
+        logger.warning(
+            f"/goal: no cheap-model hint for provider '{provider_name}' -- "
+            "falling back to the provider's default model for this "
+            "evaluator/stall-judge/summary call, which may be more expensive "
+            "than intended. Add a hint to _GOAL_CHEAP_MODEL_HINTS."
+        )
+        return None
+
+    @staticmethod
+    def _goal_progress_payload(
+        goal: dict[str, Any],
+        *,
+        state: str,
+        reason: str | None,
+        stall_detail: str | None = None,
+        summary: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the exact ``orchestrator:goal_progress`` payload contract.
+
+        Centralized so every emission site (continuing/achieved/cap_hit/
+        cancelled/error/stalled) produces an identical shape -- app-cli is
+        built in parallel against this exact contract.
+        """
+        return {
+            "orchestrator": "loop-streaming",
+            "state": state,
+            "turn": goal["turns_used"],
+            "continuations": goal.get("continuations", 0),
+            "cap": goal.get("cap") or None,
+            "reason": reason,
+            "reasons": list(goal.get("reasons", [])),
+            "stall_detail": stall_detail,
+            "summary": summary,
+            "metadata": None,
+        }
+
+    async def _judge_stall(
+        self,
+        goal: dict[str, Any],
+        providers: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
+    ) -> tuple[bool, str | None]:
+        """Ask a cheap, tool-less model whether the recent run of no-tool-turn
+        evaluator reasons describes a static, unresolved blocker (a stall) or
+        genuine incremental progress despite no tool calls.
+
+        Only called from execute()'s stall-detection block, and only once the
+        mechanical condition (``no_tool_turns >= self.goal_stall_threshold``)
+        already holds -- that's what keeps this rare and cheap. Returns
+        (is_stalled, detail). Raises on failure; the caller treats a raised
+        exception as "not stalled" (fail open on the judge -- a flaky judge
+        call must never itself manufacture a false stall; the mechanical
+        absence-of-action condition is what keeps stall detection safe).
+        """
+        recent_reasons = (
+            goal["reasons"][-goal["no_tool_turns"] :] if goal.get("reasons") else []
+        )
+        if not recent_reasons:
+            return False, None
+
+        if not providers:
+            raise RuntimeError("no provider mounted for stall judgment")
+        provider_name, provider = next(iter(providers.items()))
+        model_override = self._select_cheap_model(provider_name)
+
+        history_text = "\n".join(f"{i + 1}. {r}" for i, r in enumerate(recent_reasons))
+        user_prompt = (
+            f"GOAL CONDITION:\n{goal['condition']}\n\n"
+            f"EVALUATOR REASONS across the last {len(recent_reasons)} turns, "
+            "during which the assistant took no tool actions at all:\n"
+            f"{history_text}\n\n"
+            "Is this a stall? Respond in the required two-line format."
+        )
+
+        judge_messages = [
+            Message(role="system", content=self._GOAL_STALL_SYSTEM_PROMPT),
+            Message(role="user", content=user_prompt),
+        ]
+        chat_request = ChatRequest(
+            messages=judge_messages, tools=None, model=model_override
+        )
+
+        request_result = await hooks.emit(
+            PROVIDER_REQUEST, {"provider": provider_name, "iteration": 0}
+        )
+        if coordinator:
+            request_result = await coordinator.process_hook_result(
+                request_result, "provider:request", "orchestrator"
+            )
+            if request_result.action == "deny":
+                raise RuntimeError(
+                    f"stall judge call denied by hook: {request_result.reason}"
+                )
+
+        try:
+            response = await provider.complete(chat_request)
+        except LLMError as e:
+            await hooks.emit(
+                PROVIDER_ERROR,
+                {
+                    "provider": provider_name,
+                    "error": {"type": type(e).__name__, "msg": str(e)},
+                    "retryable": e.retryable,
+                    "status_code": e.status_code,
+                },
+            )
+            raise
+        except Exception as e:
+            await hooks.emit(
+                PROVIDER_ERROR,
+                {
+                    "provider": provider_name,
+                    "error": {"type": type(e).__name__, "msg": str(e)},
+                },
+            )
+            raise
+
+        response_text = ""
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                response_text += getattr(block, "text", "")
+
+        lines = [
+            line.strip() for line in response_text.strip().splitlines() if line.strip()
+        ]
+        if not lines:
+            raise ValueError("stall judge returned an empty response")
+
+        verdict = lines[0].strip().upper()
+        if verdict not in ("YES", "NO"):
+            raise ValueError(f"unparseable stall judge verdict: {lines[0]!r}")
+
+        detail = lines[1] if len(lines) > 1 else "(judge gave no reason)"
+        return verdict == "YES", detail
+
+    async def _summarize_goal_run(
+        self,
+        goal: dict[str, Any],
+        providers: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None,
+        final_state: str,
+    ) -> str | None:
+        """Best-effort fast-model recap of a completed /goal run, for the
+        terminal ``goal_progress`` event's ``summary`` field.
+
+        Never raises -- on any failure this logs and returns None so the
+        structured facts already in the payload (turn/continuations/reasons/
+        etc, which are the real data) are still emitted on schedule. Not
+        called for the ``cancelled`` state (a user-initiated abort needs no
+        explanation).
+        """
+        try:
+            if not providers:
+                raise RuntimeError("no provider mounted for summary")
+            provider_name, provider = next(iter(providers.items()))
+            model_override = self._select_cheap_model(provider_name)
+
+            reasons = goal.get("reasons", [])
+            reasons_text = (
+                "\n".join(f"{i + 1}. {r}" for i, r in enumerate(reasons))
+                if reasons
+                else "(no evaluator reasons recorded)"
+            )
+            user_prompt = (
+                f"GOAL CONDITION:\n{goal['condition']}\n\n"
+                f"Continuations (times sent back): {goal.get('continuations', 0)}\n"
+                f"Final state: {final_state}\n\n"
+                f"EVALUATOR REASONS in order:\n{reasons_text}\n\n"
+                "Write the 2-3 sentence recap now."
+            )
+            summary_messages = [
+                Message(role="system", content=self._GOAL_SUMMARY_SYSTEM_PROMPT),
+                Message(role="user", content=user_prompt),
+            ]
+            chat_request = ChatRequest(
+                messages=summary_messages, tools=None, model=model_override
+            )
+
+            request_result = await hooks.emit(
+                PROVIDER_REQUEST, {"provider": provider_name, "iteration": 0}
+            )
+            if coordinator:
+                request_result = await coordinator.process_hook_result(
+                    request_result, "provider:request", "orchestrator"
+                )
+                if request_result.action == "deny":
+                    raise RuntimeError(
+                        f"summary call denied by hook: {request_result.reason}"
+                    )
+
+            response = await provider.complete(chat_request)
+            summary_text = ""
+            for block in response.content:
+                if getattr(block, "type", None) == "text":
+                    summary_text += getattr(block, "text", "")
+            return summary_text.strip() or None
+        except Exception as e:
+            logger.warning(
+                f"/goal: summary generation failed, continuing without it: {e}"
+            )
+            return None
 
     async def _evaluate_goal(
         self,
@@ -511,11 +908,7 @@ class StreamingOrchestrator:
             raise RuntimeError("no provider mounted for evaluation")
         provider_name, provider = next(iter(providers.items()))
 
-        model_override = None
-        for hint_key, hint_model in self._GOAL_CHEAP_MODEL_HINTS.items():
-            if hint_key in provider_name.lower():
-                model_override = hint_model
-                break
+        model_override = self._select_cheap_model(provider_name)
 
         user_prompt = (
             f"GOAL CONDITION:\n{condition}\n\n"
@@ -1583,6 +1976,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 }
 
             # Execute
+            # NB: incremented here, not on tool lookup / pre-hook denial above
+            # -- this is where a tool actually runs (see execute()'s stall
+            # detection, which reads self._tool_calls_this_turn per turn).
+            self._tool_calls_this_turn += 1
             try:
                 result = await tool.execute(tool_call.arguments)
             except Exception as e:
@@ -1658,7 +2055,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         except Exception as e:
             # Safety net: errors become error messages
             logger.error(f"Tool {tool_call.name} failed: {e}")
-            error_msg = f"Internal error executing tool: {str(e)}"
+            error_msg = f"Internal error executing tool: {e!s}"
             await hooks.emit(
                 TOOL_ERROR,
                 {
@@ -1740,6 +2137,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 }
 
             # Execute
+            # NB: incremented here, not on tool lookup / pre-hook denial above
+            # -- this is where a tool actually runs (see execute()'s stall
+            # detection, which reads self._tool_calls_this_turn per turn).
+            self._tool_calls_this_turn += 1
             try:
                 result = await tool.execute(tool_call.arguments)
             except Exception as e:
@@ -1835,7 +2236,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             "role": "tool",
                             "name": tool_call.name,
                             "tool_call_id": tool_call.id,
-                            "content": f"Internal error executing tool: {str(e)}",
+                            "content": f"Internal error executing tool: {e!s}",
                         }
                     )
                 except Exception as inner_e:
@@ -1854,7 +2255,6 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
     async def _process_tools(self, context, tools, hooks) -> None:
         """Process any pending tool calls."""
         # Simplified - would process tracked tool calls
-        pass
 
     def _select_provider(self, providers: dict[str, Any]) -> Any:
         """Select a provider based on priority."""
