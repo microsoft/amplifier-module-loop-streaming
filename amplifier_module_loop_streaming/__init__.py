@@ -214,6 +214,19 @@ class StreamingOrchestrator:
     # ~120 characters, but a model instruction is not a guarantee.
     _GOAL_SUMMARY_MAX_CHARS = 120
 
+    # DEFECT 4 fix: shared cap for the evaluator/stall-judge/summary calls'
+    # `max_output_tokens`. Each of these three calls has a contract of
+    # "respond with EXACTLY two lines" (or, for the summary, one ~120-char
+    # sentence) -- there is no legitimate reason for their output to approach
+    # a full response budget. Real session e97e192b measured the evaluator
+    # inheriting the provider's session default of 64000 (Haiku's
+    # `max_output_tokens` capability default) purely because no
+    # `max_output_tokens` was set on the request. 512 is a generous multiple
+    # of the ~2-3 sentences these calls ever produce, while remaining far
+    # below the threshold that (combined with a stray thinking budget) trips
+    # a provider's "must stream for long operations" guard.
+    _GOAL_INTERNAL_CALL_MAX_TOKENS: ClassVar[int] = 512
+
     def __init__(self, config: dict[str, Any]):
         self.config = config
         # -1 means unlimited iterations (default)
@@ -951,8 +964,28 @@ class StreamingOrchestrator:
             Message(role="system", content=self._GOAL_STALL_SYSTEM_PROMPT),
             Message(role="user", content=user_prompt),
         ]
+        # DEFECT 4 fix (real session e97e192b): this internal utility call was
+        # built with none of the "don't leak into the foreground" flags that
+        # amplifier-foundation's hooks-session-naming module already
+        # establishes as precedent for exactly this situation (see its
+        # __init__.py's `_generate_name`, ~line 519-549). Without
+        # metadata={"stream": False}, providers stream by default
+        # (config.get("use_streaming", True) -- see
+        # docs/provider-streaming-contract.md), which emits the same
+        # llm:stream_block_start/delta/end events a real user turn does --
+        # indistinguishable to hooks-streaming-ui, so this judge's output
+        # (and, if thinking is enabled, its entire chain-of-thought) paints
+        # into the user-facing overlay. max_output_tokens is capped for the
+        # same reason session-naming caps its own call: without an explicit
+        # value the request inherits the provider's session default (64000
+        # for Haiku), which combined with an uncapped thinking budget can
+        # trip a provider's "must stream for long operations" guard.
         chat_request = ChatRequest(
-            messages=judge_messages, tools=None, model=model_override
+            messages=judge_messages,
+            tools=None,
+            model=model_override,
+            metadata={"stream": False},
+            max_output_tokens=self._GOAL_INTERNAL_CALL_MAX_TOKENS,
         )
 
         request_result = await hooks.emit(
@@ -977,9 +1010,24 @@ class StreamingOrchestrator:
         # model every time. Passing it as a kwarg too, in addition to the
         # ChatRequest field, is correct regardless of which convention a
         # given provider implementation happens to honor.
-        complete_kwargs: dict[str, Any] = (
-            {"model": model_override} if model_override else {}
-        )
+        #
+        # DEFECT 4 fix: `extended_thinking=False` is passed as an explicit
+        # kwarg, not left to "just not setting it". The installed Anthropic
+        # provider's thinking-enablement precedence is
+        # kwargs["extended_thinking"] > request.reasoning_effort >
+        # config["reasoning_effort"]/config["effort"] -- so when the
+        # *session's* provider config carries a reasoning_effort/effort
+        # setting (as it did in e97e192b, sized for the main conversational
+        # model), every call through that same provider instance -- this one
+        # included -- inherits it unless explicitly overridden. Relying on
+        # this orchestrator never setting `reasoning_effort` itself is not
+        # sufficient; the provider-level default applies regardless. Only an
+        # explicit `extended_thinking=False` kwarg reliably opts out (mirrors
+        # hooks-session-naming's identical opt-out, same file/line cited
+        # above).
+        complete_kwargs: dict[str, Any] = {"extended_thinking": False}
+        if model_override:
+            complete_kwargs["model"] = model_override
         try:
             response = await provider.complete(chat_request, **complete_kwargs)
         except LLMError as e:
@@ -1130,8 +1178,17 @@ class StreamingOrchestrator:
                 Message(role="system", content=system_prompt),
                 Message(role="user", content=user_prompt),
             ]
+            # DEFECT 4 fix: see the matching comment in _judge_stall --
+            # metadata={"stream": False} keeps this background call off the
+            # streaming branch (and off hooks-streaming-ui's overlay), and
+            # max_output_tokens caps the response to what a one-sentence
+            # summary actually needs.
             chat_request = ChatRequest(
-                messages=summary_messages, tools=None, model=model_override
+                messages=summary_messages,
+                tools=None,
+                model=model_override,
+                metadata={"stream": False},
+                max_output_tokens=self._GOAL_INTERNAL_CALL_MAX_TOKENS,
             )
 
             request_result = await hooks.emit(
@@ -1149,9 +1206,14 @@ class StreamingOrchestrator:
             # DEFECT 2 fix: see the matching comment in _judge_stall -- the
             # ChatRequest.model field alone is not honored by the installed
             # provider; the model must also be passed as a kwarg.
-            complete_kwargs: dict[str, Any] = (
-                {"model": model_override} if model_override else {}
-            )
+            #
+            # DEFECT 4 fix: extended_thinking=False is likewise passed
+            # explicitly -- see the matching comment in _judge_stall for why
+            # simply not setting it is not sufficient (a session-level
+            # provider config can force thinking on regardless).
+            complete_kwargs: dict[str, Any] = {"extended_thinking": False}
+            if model_override:
+                complete_kwargs["model"] = model_override
             response = await provider.complete(chat_request, **complete_kwargs)
             summary_text = ""
             for block in response.content:
@@ -1223,8 +1285,20 @@ class StreamingOrchestrator:
             Message(role="system", content=self._GOAL_EVALUATOR_SYSTEM_PROMPT),
             Message(role="user", content=user_prompt),
         ]
+        # DEFECT 4 fix: see the matching comment in _judge_stall --
+        # metadata={"stream": False} keeps this background call off the
+        # streaming branch (and off hooks-streaming-ui's overlay), and
+        # max_output_tokens caps the response to what a two-line verdict
+        # actually needs. This is the call confirmed responsible for real
+        # session e97e192b's thinking-leak: 46 lines of the evaluator's
+        # chain-of-thought streamed to the user because this request took
+        # the same streaming code path as a normal user turn.
         chat_request = ChatRequest(
-            messages=eval_messages, tools=None, model=model_override
+            messages=eval_messages,
+            tools=None,
+            model=model_override,
+            metadata={"stream": False},
+            max_output_tokens=self._GOAL_INTERNAL_CALL_MAX_TOKENS,
         )
 
         # Mirror _execute_stream's provider:request instrumentation so hooks
@@ -1245,9 +1319,16 @@ class StreamingOrchestrator:
         # DEFECT 2 fix: see the matching comment in _judge_stall -- the
         # ChatRequest.model field alone is not honored by the installed
         # provider; the model must also be passed as a kwarg.
-        complete_kwargs: dict[str, Any] = (
-            {"model": model_override} if model_override else {}
-        )
+        #
+        # DEFECT 4 fix: extended_thinking=False is likewise passed
+        # explicitly -- see the matching comment in _judge_stall for why
+        # simply not setting it is not sufficient (a session-level provider
+        # config can force thinking on regardless). This is the exact call
+        # confirmed (via real-session telemetry) to have run with thinking
+        # enabled and a 32000-token budget in session e97e192b.
+        complete_kwargs: dict[str, Any] = {"extended_thinking": False}
+        if model_override:
+            complete_kwargs["model"] = model_override
         try:
             response = await provider.complete(chat_request, **complete_kwargs)
         except LLMError as e:
