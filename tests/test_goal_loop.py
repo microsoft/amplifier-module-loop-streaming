@@ -179,6 +179,16 @@ class FakeProvider:
         self.judge_call_models: list[str | None] = []
         self.summary_call_models: list[str | None] = []
         self.summary_call_count = 0
+        # DEFECT 4 regression tracking: the full ChatRequest and kwargs seen
+        # by each call kind, so tests can assert `metadata == {"stream":
+        # False}`, `extended_thinking is False`, and `max_output_tokens` is
+        # set -- not just that the call happened.
+        self.eval_call_requests: list[Any] = []
+        self.eval_call_kwargs: list[dict] = []
+        self.judge_call_requests: list[Any] = []
+        self.judge_call_kwargs: list[dict] = []
+        self.summary_call_requests: list[Any] = []
+        self.summary_call_kwargs: list[dict] = []
         # When set, the summary branch raises this instead of returning a
         # response -- used to exercise _goal_summary_fallback's
         # generation-failed path.
@@ -198,12 +208,16 @@ class FakeProvider:
             if self.on_eval_call:
                 self.on_eval_call()
             self.eval_call_models.append(kwargs.get("model"))
+            self.eval_call_requests.append(chat_request)
+            self.eval_call_kwargs.append(kwargs)
             satisfied, reason = self.eval_queue.pop(0)
             verdict = "YES" if satisfied else "NO"
             return _llm_text_response(f"{verdict}\n{reason}")
 
         if "tool-less judge" in system_text:
             self.judge_call_models.append(kwargs.get("model"))
+            self.judge_call_requests.append(chat_request)
+            self.judge_call_kwargs.append(kwargs)
             is_stall, detail = self.judge_queue.pop(0)
             verdict = "YES" if is_stall else "NO"
             return _llm_text_response(f"{verdict}\n{detail}")
@@ -213,6 +227,8 @@ class FakeProvider:
             # share this phrase -- see _GOAL_SUMMARY_SYSTEM_PROMPTS.
             self.summary_call_count += 1
             self.summary_call_models.append(kwargs.get("model"))
+            self.summary_call_requests.append(chat_request)
+            self.summary_call_kwargs.append(kwargs)
             if self.summary_should_raise:
                 raise self.summary_should_raise
             return _llm_text_response(self.summary_text)
@@ -1586,3 +1602,170 @@ class TestDistinctBlockerCount:
         from amplifier_module_loop_streaming import StreamingOrchestrator
 
         assert StreamingOrchestrator._distinct_blocker_count([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. DEFECT 4 regression: internal /goal LLM calls must not leak into the
+#    user-facing streaming overlay (real session e97e192b).
+#
+# Root cause: _evaluate_goal / _judge_stall / _summarize_goal_run each build
+# a ChatRequest and call provider.complete() without metadata={"stream":
+# False}, without an explicit extended_thinking=False opt-out, and without a
+# capped max_output_tokens. Per docs/provider-streaming-contract.md, a
+# provider streams by default (config.get("use_streaming", True)) and only
+# takes the non-streaming path when request.metadata["stream"] is False --
+# so these background utility calls took the same streaming branch as a
+# real user turn, emitting llm:stream_block_start/delta/end events that
+# hooks-streaming-ui cannot distinguish from foreground output. Precedent
+# fix: amplifier-foundation's hooks-session-naming module
+# (__init__.py:~519-549) already sets all three of these on its own
+# background call.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInternalCallsDoNotStream:
+    async def test_evaluate_goal_sets_stream_false_and_disables_thinking(
+        self,
+    ) -> None:
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "looks satisfied"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        satisfied, reason = await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert satisfied is True
+        assert reason == "looks satisfied"
+        assert len(provider.eval_call_requests) == 1
+        request = provider.eval_call_requests[0]
+        kwargs = provider.eval_call_kwargs[0]
+
+        # metadata={"stream": False} -- keeps this call off the streaming
+        # branch entirely (identity check per the provider contract, not
+        # truthiness).
+        assert request.metadata == {"stream": False}
+        # extended_thinking=False passed explicitly as a kwarg -- NOT left
+        # to "just don't set reasoning_effort", since a session-level
+        # provider config (reasoning_effort/effort) would otherwise force
+        # thinking on regardless of what this orchestrator does.
+        assert kwargs.get("extended_thinking") is False
+        # max_output_tokens capped -- not left to inherit the provider's
+        # session default (64000 in the real session e97e192b that
+        # triggered this fix).
+        assert request.max_output_tokens == orch._GOAL_INTERNAL_CALL_MAX_TOKENS
+        assert request.max_output_tokens is not None
+        assert request.max_output_tokens < 64000
+
+    async def test_judge_stall_sets_stream_false_and_disables_thinking(
+        self,
+    ) -> None:
+        orch = _make_orchestrator()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.judge_queue.append((True, "same blocker again"))
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 2,
+            "last_reason": None,
+            "cap": None,
+            "reasons": ["blocked: x", "blocked: x"],
+            "no_tool_turns": 2,
+        }
+
+        is_stalled, detail = await orch._judge_stall(
+            goal_dict,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert is_stalled is True
+        assert detail == "same blocker again"
+        assert len(provider.judge_call_requests) == 1
+        request = provider.judge_call_requests[0]
+        kwargs = provider.judge_call_kwargs[0]
+
+        assert request.metadata == {"stream": False}
+        assert kwargs.get("extended_thinking") is False
+        assert request.max_output_tokens == orch._GOAL_INTERNAL_CALL_MAX_TOKENS
+        assert request.max_output_tokens is not None
+        assert request.max_output_tokens < 64000
+
+    async def test_summarize_goal_run_sets_stream_false_and_disables_thinking(
+        self,
+    ) -> None:
+        orch = _make_orchestrator()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 3,
+            "last_reason": "still blocked",
+            "cap": None,
+            "reasons": ["blocked: x", "blocked: x", "blocked: x"],
+            "no_tool_turns": 3,
+            "continuations": 2,
+        }
+
+        summary = await orch._summarize_goal_run(
+            goal_dict,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+            final_state="stalled",
+        )
+
+        assert summary  # non-empty (falls back deterministically otherwise)
+        assert len(provider.summary_call_requests) == 1
+        request = provider.summary_call_requests[0]
+        kwargs = provider.summary_call_kwargs[0]
+
+        assert request.metadata == {"stream": False}
+        assert kwargs.get("extended_thinking") is False
+        assert request.max_output_tokens == orch._GOAL_INTERNAL_CALL_MAX_TOKENS
+        assert request.max_output_tokens is not None
+        assert request.max_output_tokens < 64000
+
+    async def test_no_goal_path_never_touches_internal_call_sites(self) -> None:
+        """Zero behavior change on the no-goal path: none of the three
+        internal-call fixes matter if the goal loop is never entered, and
+        this must remain true after the DEFECT 4 fix. No goal set ->
+        _evaluate_goal / _judge_stall / _summarize_goal_run are never
+        called at all.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.turn_queue.append(MockTurnResponse(text="just an answer"))
+        # No goal set in coordinator.session_state.
+
+        result = await orch.execute(
+            prompt="hello",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert result == "just an answer"
+        assert provider.eval_call_requests == []
+        assert provider.judge_call_requests == []
+        assert provider.summary_call_requests == []
