@@ -43,9 +43,37 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 module = "loop-streaming"
 name = "streaming"
 config = {
-    buffer_size = 10,           # Tokens to buffer before flush
-    max_iterations = -1,        # Maximum iterations (-1 = unlimited, default)
-    timeout = 300               # Timeout in seconds
+    max_iterations = -1,             # Maximum iterations (-1 = unlimited, default)
+    goal_stall_threshold = 3,        # /goal: consecutive no-tool continuation turns
+                                      # before the stall judge is consulted
+    goal_model_role = "fast",        # /goal: routing-matrix model role requested for
+                                      # the evaluator/stall-judge/summary calls, via
+                                      # the model_role_resolver coordinator capability
+    goal_provider_preferences = [    # /goal: ordered {provider, model, config?}
+        {provider = "anthropic", model = "claude-haiku-*"},        # fallback list, consulted ONLY when
+        {provider = "openai", model = "gpt-?.?-luna*"},            # goal_model_role routing above didn't
+        {provider = "openai", model = "gpt-?.?-mini*"},            # yield a usable, mounted provider (no
+        {provider = "gemini", model = "gemini-*-flash-preview"},   # routing bundle installed, resolver
+        {provider = "github-copilot", model = "claude-haiku-4.5"}, # returned no candidates, or resolved
+        {provider = "github-copilot", model = "gpt-5.4-mini"},     # provider not mounted). Without this,
+        {provider = "ollama", model = "*"},                        # that case falls through to the
+    ],                                # session's expensive default model for every
+                                      # evaluator call (one per turn) -- a cost
+                                      # regression. Models are GLOB patterns, not
+                                      # pinned versions, so a new release (e.g. the
+                                      # next Haiku point release) is picked up
+                                      # automatically the moment a provider lists it,
+                                      # with no config change here. Shown above is
+                                      # the built-in default (the routing matrix's
+                                      # own "fast"-role membership) -- override to
+                                      # change it.
+    stream_delay = 0.0,              # Per-token artificial delay (seconds), for
+                                      # human-facing typing animation (0.0 = off)
+    extended_thinking = false,       # Enable extended thinking on the main
+                                      # conversational turns (not the /goal internal
+                                      # calls, which always disable it)
+    min_delay_between_calls_ms = 0,  # Minimum delay between provider calls (rate
+                                      # limiting; 0 = disabled)
 }
 ```
 
