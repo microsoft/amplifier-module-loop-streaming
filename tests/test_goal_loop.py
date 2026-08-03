@@ -176,7 +176,10 @@ class FakeProvider:
         # Each item: (satisfied: bool, reason: str)
         self.eval_queue: list[tuple[bool, str]] = []
         # Each item: (is_stall: bool, detail: str)
-        self.judge_queue: list[tuple[bool, str]] = []
+        # First element is either a plain bool (legacy shape -- see
+        # `complete()`'s "tool-less judge" branch) or an explicit taxonomy
+        # verdict string.
+        self.judge_queue: list[tuple[bool | str, str]] = []
         self.summary_text = "Recap: goal pursued across several turns, then resolved."
         # Optional test hook: called right before an evaluator call is
         # answered (used to snapshot orchestrator state, e.g.
@@ -242,9 +245,19 @@ class FakeProvider:
             self.judge_call_models.append(kwargs.get("model"))
             self.judge_call_requests.append(chat_request)
             self.judge_call_kwargs.append(kwargs)
-            is_stall, detail = self.judge_queue.pop(0)
-            verdict = "YES" if is_stall else "NO"
-            return _llm_text_response(f"{verdict}\n{detail}")
+            flag, detail = self.judge_queue.pop(0)
+            # `flag` is either a plain bool (legacy shape: True/False --
+            # mapped to a default locked/resolvable verdict word below, for
+            # tests that only care about the stalled/not-stalled outcome)
+            # or an explicit taxonomy verdict string ("time-locked",
+            # "structure-locked", "history-locked", "resolvable" --
+            # case-insensitive) for tests that assert on the specific
+            # verdict. See _judge_stall / _GOAL_STALL_VERDICT_WORDS.
+            if isinstance(flag, str):
+                verdict_word = flag.upper()
+            else:
+                verdict_word = "HISTORY-LOCKED" if flag else "RESOLVABLE"
+            return _llm_text_response(f"{verdict_word}\n{detail}")
 
         if "single, short line for a developer" in system_text:
             # All three per-state summary prompts (stalled/cap_hit/error)
@@ -379,6 +392,7 @@ class TestContinuationCounting:
                 "stall_detail",
                 "summary",
                 "distinct_blockers",
+                "stall_verdict",
                 "condition",
                 "schema_version",
             }
@@ -686,6 +700,227 @@ class TestEscalationThenStall:
 
 
 # ---------------------------------------------------------------------------
+# 4b. Busy-stall trigger (b): tool-activity-INDEPENDENT pre-filter. This is
+#     the real defect the task fixes -- trigger (a) above can only ever
+#     observe a stall during zero-tool-call turns, so it never fires for
+#     the dominant real-world failure mode: the agent stays busy (tool
+#     calls every turn) while the goal has already become unsatisfiable
+#     (real sessions a3126f2f r8, 6e64b3db r1/r2 -- see
+#     GOAL-HARDENING-DESIGN.md sec 1.2).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBusyStallTrigger:
+    async def test_busy_trigger_fires_and_hard_stops_despite_tool_calls_every_turn(
+        self,
+    ) -> None:
+        # goal_stall_threshold impossibly high -- proves trigger (a) (idle)
+        # genuinely never reaches threshold, isolating trigger (b) (busy).
+        orch = _make_orchestrator(
+            {
+                "goal_stall_threshold": 100,
+                "goal_busy_stall_window": 3,
+                "goal_busy_stall_min_overlap": 0.5,
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        # 4 turns total (initial + 3 continuations); EVERY turn makes a
+        # tool call, so no_tool_turns stays 0 for the whole run.
+        for _ in range(4):
+            provider.turn_queue.append(
+                MockTurnResponse(text="", tool_calls=[MockToolCall()])
+            )
+            provider.turn_queue.append(MockTurnResponse(text="ran a tool"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing config file for module x"),
+                (False, "blocked: missing config file for module y"),
+                (False, "blocked: missing config file for module z"),
+                (False, "blocked: missing config file for module w"),
+            ]
+        )
+        # Window (3) is first reached after the 3rd eval (-> escalate) and
+        # again after the 4th (-> hard stop).
+        provider.judge_queue.extend(
+            [
+                ("history-locked", "same blocker recurring despite activity"),
+                ("history-locked", "still the same blocker after escalation"),
+            ]
+        )
+
+        result = await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={"mock_tool": MockTool()},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert isinstance(result, str)
+        assert provider.judge_queue == []  # both judge calls consumed
+        assert provider.eval_queue == []
+
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states[-1] == "stalled"
+        assert "achieved" not in states
+
+        stalled_event = hooks.goal_progress_events()[-1]
+        assert stalled_event["stall_verdict"] == "history-locked"
+        assert (
+            stalled_event["stall_detail"]
+            == "still the same blocker after escalation"
+        )
+
+        # The mechanical IDLE trigger genuinely never reached threshold --
+        # proves this run was caught SOLELY by the busy pre-filter.
+        assert goal_dict["no_tool_turns"] == 0
+        assert goal_dict["escalated"] is True
+
+    async def test_busy_pretrip_does_not_fire_when_reasons_genuinely_differ(
+        self,
+    ) -> None:
+        """Dissimilar reasons across the window must never trip the
+        pre-filter, regardless of tool activity -- this is what keeps
+        trigger (b) from manufacturing false stalls on a genuinely
+        exploratory run.
+        """
+        orch = _make_orchestrator(
+            {
+                "goal_stall_threshold": 100,
+                "goal_busy_stall_window": 3,
+                "goal_busy_stall_min_overlap": 0.5,
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for _ in range(4):
+            provider.turn_queue.append(
+                MockTurnResponse(text="", tool_calls=[MockToolCall()])
+            )
+            provider.turn_queue.append(MockTurnResponse(text="ran a tool"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "checking the database connection pool settings"),
+                (False, "verifying the network firewall rules configuration"),
+                (False, "narrowing down the deployment pipeline permissions"),
+                (True, "root cause found and fixed, condition satisfied"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={"mock_tool": MockTool()},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        # Pre-filter never tripped -- judge was never consulted at all.
+        assert provider.judge_call_requests == []
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states == ["continuing", "continuing", "continuing", "achieved"]
+
+    async def test_idle_trigger_wins_when_both_conditions_hold_same_turn(
+        self,
+    ) -> None:
+        """When idle_trip and busy_trip could both hold on the same turn,
+        idle framing wins (and only one judge call is made) -- a turn
+        never pays for two judge calls (see execute()'s stall-detection
+        block comment).
+        """
+        # window(3) - 1 == threshold(2): the busy pre-filter would reach
+        # its window on the SAME continuation turn idle_trip first reaches
+        # threshold (reasons accumulate 1/turn overall; no_tool_turns only
+        # accumulates 1/zero-tool continuation -- see execute()'s
+        # stall-detection block comment for why idle wins the race).
+        orch = _make_orchestrator(
+            {
+                "goal_stall_threshold": 2,
+                "goal_busy_stall_window": 3,
+                "goal_busy_stall_min_overlap": 0.5,
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        # Initial turn (not counted) + 2 no-tool continuations (idle_trip
+        # threshold reached) + 1 escalation turn.
+        for i in range(4):
+            provider.turn_queue.append(MockTurnResponse(text=f"t{i}"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing credentials for the deploy step"),
+                (False, "blocked: missing credentials for the deploy step"),
+                (
+                    False,
+                    "blocked: missing credentials for the deploy step",
+                ),  # idle_trip reaches threshold here; busy_trip would
+                # independently be true too (identical reasons, window
+                # reached) but is short-circuited -- see the assertion
+                # below that the judge got idle framing.
+                (True, "credentials provided, solved"),
+            ]
+        )
+        provider.judge_queue.append((True, "same blocker, no progress"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert provider.judge_queue == []  # exactly one judge call consumed
+        assert len(provider.judge_call_requests) == 1
+        # Idle framing used: the judge's user prompt names "no tool
+        # actions", not the busy framing's "regardless of ... activity".
+        judge_request = provider.judge_call_requests[0]
+        user_msg = next(m for m in judge_request.messages if m.role == "user")
+        assert "no tool actions at all" in user_msg.content
+
+
+# ---------------------------------------------------------------------------
 # 5. No-goal passthrough: zero behavior change
 # ---------------------------------------------------------------------------
 
@@ -786,7 +1021,18 @@ class TestStallRearmsAfterEscalation:
     async def test_second_trip_at_cap_boundary_reports_stalled_not_cap_hit(
         self,
     ) -> None:
-        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        # goal_busy_stall_window disabled (set impossibly high): this test
+        # exercises the IDLE trigger's DEFECT-1 cap-boundary interaction in
+        # isolation. Every reason in this test is identical across all 6
+        # turns, so the (separate, additive) busy pre-filter would
+        # otherwise trip too -- and, correctly, EARLIER than this test's
+        # cap boundary (see TestBusyStallTrigger for that behavior
+        # exercised on its own terms) -- which would change this test's
+        # judge-call count and defeat the specific DEFECT-1 timing it
+        # pins.
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 2, "goal_busy_stall_window": 100}
+        )
         ctx = MockContext()
         hooks = MockHooks()
         coordinator = MockCoordinator()
@@ -2430,7 +2676,7 @@ class TestInternalCallsDoNotStream:
             "no_tool_turns": 2,
         }
 
-        is_stalled, detail = await orch._judge_stall(
+        is_stalled, detail, verdict = await orch._judge_stall(
             goal_dict,
             {"main": provider},
             hooks,  # type: ignore[arg-type]
@@ -2439,6 +2685,7 @@ class TestInternalCallsDoNotStream:
 
         assert is_stalled is True
         assert detail == "same blocker again"
+        assert verdict == "history-locked"
         assert len(provider.judge_call_requests) == 1
         request = provider.judge_call_requests[0]
         kwargs = provider.judge_call_kwargs[0]
