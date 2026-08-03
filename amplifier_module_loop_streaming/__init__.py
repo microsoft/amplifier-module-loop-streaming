@@ -339,10 +339,23 @@ class StreamingOrchestrator:
         ),
     }
 
-    # Hard ceiling enforced in code on every generated run summary (see
-    # _enforce_summary_length below) -- the prompts above ask the model for
-    # ~120 characters, but a model instruction is not a guarantee.
-    _GOAL_SUMMARY_MAX_CHARS = 120
+    # Monotonic integer identifying the `orchestrator:goal_progress` payload's
+    # field set (see _goal_progress_payload). Bump by 1 whenever a field is
+    # added, removed, or renamed. Always an explicit int on every emitted
+    # event -- never null -- so a consumer can tell "this event carries a
+    # versioned contract" (key present) from "this predates versioning
+    # entirely" (key absent), rather than confusing an absent key with a
+    # null value (the exact confusion that broke consumers of the `metadata`
+    # field, which shipped null on 100% of measured events).
+    #
+    # Version 1 (this change): adds `condition` (the fully-expanded goal text
+    # the evaluator actually judged) and this `schema_version` field itself;
+    # removes the always-null `metadata` slot (zero readers found in either
+    # this repo or amplifier-app-cli). The three prior wire shapes --
+    # baseline; +reasons/summary/stall_detail/continuations; +distinct_
+    # blockers -- all shipped with no version key at all, so an absent key
+    # unambiguously means "one of those three", never a specific one of them.
+    _GOAL_PROGRESS_SCHEMA_VERSION: ClassVar[int] = 1
 
     # DEFECT 4 fix: shared cap for the evaluator/stall-judge/summary calls'
     # `max_output_tokens`. Each of these three calls has a contract of
@@ -1302,7 +1315,23 @@ class StreamingOrchestrator:
             # distinct evaluator-reason signatures across the whole run --
             # distinguishes "hit a wall" (1) from "flailing" (N).
             "distinct_blockers": self._distinct_blocker_count(reasons),
-            "metadata": None,
+            # The fully-expanded goal condition -- @mentions already resolved
+            # at /goal set-time (see amplifier-app-cli's process_runtime_
+            # mentions call sites), i.e. the exact text re-sent to the
+            # evaluator every turn. Deliberately the expanded form, not the
+            # raw user-typed text: a reader of this event should see exactly
+            # what the evaluator judged. Previously reconstructable only via
+            # a fragile 4-step procedure (split runs on turn reset, find the
+            # nearest preceding Prompt node, then distinguish the real user
+            # prompt from this loop's own auto-injected continuation
+            # prompts -- indistinguishable by node type alone).
+            "condition": goal.get("condition"),
+            # See _GOAL_PROGRESS_SCHEMA_VERSION for the versioning contract.
+            # `metadata` (previously a hardcoded-None slot here) is removed:
+            # it measured null on 100% of 328 sampled events across three
+            # graph endpoints, and a repo-wide grep of both this repo and
+            # amplifier-app-cli found zero readers of it on this event.
+            "schema_version": self._GOAL_PROGRESS_SCHEMA_VERSION,
         }
 
     async def _judge_stall(
@@ -1465,30 +1494,6 @@ class StreamingOrchestrator:
         return verdict == "YES", detail
 
     @staticmethod
-    def _enforce_summary_length(text: str, max_chars: int | None = None) -> str:
-        """Hard-truncate ``text`` to at most ``max_chars`` (default
-        ``_GOAL_SUMMARY_MAX_CHARS``), breaking at the last whole word rather
-        than mid-word.
-
-        The per-state system prompts ask the model for "no more than about
-        120 characters", but a model instruction is not a guarantee -- this
-        is the code-level backstop that actually enforces it.
-        """
-        cap = (
-            max_chars
-            if max_chars is not None
-            else StreamingOrchestrator._GOAL_SUMMARY_MAX_CHARS
-        )
-        text = text.strip()
-        if len(text) <= cap:
-            return text
-        truncated = text[:cap]
-        last_space = truncated.rfind(" ")
-        if last_space > 0:
-            truncated = truncated[:last_space]
-        return truncated.rstrip()
-
-    @staticmethod
     def _goal_summary_fallback(goal: dict[str, Any], final_state: str) -> str | None:
         """Deterministic per-state fallback string used when summary
         generation fails outright, or the model returns empty text, so the
@@ -1536,9 +1541,18 @@ class StreamingOrchestrator:
         on any failure, or an empty model response, this falls back to a
         deterministic per-state string (``_goal_summary_fallback``) so the
         payload's ``summary`` field always carries *something* actionable
-        rather than silently going missing. The length cap is enforced in
-        code (``_enforce_summary_length``) regardless of what the model
-        actually returned.
+        rather than silently going missing.
+
+        Returns the model's text in full, with no length cap -- storage and
+        display are different concerns (previously this truncated to
+        ``_GOAL_SUMMARY_MAX_CHARS`` before storage, so a stalled/cap_hit
+        run's stored summary could end mid-clause and the full model text
+        was never retained anywhere). Truncation for one-line terminal
+        rendering is now applied only at display time, in amplifier-app-cli's
+        ``goal_progress_hook.py``. The per-state system prompts above still
+        ask the model for "no more than about 120 characters" to keep the
+        text itself short, but that is a request to the model, not an
+        enforced ceiling on what gets stored.
         """
         try:
             if not providers:
@@ -1626,7 +1640,7 @@ class StreamingOrchestrator:
             summary_text = summary_text.strip()
             if not summary_text:
                 return self._goal_summary_fallback(goal, final_state)
-            return self._enforce_summary_length(summary_text)
+            return summary_text
         except Exception as e:
             logger.warning(
                 f"/goal: summary generation failed, falling back to a "

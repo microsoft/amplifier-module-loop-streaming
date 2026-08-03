@@ -365,7 +365,8 @@ class TestContinuationCounting:
         assert states == ["continuing", "continuing", "achieved"]
 
         # Every emitted payload matches the exact contract shape (plus the
-        # additive distinct_blockers field -- see _distinct_blocker_count).
+        # additive distinct_blockers/condition/schema_version fields -- see
+        # _distinct_blocker_count and _GOAL_PROGRESS_SCHEMA_VERSION).
         for event in hooks.goal_progress_events():
             assert set(event.keys()) == {
                 "orchestrator",
@@ -378,7 +379,8 @@ class TestContinuationCounting:
                 "stall_detail",
                 "summary",
                 "distinct_blockers",
-                "metadata",
+                "condition",
+                "schema_version",
             }
 
         # `achieved` never gets a summary, regardless of how many
@@ -1899,61 +1901,24 @@ class TestReasonDedupe:
 
 
 # ---------------------------------------------------------------------------
-# 10. Run-summary length cap: enforced in code, not trusted to the model
+# 10. Run summary stored in full: no length cap in the orchestrator --
+# truncation (if any) is a display-time concern for the CLI renderer, not
+# something the orchestrator does before storing/emitting the summary.
 # ---------------------------------------------------------------------------
 
 
-class TestEnforceSummaryLength:
-    """Unit-level coverage of `_enforce_summary_length` in isolation --
-    exact, hardcoded expected output, independent of any orchestration.
-    """
-
-    def test_text_under_cap_is_unchanged(self) -> None:
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
-        text = "short and under the cap"
-        assert StreamingOrchestrator._enforce_summary_length(text) == text
-
-    def test_text_over_cap_truncates_at_word_boundary(self) -> None:
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
-        # 130 chars, well over the default 120-char cap, with clean word
-        # boundaries throughout so the expected truncation point is exact.
-        text = (
-            "the evaluator keeps reporting the exact same blocker every "
-            "single turn and no new progress has been made toward the "
-            "condition at all whatsoever"
-        )
-        assert len(text) > 120
-        result = StreamingOrchestrator._enforce_summary_length(text)
-        assert len(result) <= 120
-        # Truncated at the last whole word within the cap -- never a
-        # partial word, and never the raw text[:120] slice verbatim.
-        assert text.startswith(result)
-        assert not result.endswith(" ")
-        cutoff = text[:120]
-        assert result == cutoff[: cutoff.rfind(" ")]
-
-    def test_custom_max_chars_honored(self) -> None:
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
-        text = "one two three four five six seven eight nine ten"
-        result = StreamingOrchestrator._enforce_summary_length(text, max_chars=10)
-        assert len(result) <= 10
-        assert result == "one two"
-
-
 @pytest.mark.asyncio
-class TestSummaryLengthCapIntegration:
-    async def test_overlong_model_summary_is_truncated_in_emitted_payload(
+class TestSummaryStoredInFull:
+    async def test_overlong_model_summary_passes_through_unclipped(
         self,
     ) -> None:
-        """Wiring check: a model response longer than the cap must come out
-        of the emitted payload already truncated -- the cap is enforced by
-        the orchestrator, not merely documented in the prompt.
+        """Wiring check: a model response over ~120 chars (the length the
+        per-state prompts merely *ask* the model for) must come out of the
+        emitted payload byte-for-byte identical to what the model returned
+        -- no code-level truncation. Storage and display are different
+        concerns; display-time clipping (if any) lives in amplifier-app-cli's
+        goal_progress_hook.py, not here.
         """
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
         orch = _make_orchestrator({"goal_stall_threshold": 2})
         ctx = MockContext()
         hooks = MockHooks()
@@ -1962,7 +1927,7 @@ class TestSummaryLengthCapIntegration:
         provider.summary_text = (
             "the evaluator keeps reporting the exact same blocker every "
             "single turn and no new progress has been made toward the "
-            "condition at all whatsoever"
+            "condition at all whatsoever, across every turn of this run"
         )
         assert len(provider.summary_text) > 120
 
@@ -2002,10 +1967,67 @@ class TestSummaryLengthCapIntegration:
 
         stalled_event = hooks.goal_progress_events()[-1]
         assert stalled_event["state"] == "stalled"
-        assert len(stalled_event["summary"]) <= 120
-        assert stalled_event[
-            "summary"
-        ] == StreamingOrchestrator._enforce_summary_length(provider.summary_text)
+        # Full text, verbatim -- not merely "under some cap".
+        assert stalled_event["summary"] == provider.summary_text
+
+
+# ---------------------------------------------------------------------------
+# 10b. `condition` (fully-expanded) and `schema_version` on every emitted
+# goal_progress payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConditionAndSchemaVersionInPayload:
+    async def test_condition_is_the_fully_expanded_text_on_every_event(
+        self,
+    ) -> None:
+        """`goal["condition"]` is already the fully-expanded form by the
+        time it reaches the orchestrator (app-cli expands @mentions once,
+        at /goal set-time) -- the payload must carry that exact text
+        verbatim, on every state, not just the terminal one.
+        """
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        orch = _make_orchestrator({})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        expanded_condition = (
+            "the file expanded-from-mention.txt exists and contains 'done'"
+        )
+        goal_dict = {
+            "condition": expanded_condition,
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.eval_queue.append((True, "done"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        events = hooks.goal_progress_events()
+        assert events  # sanity: at least the achieved event fired
+        for event in events:
+            assert event["condition"] == expanded_condition
+            assert event["schema_version"] == (
+                StreamingOrchestrator._GOAL_PROGRESS_SCHEMA_VERSION
+            )
+            assert isinstance(event["schema_version"], int)
+            # The dead, always-null field is gone -- not merely null.
+            assert "metadata" not in event
 
 
 # ---------------------------------------------------------------------------
@@ -2492,3 +2514,328 @@ class TestInternalCallsDoNotStream:
         assert provider.eval_call_requests == []
         assert provider.judge_call_requests == []
         assert provider.summary_call_requests == []
+
+
+# ---------------------------------------------------------------------------
+# 13. _flatten_message_for_evaluator: characterization of current behavior
+#     (__init__.py:94-122). Zero coverage existed for this function before
+#     these tests -- pinned here so a future change can't silently alter
+#     what the /goal evaluator actually sees.
+# ---------------------------------------------------------------------------
+
+
+class TestFlattenMessageForEvaluator:
+    """Pure-function characterization tests -- no orchestration, no mocks.
+    Each test pins the CURRENT input -> output mapping exactly as
+    implemented, including the one behavior (below) that contradicts the
+    function's own docstring/inline comment.
+    """
+
+    def test_plain_string_content_renders_as_role_colon_content(self) -> None:
+        """Case 1: `content` is a plain string -> `"{role}: {content}"`
+        verbatim, hitting the `isinstance(content, str)` branch (line 103).
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {"role": "user", "content": "please fix the bug"}
+        assert _flatten_message_for_evaluator(msg) == "user: please fix the bug"
+
+    def test_tool_role_message_as_this_orchestrator_writes_it_is_fully_visible(
+        self,
+    ) -> None:
+        """CRUX TEST -- pins that tool results DO reach the evaluator, in
+        full, refuting the docstring/`[tool result omitted]`-branch
+        implication that they don't.
+
+        This orchestrator's own tool-result write sites (__init__.py
+        :2416-2424 normal path, :2366-2374 graceful cancel, :2313-2321
+        immediate cancel) all write `role="tool"` messages with a PLAIN
+        STRING `content` -- never a `{"type": "tool_result", ...}` content
+        block. A plain string hits `isinstance(content, str)` (line 103),
+        not the `type == "tool_result"` block branch (line 115), so the
+        `[tool result omitted]` placeholder is never substituted: the tool
+        result text is emitted VERBATIM AND IN FULL to the evaluator.
+
+        CONFIRMED (not refuted): tool results reach the evaluator in full.
+        The `type == "tool_result"` block-handling branch is dead code on
+        this orchestrator's own message-writing path (see the sibling test
+        `test_tool_result_content_block_form_renders_omitted_placeholder`
+        below, which is the only way to reach it).
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        tool_result_content = (
+            '{"error": "Tool execution was cancelled by user", '
+            '"cancelled": true, "tool": "write_file", '
+            '"detail": "verbatim marker 8f3c2a should survive intact"}'
+        )
+        msg = {
+            "role": "tool",
+            "name": "write_file",
+            "tool_call_id": "call_abc123",
+            "content": tool_result_content,
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == f"tool: {tool_result_content}"
+        # Explicit, not-omitted, not-truncated assertions on the marker text.
+        assert "verbatim marker 8f3c2a should survive intact" in result
+        assert "[tool result omitted]" not in result
+
+    def test_text_content_block_extracts_text_field(self) -> None:
+        """Case 3: a `type: "text"` block -> its `text` field is extracted."""
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "here is my answer"}],
+        }
+        assert _flatten_message_for_evaluator(msg) == "assistant: here is my answer"
+
+    def test_tool_call_block_renders_name_only_arguments_are_a_blind_spot(
+        self,
+    ) -> None:
+        """GAP: a `type: "tool_call"` block renders only `[called tool:
+        NAME]`. The call's arguments -- present in `block["input"]` per the
+        content-block schema, and separately on the message's top-level
+        `tool_calls` key -- are never read by this function. The evaluator
+        sees WHICH tool ran but never WHAT it was asked to do.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        secret_argument_marker = "/tmp/only-in-arguments-should-not-leak.txt"
+        msg = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "input": {"path": secret_argument_marker, "content": "..."},
+                }
+            ],
+            # Top-level tool_calls key some callers also carry -- also unread.
+            "tool_calls": [
+                {"name": "write_file", "arguments": {"path": secret_argument_marker}}
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == "assistant: [called tool: write_file]"
+        assert secret_argument_marker not in result
+
+    def test_tool_call_block_missing_name_falls_back_to_question_mark(
+        self,
+    ) -> None:
+        """`block.get('name', '?')` fallback when a tool_call block has no
+        `name` key at all.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {"role": "assistant", "content": [{"type": "tool_call"}]}
+        assert _flatten_message_for_evaluator(msg) == "assistant: [called tool: ?]"
+
+    def test_tool_result_content_block_form_renders_omitted_placeholder(
+        self,
+    ) -> None:
+        """Case 5: a `{"type": "tool_result", ...}` content BLOCK (as
+        opposed to a plain-string `role="tool"` message) renders the
+        `[tool result omitted]` placeholder regardless of what the block
+        actually contains.
+
+        NOTE: this orchestrator's own tool-result writes never take this
+        shape (see the CRUX test above) -- this branch is only reachable
+        via a message constructed directly in this block form, which is not
+        how __init__.py:2313-2424 write tool results. It is effectively
+        dead code on this orchestrator's own path.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "tool",
+            "content": [
+                {"type": "tool_result", "content": "this text must not appear"}
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == "tool: [tool result omitted]"
+        assert "this text must not appear" not in result
+
+    def test_thinking_redacted_thinking_and_reasoning_blocks_are_dropped(
+        self,
+    ) -> None:
+        """Case 6: `thinking` / `redacted_thinking` / `reasoning` blocks are
+        intentionally skipped entirely -- none of their content, nor any
+        placeholder for them, appears in the output.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "internal chain of thought A"},
+                {"type": "redacted_thinking", "data": "opaque redacted blob B"},
+                {"type": "reasoning", "text": "internal reasoning trace C"},
+                {"type": "text", "text": "the only visible answer"},
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == "assistant: the only visible answer"
+        assert "internal chain of thought A" not in result
+        assert "opaque redacted blob B" not in result
+        assert "internal reasoning trace C" not in result
+
+    def test_mixed_content_blocks_joined_with_newline_empty_parts_skipped(
+        self,
+    ) -> None:
+        """Case 7: multiple blocks of different types are joined with `\\n`,
+        and any block that contributes an empty string (e.g. a `text` block
+        with empty text) is filtered out of the join -- not preserved as a
+        blank line. Non-dict list entries are silently skipped too (line
+        108's `continue`).
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "dropped"},
+                {"type": "text", "text": "first visible line"},
+                {"type": "text", "text": ""},  # empty -> filtered, no blank line
+                "not-a-dict-block",  # non-dict entry -> skipped via `continue`
+                {"type": "tool_call", "name": "search"},
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == "assistant: first visible line\n[called tool: search]"
+
+    def test_missing_content_key_and_missing_role_key_fallbacks(self) -> None:
+        """Case 8a: no `content` key -> defaults to `""` -> the function's
+        final `if text else ""` guard means the WHOLE render is `""` (not
+        `"role: "`).
+        Case 8b: no `role` key -> defaults to `"unknown"`.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        assert _flatten_message_for_evaluator({"role": "user"}) == ""
+        assert _flatten_message_for_evaluator({"content": "hi"}) == "unknown: hi"
+
+    def test_empty_string_content_renders_as_empty_string(self) -> None:
+        """Case 8c: `content` explicitly `""` also hits the falsy-text
+        short-circuit and returns `""`, same as a missing key.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        assert _flatten_message_for_evaluator({"role": "user", "content": ""}) == ""
+
+    def test_non_str_non_list_content_falls_back_to_str_of_content(self) -> None:
+        """Case 9: a `content` value that is neither `str` nor `list` (e.g.
+        a `dict` or an `int`) falls through to the `else: text = str(content)`
+        branch (line 121) -- the raw Python `str()` rendering, not an error.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        dict_msg = {"role": "assistant", "content": {"unexpected": "shape"}}
+        assert _flatten_message_for_evaluator(dict_msg) == (
+            "assistant: " + str({"unexpected": "shape"})
+        )
+
+        int_msg = {"role": "assistant", "content": 42}
+        assert _flatten_message_for_evaluator(int_msg) == "assistant: 42"
+
+
+# ---------------------------------------------------------------------------
+# 14. Assembled evaluator transcript: truncation to the last 40 messages
+#     (_GOAL_MAX_TRANSCRIPT_MESSAGES, __init__.py:266) and the "(truncated,
+#     most recent messages shown)" marker (__init__.py:1665-1671, :1685).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEvaluatorTranscriptTruncation:
+    async def test_over_40_messages_only_last_40_appear_with_truncated_marker(
+        self,
+    ) -> None:
+        """With more than `_GOAL_MAX_TRANSCRIPT_MESSAGES` (40) messages in
+        context, `_evaluate_goal` must truncate the transcript it sends to
+        the evaluator to only the last 40, and must set the
+        "(truncated, most recent messages shown)" marker in the prompt. The
+        earliest messages must not appear anywhere in the sent prompt; the
+        most recent 40 must all appear.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        # Delimited markers (not bare decimal indices) -- a bare index like
+        # "message number 1" is a SUBSTRING of "message number 10"/"11"/...,
+        # which would make an early naive version of this test pass for the
+        # wrong reason. "MSG_<i>_END" cannot falsely match another index.
+        total_messages = 45
+        for i in range(total_messages):
+            await ctx.add_message({"role": "user", "content": f"MSG_{i}_END"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert len(provider.eval_call_requests) == 1
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" in prompt_text
+
+        # The oldest 5 messages (indices 0-4) were dropped by truncation to
+        # the last 40 (indices 5-44).
+        for dropped_index in range(total_messages - 40):
+            assert f"MSG_{dropped_index}_END" not in prompt_text
+
+        # The most recent 40 messages (indices 5-44) all survive.
+        for kept_index in range(total_messages - 40, total_messages):
+            assert f"MSG_{kept_index}_END" in prompt_text
+
+    async def test_40_or_fewer_messages_no_truncation_marker(self) -> None:
+        """Sanity counterpart: at or below the 40-message cap, no
+        truncation occurs and the marker is absent -- confirms the marker
+        is conditional on actual truncation, not always present.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        for i in range(40):
+            await ctx.add_message({"role": "user", "content": f"message number {i}"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" not in prompt_text
+        assert "message number 0" in prompt_text
+        assert "message number 39" in prompt_text
