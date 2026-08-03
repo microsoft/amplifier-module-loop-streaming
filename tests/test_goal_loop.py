@@ -176,7 +176,10 @@ class FakeProvider:
         # Each item: (satisfied: bool, reason: str)
         self.eval_queue: list[tuple[bool, str]] = []
         # Each item: (is_stall: bool, detail: str)
-        self.judge_queue: list[tuple[bool, str]] = []
+        # First element is either a plain bool (legacy shape -- see
+        # `complete()`'s "tool-less judge" branch) or an explicit taxonomy
+        # verdict string.
+        self.judge_queue: list[tuple[bool | str, str]] = []
         self.summary_text = "Recap: goal pursued across several turns, then resolved."
         # Optional test hook: called right before an evaluator call is
         # answered (used to snapshot orchestrator state, e.g.
@@ -242,9 +245,19 @@ class FakeProvider:
             self.judge_call_models.append(kwargs.get("model"))
             self.judge_call_requests.append(chat_request)
             self.judge_call_kwargs.append(kwargs)
-            is_stall, detail = self.judge_queue.pop(0)
-            verdict = "YES" if is_stall else "NO"
-            return _llm_text_response(f"{verdict}\n{detail}")
+            flag, detail = self.judge_queue.pop(0)
+            # `flag` is either a plain bool (legacy shape: True/False --
+            # mapped to a default locked/resolvable verdict word below, for
+            # tests that only care about the stalled/not-stalled outcome)
+            # or an explicit taxonomy verdict string ("time-locked",
+            # "structure-locked", "history-locked", "resolvable" --
+            # case-insensitive) for tests that assert on the specific
+            # verdict. See _judge_stall / _GOAL_STALL_VERDICT_WORDS.
+            if isinstance(flag, str):
+                verdict_word = flag.upper()
+            else:
+                verdict_word = "HISTORY-LOCKED" if flag else "RESOLVABLE"
+            return _llm_text_response(f"{verdict_word}\n{detail}")
 
         if "single, short line for a developer" in system_text:
             # All three per-state summary prompts (stalled/cap_hit/error)
@@ -365,7 +378,8 @@ class TestContinuationCounting:
         assert states == ["continuing", "continuing", "achieved"]
 
         # Every emitted payload matches the exact contract shape (plus the
-        # additive distinct_blockers field -- see _distinct_blocker_count).
+        # additive distinct_blockers/condition/schema_version fields -- see
+        # _distinct_blocker_count and _GOAL_PROGRESS_SCHEMA_VERSION).
         for event in hooks.goal_progress_events():
             assert set(event.keys()) == {
                 "orchestrator",
@@ -378,7 +392,9 @@ class TestContinuationCounting:
                 "stall_detail",
                 "summary",
                 "distinct_blockers",
-                "metadata",
+                "stall_verdict",
+                "condition",
+                "schema_version",
             }
 
         # `achieved` never gets a summary, regardless of how many
@@ -684,6 +700,227 @@ class TestEscalationThenStall:
 
 
 # ---------------------------------------------------------------------------
+# 4b. Busy-stall trigger (b): tool-activity-INDEPENDENT pre-filter. This is
+#     the real defect the task fixes -- trigger (a) above can only ever
+#     observe a stall during zero-tool-call turns, so it never fires for
+#     the dominant real-world failure mode: the agent stays busy (tool
+#     calls every turn) while the goal has already become unsatisfiable
+#     (real sessions a3126f2f r8, 6e64b3db r1/r2 -- see
+#     GOAL-HARDENING-DESIGN.md sec 1.2).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBusyStallTrigger:
+    async def test_busy_trigger_fires_and_hard_stops_despite_tool_calls_every_turn(
+        self,
+    ) -> None:
+        # goal_stall_threshold impossibly high -- proves trigger (a) (idle)
+        # genuinely never reaches threshold, isolating trigger (b) (busy).
+        orch = _make_orchestrator(
+            {
+                "goal_stall_threshold": 100,
+                "goal_busy_stall_window": 3,
+                "goal_busy_stall_min_overlap": 0.5,
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        # 4 turns total (initial + 3 continuations); EVERY turn makes a
+        # tool call, so no_tool_turns stays 0 for the whole run.
+        for _ in range(4):
+            provider.turn_queue.append(
+                MockTurnResponse(text="", tool_calls=[MockToolCall()])
+            )
+            provider.turn_queue.append(MockTurnResponse(text="ran a tool"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing config file for module x"),
+                (False, "blocked: missing config file for module y"),
+                (False, "blocked: missing config file for module z"),
+                (False, "blocked: missing config file for module w"),
+            ]
+        )
+        # Window (3) is first reached after the 3rd eval (-> escalate) and
+        # again after the 4th (-> hard stop).
+        provider.judge_queue.extend(
+            [
+                ("history-locked", "same blocker recurring despite activity"),
+                ("history-locked", "still the same blocker after escalation"),
+            ]
+        )
+
+        result = await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={"mock_tool": MockTool()},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert isinstance(result, str)
+        assert provider.judge_queue == []  # both judge calls consumed
+        assert provider.eval_queue == []
+
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states[-1] == "stalled"
+        assert "achieved" not in states
+
+        stalled_event = hooks.goal_progress_events()[-1]
+        assert stalled_event["stall_verdict"] == "history-locked"
+        assert (
+            stalled_event["stall_detail"]
+            == "still the same blocker after escalation"
+        )
+
+        # The mechanical IDLE trigger genuinely never reached threshold --
+        # proves this run was caught SOLELY by the busy pre-filter.
+        assert goal_dict["no_tool_turns"] == 0
+        assert goal_dict["escalated"] is True
+
+    async def test_busy_pretrip_does_not_fire_when_reasons_genuinely_differ(
+        self,
+    ) -> None:
+        """Dissimilar reasons across the window must never trip the
+        pre-filter, regardless of tool activity -- this is what keeps
+        trigger (b) from manufacturing false stalls on a genuinely
+        exploratory run.
+        """
+        orch = _make_orchestrator(
+            {
+                "goal_stall_threshold": 100,
+                "goal_busy_stall_window": 3,
+                "goal_busy_stall_min_overlap": 0.5,
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for _ in range(4):
+            provider.turn_queue.append(
+                MockTurnResponse(text="", tool_calls=[MockToolCall()])
+            )
+            provider.turn_queue.append(MockTurnResponse(text="ran a tool"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "checking the database connection pool settings"),
+                (False, "verifying the network firewall rules configuration"),
+                (False, "narrowing down the deployment pipeline permissions"),
+                (True, "root cause found and fixed, condition satisfied"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={"mock_tool": MockTool()},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        # Pre-filter never tripped -- judge was never consulted at all.
+        assert provider.judge_call_requests == []
+        states = [e["state"] for e in hooks.goal_progress_events()]
+        assert states == ["continuing", "continuing", "continuing", "achieved"]
+
+    async def test_idle_trigger_wins_when_both_conditions_hold_same_turn(
+        self,
+    ) -> None:
+        """When idle_trip and busy_trip could both hold on the same turn,
+        idle framing wins (and only one judge call is made) -- a turn
+        never pays for two judge calls (see execute()'s stall-detection
+        block comment).
+        """
+        # window(3) - 1 == threshold(2): the busy pre-filter would reach
+        # its window on the SAME continuation turn idle_trip first reaches
+        # threshold (reasons accumulate 1/turn overall; no_tool_turns only
+        # accumulates 1/zero-tool continuation -- see execute()'s
+        # stall-detection block comment for why idle wins the race).
+        orch = _make_orchestrator(
+            {
+                "goal_stall_threshold": 2,
+                "goal_busy_stall_window": 3,
+                "goal_busy_stall_min_overlap": 0.5,
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        # Initial turn (not counted) + 2 no-tool continuations (idle_trip
+        # threshold reached) + 1 escalation turn.
+        for i in range(4):
+            provider.turn_queue.append(MockTurnResponse(text=f"t{i}"))
+
+        provider.eval_queue.extend(
+            [
+                (False, "blocked: missing credentials for the deploy step"),
+                (False, "blocked: missing credentials for the deploy step"),
+                (
+                    False,
+                    "blocked: missing credentials for the deploy step",
+                ),  # idle_trip reaches threshold here; busy_trip would
+                # independently be true too (identical reasons, window
+                # reached) but is short-circuited -- see the assertion
+                # below that the judge got idle framing.
+                (True, "credentials provided, solved"),
+            ]
+        )
+        provider.judge_queue.append((True, "same blocker, no progress"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert provider.judge_queue == []  # exactly one judge call consumed
+        assert len(provider.judge_call_requests) == 1
+        # Idle framing used: the judge's user prompt names "no tool
+        # actions", not the busy framing's "regardless of ... activity".
+        judge_request = provider.judge_call_requests[0]
+        user_msg = next(m for m in judge_request.messages if m.role == "user")
+        assert "no tool actions at all" in user_msg.content
+
+
+# ---------------------------------------------------------------------------
 # 5. No-goal passthrough: zero behavior change
 # ---------------------------------------------------------------------------
 
@@ -784,7 +1021,18 @@ class TestStallRearmsAfterEscalation:
     async def test_second_trip_at_cap_boundary_reports_stalled_not_cap_hit(
         self,
     ) -> None:
-        orch = _make_orchestrator({"goal_stall_threshold": 2})
+        # goal_busy_stall_window disabled (set impossibly high): this test
+        # exercises the IDLE trigger's DEFECT-1 cap-boundary interaction in
+        # isolation. Every reason in this test is identical across all 6
+        # turns, so the (separate, additive) busy pre-filter would
+        # otherwise trip too -- and, correctly, EARLIER than this test's
+        # cap boundary (see TestBusyStallTrigger for that behavior
+        # exercised on its own terms) -- which would change this test's
+        # judge-call count and defeat the specific DEFECT-1 timing it
+        # pins.
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 2, "goal_busy_stall_window": 100}
+        )
         ctx = MockContext()
         hooks = MockHooks()
         coordinator = MockCoordinator()
@@ -1899,61 +2147,24 @@ class TestReasonDedupe:
 
 
 # ---------------------------------------------------------------------------
-# 10. Run-summary length cap: enforced in code, not trusted to the model
+# 10. Run summary stored in full: no length cap in the orchestrator --
+# truncation (if any) is a display-time concern for the CLI renderer, not
+# something the orchestrator does before storing/emitting the summary.
 # ---------------------------------------------------------------------------
 
 
-class TestEnforceSummaryLength:
-    """Unit-level coverage of `_enforce_summary_length` in isolation --
-    exact, hardcoded expected output, independent of any orchestration.
-    """
-
-    def test_text_under_cap_is_unchanged(self) -> None:
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
-        text = "short and under the cap"
-        assert StreamingOrchestrator._enforce_summary_length(text) == text
-
-    def test_text_over_cap_truncates_at_word_boundary(self) -> None:
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
-        # 130 chars, well over the default 120-char cap, with clean word
-        # boundaries throughout so the expected truncation point is exact.
-        text = (
-            "the evaluator keeps reporting the exact same blocker every "
-            "single turn and no new progress has been made toward the "
-            "condition at all whatsoever"
-        )
-        assert len(text) > 120
-        result = StreamingOrchestrator._enforce_summary_length(text)
-        assert len(result) <= 120
-        # Truncated at the last whole word within the cap -- never a
-        # partial word, and never the raw text[:120] slice verbatim.
-        assert text.startswith(result)
-        assert not result.endswith(" ")
-        cutoff = text[:120]
-        assert result == cutoff[: cutoff.rfind(" ")]
-
-    def test_custom_max_chars_honored(self) -> None:
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
-        text = "one two three four five six seven eight nine ten"
-        result = StreamingOrchestrator._enforce_summary_length(text, max_chars=10)
-        assert len(result) <= 10
-        assert result == "one two"
-
-
 @pytest.mark.asyncio
-class TestSummaryLengthCapIntegration:
-    async def test_overlong_model_summary_is_truncated_in_emitted_payload(
+class TestSummaryStoredInFull:
+    async def test_overlong_model_summary_passes_through_unclipped(
         self,
     ) -> None:
-        """Wiring check: a model response longer than the cap must come out
-        of the emitted payload already truncated -- the cap is enforced by
-        the orchestrator, not merely documented in the prompt.
+        """Wiring check: a model response over ~120 chars (the length the
+        per-state prompts merely *ask* the model for) must come out of the
+        emitted payload byte-for-byte identical to what the model returned
+        -- no code-level truncation. Storage and display are different
+        concerns; display-time clipping (if any) lives in amplifier-app-cli's
+        goal_progress_hook.py, not here.
         """
-        from amplifier_module_loop_streaming import StreamingOrchestrator
-
         orch = _make_orchestrator({"goal_stall_threshold": 2})
         ctx = MockContext()
         hooks = MockHooks()
@@ -1962,7 +2173,7 @@ class TestSummaryLengthCapIntegration:
         provider.summary_text = (
             "the evaluator keeps reporting the exact same blocker every "
             "single turn and no new progress has been made toward the "
-            "condition at all whatsoever"
+            "condition at all whatsoever, across every turn of this run"
         )
         assert len(provider.summary_text) > 120
 
@@ -2002,10 +2213,67 @@ class TestSummaryLengthCapIntegration:
 
         stalled_event = hooks.goal_progress_events()[-1]
         assert stalled_event["state"] == "stalled"
-        assert len(stalled_event["summary"]) <= 120
-        assert stalled_event[
-            "summary"
-        ] == StreamingOrchestrator._enforce_summary_length(provider.summary_text)
+        # Full text, verbatim -- not merely "under some cap".
+        assert stalled_event["summary"] == provider.summary_text
+
+
+# ---------------------------------------------------------------------------
+# 10b. `condition` (fully-expanded) and `schema_version` on every emitted
+# goal_progress payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConditionAndSchemaVersionInPayload:
+    async def test_condition_is_the_fully_expanded_text_on_every_event(
+        self,
+    ) -> None:
+        """`goal["condition"]` is already the fully-expanded form by the
+        time it reaches the orchestrator (app-cli expands @mentions once,
+        at /goal set-time) -- the payload must carry that exact text
+        verbatim, on every state, not just the terminal one.
+        """
+        from amplifier_module_loop_streaming import StreamingOrchestrator
+
+        orch = _make_orchestrator({})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+
+        expanded_condition = (
+            "the file expanded-from-mention.txt exists and contains 'done'"
+        )
+        goal_dict = {
+            "condition": expanded_condition,
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.eval_queue.append((True, "done"))
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        events = hooks.goal_progress_events()
+        assert events  # sanity: at least the achieved event fired
+        for event in events:
+            assert event["condition"] == expanded_condition
+            assert event["schema_version"] == (
+                StreamingOrchestrator._GOAL_PROGRESS_SCHEMA_VERSION
+            )
+            assert isinstance(event["schema_version"], int)
+            # The dead, always-null field is gone -- not merely null.
+            assert "metadata" not in event
 
 
 # ---------------------------------------------------------------------------
@@ -2408,7 +2676,7 @@ class TestInternalCallsDoNotStream:
             "no_tool_turns": 2,
         }
 
-        is_stalled, detail = await orch._judge_stall(
+        is_stalled, detail, verdict = await orch._judge_stall(
             goal_dict,
             {"main": provider},
             hooks,  # type: ignore[arg-type]
@@ -2417,6 +2685,7 @@ class TestInternalCallsDoNotStream:
 
         assert is_stalled is True
         assert detail == "same blocker again"
+        assert verdict == "history-locked"
         assert len(provider.judge_call_requests) == 1
         request = provider.judge_call_requests[0]
         kwargs = provider.judge_call_kwargs[0]
@@ -2492,3 +2761,571 @@ class TestInternalCallsDoNotStream:
         assert provider.eval_call_requests == []
         assert provider.judge_call_requests == []
         assert provider.summary_call_requests == []
+
+
+# ---------------------------------------------------------------------------
+# 13. _flatten_message_for_evaluator: characterization of current behavior
+#     (__init__.py:94-122). Zero coverage existed for this function before
+#     these tests -- pinned here so a future change can't silently alter
+#     what the /goal evaluator actually sees.
+# ---------------------------------------------------------------------------
+
+
+class TestFlattenMessageForEvaluator:
+    """Pure-function characterization tests -- no orchestration, no mocks.
+    Each test pins the CURRENT input -> output mapping exactly as
+    implemented, including the one behavior (below) that contradicts the
+    function's own docstring/inline comment.
+    """
+
+    def test_plain_string_content_renders_as_role_colon_content(self) -> None:
+        """Case 1: `content` is a plain string -> `"{role}: {content}"`
+        verbatim, hitting the `isinstance(content, str)` branch (line 103).
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {"role": "user", "content": "please fix the bug"}
+        assert _flatten_message_for_evaluator(msg) == "user: please fix the bug"
+
+    def test_tool_role_message_as_this_orchestrator_writes_it_is_fully_visible(
+        self,
+    ) -> None:
+        """CRUX TEST (UPDATED for evaluator input hygiene) -- pins that tool
+        results DO reach the evaluator, refuting the docstring/`[tool
+        result omitted]`-branch implication that they don't.
+
+        This orchestrator's own tool-result write sites (__init__.py
+        :2416-2424 normal path, :2366-2374 graceful cancel, :2313-2321
+        immediate cancel) all write `role="tool"` messages with a PLAIN
+        STRING `content` -- never a `{"type": "tool_result", ...}` content
+        block. A plain string hits `isinstance(content, str)`, not the
+        `type == "tool_result"` block branch, so the `[tool result
+        omitted]` placeholder is never substituted.
+
+        POST-HYGIENE: tool results remain VISIBLE, but are now BOUNDED --
+        a short result (well under `tool_content_clip_chars`, as here)
+        still renders VERBATIM AND IN FULL, unclipped. See the sibling
+        test `test_overlong_tool_result_is_head_tail_clipped_with_marker`
+        below for the overlong case, which is clipped rather than dropped.
+
+        The `type == "tool_result"` block-handling branch remains dead code
+        on this orchestrator's own message-writing path (see the sibling
+        test `test_tool_result_content_block_form_renders_omitted_placeholder`
+        below, which is the only way to reach it).
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        tool_result_content = (
+            '{"error": "Tool execution was cancelled by user", '
+            '"cancelled": true, "tool": "write_file", '
+            '"detail": "verbatim marker 8f3c2a should survive intact"}'
+        )
+        msg = {
+            "role": "tool",
+            "name": "write_file",
+            "tool_call_id": "call_abc123",
+            "content": tool_result_content,
+        }
+
+        # Default clip (2000 chars) -- well above this short result's
+        # length, so it is untouched.
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == f"tool: {tool_result_content}"
+        # Explicit, not-omitted, not-clipped assertions on the marker text.
+        assert "verbatim marker 8f3c2a should survive intact" in result
+        assert "[tool result omitted]" not in result
+        assert "chars truncated" not in result
+
+    def test_overlong_tool_result_is_head_tail_clipped_with_marker(self) -> None:
+        """Evaluator input hygiene: a tool result LONGER than
+        `tool_content_clip_chars` is clipped, not dropped -- it remains
+        VISIBLE (bounded, not omitted), with BOTH the head (e.g. a command
+        echo) and the tail (e.g. an exit-status line) retained, and an
+        explicit marker naming how many characters were cut in between.
+
+        Head+tail (not head-only) because verdict-bearing detail commonly
+        sits at both ends of tool output.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        head_marker = "HEAD_MARKER_running_command_abc123"
+        tail_marker = "TAIL_MARKER_exit_status_0_success"
+        middle_filler = "x" * 5000
+        tool_result_content = f"{head_marker}{middle_filler}{tail_marker}"
+        msg = {"role": "tool", "content": tool_result_content}
+
+        result = _flatten_message_for_evaluator(msg, tool_content_clip_chars=200)
+
+        assert result.startswith("tool: ")
+        assert head_marker in result
+        assert tail_marker in result
+        assert "chars truncated" in result
+        # The clip must actually have shrunk the content -- not merely
+        # decorated the full text with a marker.
+        assert len(result) < len(f"tool: {tool_result_content}")
+        assert "[tool result omitted]" not in result
+
+    def test_text_content_block_extracts_text_field(self) -> None:
+        """Case 3: a `type: "text"` block -> its `text` field is extracted."""
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "here is my answer"}],
+        }
+        assert _flatten_message_for_evaluator(msg) == "assistant: here is my answer"
+
+    def test_tool_call_block_includes_clipped_arguments(
+        self,
+    ) -> None:
+        """GAP CLOSED (evaluator input hygiene): a `type: "tool_call"`
+        block used to render only `[called tool: NAME]`, dropping the
+        call's arguments entirely. The evaluator could see WHICH tool ran
+        but never WHAT it was asked to do -- a plausible cause of observed
+        confabulation.
+
+        Now `block["input"]` (the tool-call-argument dict per the
+        ToolCallBlock content-block schema) IS included, JSON-rendered and
+        clipped via the same `tool_content_clip_chars` bound as tool
+        results. This test uses a short argument dict (well under the
+        default clip) so it should appear verbatim, unclipped.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        argument_marker = "/tmp/argument-marker-should-now-be-visible.txt"
+        msg = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "input": {"path": argument_marker, "content": "..."},
+                }
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result.startswith("assistant: [called tool: write_file args:")
+        assert argument_marker in result
+        assert "chars truncated" not in result
+
+    def test_tool_call_block_overlong_arguments_are_clipped(self) -> None:
+        """Evaluator input hygiene: tool-call arguments longer than
+        `tool_content_clip_chars` are clipped (head+tail, with a marker),
+        not shipped in full and not dropped back to the pre-hygiene
+        name-only rendering.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        head_marker = "HEAD_ARG_MARKER"
+        tail_marker = "TAIL_ARG_MARKER"
+        msg = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "input": {
+                        "path": head_marker,
+                        "content": "y" * 5000,
+                        "trailer": tail_marker,
+                    },
+                }
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg, tool_content_clip_chars=200)
+
+        assert "[called tool: write_file args:" in result
+        assert "chars truncated" in result
+        # The tool name itself is always visible even when args are clipped.
+        assert "write_file" in result
+
+    def test_tool_call_block_missing_name_falls_back_to_question_mark(
+        self,
+    ) -> None:
+        """`block.get('name', '?')` fallback when a tool_call block has no
+        `name` key at all.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {"role": "assistant", "content": [{"type": "tool_call"}]}
+        assert _flatten_message_for_evaluator(msg) == "assistant: [called tool: ?]"
+
+    def test_tool_result_content_block_form_renders_omitted_placeholder(
+        self,
+    ) -> None:
+        """Case 5: a `{"type": "tool_result", ...}` content BLOCK (as
+        opposed to a plain-string `role="tool"` message) renders the
+        `[tool result omitted]` placeholder regardless of what the block
+        actually contains.
+
+        NOTE: this orchestrator's own tool-result writes never take this
+        shape (see the CRUX test above) -- this branch is only reachable
+        via a message constructed directly in this block form, which is not
+        how __init__.py:2313-2424 write tool results. It is effectively
+        dead code on this orchestrator's own path.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "tool",
+            "content": [
+                {"type": "tool_result", "content": "this text must not appear"}
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == "tool: [tool result omitted]"
+        assert "this text must not appear" not in result
+
+    def test_thinking_redacted_thinking_and_reasoning_blocks_are_dropped(
+        self,
+    ) -> None:
+        """Case 6: `thinking` / `redacted_thinking` / `reasoning` blocks are
+        intentionally skipped entirely -- none of their content, nor any
+        placeholder for them, appears in the output.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "internal chain of thought A"},
+                {"type": "redacted_thinking", "data": "opaque redacted blob B"},
+                {"type": "reasoning", "text": "internal reasoning trace C"},
+                {"type": "text", "text": "the only visible answer"},
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == "assistant: the only visible answer"
+        assert "internal chain of thought A" not in result
+        assert "opaque redacted blob B" not in result
+        assert "internal reasoning trace C" not in result
+
+    def test_mixed_content_blocks_joined_with_newline_empty_parts_skipped(
+        self,
+    ) -> None:
+        """Case 7: multiple blocks of different types are joined with `\\n`,
+        and any block that contributes an empty string (e.g. a `text` block
+        with empty text) is filtered out of the join -- not preserved as a
+        blank line. Non-dict list entries are silently skipped too (line
+        108's `continue`).
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        msg = {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "dropped"},
+                {"type": "text", "text": "first visible line"},
+                {"type": "text", "text": ""},  # empty -> filtered, no blank line
+                "not-a-dict-block",  # non-dict entry -> skipped via `continue`
+                {"type": "tool_call", "name": "search"},
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg)
+
+        assert result == "assistant: first visible line\n[called tool: search]"
+
+    def test_missing_content_key_and_missing_role_key_fallbacks(self) -> None:
+        """Case 8a: no `content` key -> defaults to `""` -> the function's
+        final `if text else ""` guard means the WHOLE render is `""` (not
+        `"role: "`).
+        Case 8b: no `role` key -> defaults to `"unknown"`.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        assert _flatten_message_for_evaluator({"role": "user"}) == ""
+        assert _flatten_message_for_evaluator({"content": "hi"}) == "unknown: hi"
+
+    def test_empty_string_content_renders_as_empty_string(self) -> None:
+        """Case 8c: `content` explicitly `""` also hits the falsy-text
+        short-circuit and returns `""`, same as a missing key.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        assert _flatten_message_for_evaluator({"role": "user", "content": ""}) == ""
+
+    def test_non_str_non_list_content_falls_back_to_str_of_content(self) -> None:
+        """Case 9: a `content` value that is neither `str` nor `list` (e.g.
+        a `dict` or an `int`) falls through to the `else: text = str(content)`
+        branch (line 121) -- the raw Python `str()` rendering, not an error.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        dict_msg = {"role": "assistant", "content": {"unexpected": "shape"}}
+        assert _flatten_message_for_evaluator(dict_msg) == (
+            "assistant: " + str({"unexpected": "shape"})
+        )
+
+        int_msg = {"role": "assistant", "content": 42}
+        assert _flatten_message_for_evaluator(int_msg) == "assistant: 42"
+
+
+# ---------------------------------------------------------------------------
+# 14. Assembled evaluator transcript: truncation to the last 40 messages
+#     (_GOAL_MAX_TRANSCRIPT_MESSAGES, __init__.py:266) and the "(truncated,
+#     most recent messages shown)" marker (__init__.py:1665-1671, :1685).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEvaluatorTranscriptTruncation:
+    async def test_over_40_messages_only_last_40_appear_with_truncated_marker(
+        self,
+    ) -> None:
+        """With more than `_GOAL_MAX_TRANSCRIPT_MESSAGES` (40) messages in
+        context, `_evaluate_goal` must truncate the transcript it sends to
+        the evaluator to only the last 40, and must set the
+        "(truncated, most recent messages shown)" marker in the prompt. The
+        earliest messages must not appear anywhere in the sent prompt; the
+        most recent 40 must all appear.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        # Delimited markers (not bare decimal indices) -- a bare index like
+        # "message number 1" is a SUBSTRING of "message number 10"/"11"/...,
+        # which would make an early naive version of this test pass for the
+        # wrong reason. "MSG_<i>_END" cannot falsely match another index.
+        total_messages = 45
+        for i in range(total_messages):
+            await ctx.add_message({"role": "user", "content": f"MSG_{i}_END"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert len(provider.eval_call_requests) == 1
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" in prompt_text
+
+        # The oldest 5 messages (indices 0-4) were dropped by truncation to
+        # the last 40 (indices 5-44).
+        for dropped_index in range(total_messages - 40):
+            assert f"MSG_{dropped_index}_END" not in prompt_text
+
+        # The most recent 40 messages (indices 5-44) all survive.
+        for kept_index in range(total_messages - 40, total_messages):
+            assert f"MSG_{kept_index}_END" in prompt_text
+
+    async def test_40_or_fewer_messages_no_truncation_marker(self) -> None:
+        """Sanity counterpart: at or below the 40-message cap, no
+        truncation occurs and the marker is absent -- confirms the marker
+        is conditional on actual truncation, not always present.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        for i in range(40):
+            await ctx.add_message({"role": "user", "content": f"message number {i}"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" not in prompt_text
+        assert "message number 0" in prompt_text
+        assert "message number 39" in prompt_text
+
+    async def test_transcript_char_budget_drops_oldest_messages_first(
+        self,
+    ) -> None:
+        """Evaluator input hygiene: `goal_transcript_char_budget` is a
+        backstop ABOVE the message-count window, applied NEWEST-FIRST --
+        when it binds, the OLDEST messages within the window are dropped
+        and the most recent (most verdict-relevant) ones survive.
+        """
+        orch = _make_orchestrator(
+            {
+                # Budget only large enough for the last couple of messages.
+                "goal_transcript_char_budget": 60,
+                "goal_tool_content_clip_chars": 0,  # disabled -- not exercised here
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        for i in range(10):
+            await ctx.add_message({"role": "user", "content": f"MSG_{i}_END"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" in prompt_text
+        # The newest message must survive.
+        assert "MSG_9_END" in prompt_text
+        # The oldest message must have been dropped by the char budget.
+        assert "MSG_0_END" not in prompt_text
+
+    async def test_transcript_char_budget_disabled_by_non_positive_value(
+        self,
+    ) -> None:
+        """`goal_transcript_char_budget <= 0` disables the budget entirely
+        -- sanity counterpart proving the knob is opt-in, not a silent
+        always-on truncation.
+        """
+        orch = _make_orchestrator({"goal_transcript_char_budget": 0})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        for i in range(10):
+            await ctx.add_message({"role": "user", "content": f"MSG_{i}_END"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" not in prompt_text
+        for i in range(10):
+            assert f"MSG_{i}_END" in prompt_text
+
+
+@pytest.mark.asyncio
+class TestEvaluatorInputHygieneEndToEnd:
+    """Empirical verification (see goal-build.md item 4): a real large tool
+    result run through the ACTUAL assembly path (`_evaluate_goal`) produces
+    a bounded evaluator prompt -- not merely a unit-level clip. Compares
+    the hygiene knobs DISABLED (reproducing the pre-hygiene unbounded
+    behavior exactly, since the only prior bound was message count) against
+    the hygiene knobs at their defaults.
+    """
+
+    async def test_large_tool_result_bounded_vs_unbounded_prompt_size(
+        self,
+    ) -> None:
+        large_tool_output = (
+            "COMMAND_ECHO_START read_file /var/log/huge.log\n"
+            + ("line of log output filler content here\n" * 6000)
+            + "EXIT_STATUS_END code=0"
+        )
+
+        async def _run(config: dict) -> str:
+            orch = _make_orchestrator(config)
+            ctx = MockContext()
+            hooks = MockHooks()
+            coordinator = MockCoordinator()
+            provider = FakeProvider()
+            provider.eval_queue.append((True, "n/a"))
+
+            await ctx.add_message({"role": "user", "content": "please read the log"})
+            await ctx.add_message(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_call",
+                            "name": "read_file",
+                            "input": {"path": "/var/log/huge.log"},
+                        }
+                    ],
+                }
+            )
+            await ctx.add_message(
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "tool_call_id": "call_1",
+                    "content": large_tool_output,
+                }
+            )
+
+            await orch._evaluate_goal(
+                "the log has been read",
+                ctx,
+                {"main": provider},
+                hooks,  # type: ignore[arg-type]
+                coordinator,  # type: ignore[arg-type]
+            )
+
+            request = provider.eval_call_requests[0]
+            user_message = next(m for m in request.messages if m.role == "user")
+            return user_message.content
+
+        # BEFORE (knobs disabled -- reproduces the pre-hygiene behavior,
+        # since a 40-message window was the ONLY bound that existed):
+        before_prompt = await _run(
+            {"goal_tool_content_clip_chars": 0, "goal_transcript_char_budget": 0}
+        )
+        # AFTER (default hygiene knobs):
+        after_prompt = await _run({})
+
+        before_size = len(before_prompt)
+        after_size = len(after_prompt)
+
+        print(
+            f"\n[evaluator input hygiene] tool-result char count: "
+            f"{len(large_tool_output)}\n"
+            f"[evaluator input hygiene] BEFORE (unbounded) prompt size: "
+            f"{before_size} chars\n"
+            f"[evaluator input hygiene] AFTER (bounded) prompt size: "
+            f"{after_size} chars\n"
+        )
+
+        # The unbounded run must actually contain the full tool output --
+        # otherwise this isn't a fair "before" baseline.
+        assert large_tool_output in before_prompt
+        # The bounded run must be dramatically smaller.
+        assert after_size < before_size
+        assert after_size < 5000
+        # But NOT empty / NOT silently dropped -- the clip marker and both
+        # ends of the tool output must still be visible (visibility, not
+        # omission).
+        assert "chars truncated" in after_prompt
+        assert "COMMAND_ECHO_START read_file /var/log/huge.log" in after_prompt
+        assert "EXIT_STATUS_END code=0" in after_prompt
+        # Tool-call arguments are now visible too.
+        assert "/var/log/huge.log" in after_prompt

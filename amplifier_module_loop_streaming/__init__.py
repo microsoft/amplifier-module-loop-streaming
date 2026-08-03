@@ -91,17 +91,78 @@ def _build_tool_spec(tool: Any) -> ToolSpec:
     )
 
 
-def _flatten_message_for_evaluator(msg: dict) -> str:
+# --- Evaluator input hygiene defaults (see _flatten_message_for_evaluator,
+# StreamingOrchestrator._evaluate_goal) ---
+#
+# Before this, the evaluator's transcript had exactly one bound: the
+# 40-message window (`_GOAL_MAX_TRANSCRIPT_MESSAGES`). A single large tool
+# result (file read, log dump) inside those 40 messages shipped to the
+# evaluator IN FULL, once per turn -- a cost problem and a signal-burial
+# problem. These module-level defaults back the `self.goal_*` config knobs
+# read in `StreamingOrchestrator.__init__` (same override pattern as
+# `goal_stall_threshold`).
+#
+# Per-tool-result / tool-call-argument clip, in characters. 2000 chars
+# (~500 tokens) is generous for a typical tool result while bounding the
+# worst case (a multi-MB file dump) to a fixed, cheap-to-evaluate size.
+_GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS = 2000
+
+
+def _clip_head_tail(text: str, limit: int) -> str:
+    """Clip ``text`` to roughly ``limit`` chars, keeping BOTH the head and
+    the tail with a marker naming how much was dropped in between.
+
+    Head+tail, not head-only: verdict-bearing detail in tool output
+    commonly sits at BOTH ends -- the command/args echo at the head, the
+    exit status or summary line at the tail. A naive head-only clip loses
+    exactly the part that usually decides the verdict.
+
+    ``limit <= 0`` disables clipping entirely (returns ``text`` unchanged).
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    # First-pass estimate of the marker's own size (using the naive
+    # dropped-char count) so it can be subtracted from `limit` before
+    # splitting head/tail. The exact dropped count is recomputed below from
+    # the actual split chosen, so this estimate only affects how much of
+    # `limit` the marker itself consumes -- not correctness.
+    estimated_marker = f"\n...[{len(text) - limit} chars truncated]...\n"
+    keep = limit - len(estimated_marker)
+    if keep < 20:
+        # `limit` too tight for a head+tail split plus a marker -- fall
+        # back to a hard cut rather than producing a nonsensical clip.
+        return text[:limit]
+    head_len = keep // 2
+    tail_len = keep - head_len
+    dropped = len(text) - head_len - tail_len
+    marker = f"\n...[{dropped} chars truncated]...\n"
+    return text[:head_len] + marker + text[-tail_len:]
+
+
+def _flatten_message_for_evaluator(
+    msg: dict, tool_content_clip_chars: int = _GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS
+) -> str:
     """Render one stored (dict) message as plain text for the goal evaluator.
 
-    Ported verbatim from amplifier-app-cli's `_flatten_message_for_evaluator`
-    (see docs/designs/goal-command.md). Kept as a module-level function since
-    it needs no orchestrator state.
+    Ported (with input-hygiene added -- see below) from amplifier-app-cli's
+    `_flatten_message_for_evaluator` (see docs/designs/goal-command.md).
+    Kept as a module-level function -- ``tool_content_clip_chars`` is a
+    plain parameter, not orchestrator state, so the function stays pure and
+    directly testable; `_evaluate_goal` passes its configured
+    `self.goal_tool_content_clip_chars`.
+
+    Tool results and tool-call arguments remain FULLY VISIBLE to the
+    evaluator -- they are just BOUNDED. A short tool result still appears
+    verbatim; an overlong one appears head+tail clipped (see
+    `_clip_head_tail`) with an explicit marker naming what was dropped, so
+    the evaluator knows it's looking at a clip, not the whole story.
     """
     role = msg.get("role", "unknown")
     content = msg.get("content", "")
     if isinstance(content, str):
         text = content
+        if role == "tool":
+            text = _clip_head_tail(text, tool_content_clip_chars)
     elif isinstance(content, list):
         parts = []
         for block in content:
@@ -111,7 +172,20 @@ def _flatten_message_for_evaluator(msg: dict) -> str:
             if btype == "text":
                 parts.append(block.get("text", ""))
             elif btype == "tool_call":
-                parts.append(f"[called tool: {block.get('name', '?')}]")
+                name = block.get("name", "?")
+                # `input` is the tool-call-argument dict per ToolCallBlock's
+                # schema (amplifier_core.message_models). Previously
+                # dropped entirely -- the evaluator could see WHICH tool ran
+                # but never WHAT it was asked to do. Clipped for the same
+                # cost-bound reason as tool results above.
+                args = block.get("input")
+                if args:
+                    args_text = _clip_head_tail(
+                        json.dumps(args, default=str), tool_content_clip_chars
+                    )
+                    parts.append(f"[called tool: {name} args: {args_text}]")
+                else:
+                    parts.append(f"[called tool: {name}]")
             elif btype == "tool_result":
                 parts.append("[tool result omitted]")
             # thinking/redacted_thinking/reasoning blocks are intentionally
@@ -245,6 +319,14 @@ class StreamingOrchestrator:
         "CONDITION and a transcript of an assistant's work so far in a "
         "coding/agent session. Decide whether the GOAL CONDITION has been "
         "satisfied by that work.\n\n"
+        "What you can and cannot see: tool results and tool-call arguments "
+        "are shown to you, but each is bounded in size -- an overlong one "
+        "is clipped and marked with '...[N chars truncated]...' showing "
+        "exactly how much was cut. Very old turns may be dropped entirely "
+        "if the transcript is marked truncated. When content is marked "
+        "clipped or the transcript is marked truncated, say so plainly in "
+        "your reasoning rather than inferring or guessing at what the "
+        "elided content contained.\n\n"
         "Respond with EXACTLY two lines and nothing else:\n"
         "Line 1: the single word YES or NO (verbatim, nothing else)\n"
         "Line 2: one sentence explaining why\n"
@@ -265,23 +347,120 @@ class StreamingOrchestrator:
 
     _GOAL_MAX_TRANSCRIPT_MESSAGES = 40
 
+    # Total transcript character budget: a backstop ABOVE the per-message
+    # clip (`_GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS`) and the message-count
+    # window above. Applied NEWEST-FIRST in `_evaluate_goal` so that when
+    # the budget binds, the most recent (most verdict-relevant) turns
+    # survive and older messages within the window are what gets dropped.
+    # 20000 chars (~5000 tokens) keeps the evaluator call cheap even in the
+    # worst case of all 40 messages sitting at the per-message clip ceiling
+    # (40 * 2000 = 80000 chars before this budget applies).
+    _GOAL_DEFAULT_TRANSCRIPT_CHAR_BUDGET: ClassVar[int] = 20000
+
     # Stall-detection judge (see execute()'s stall-detection block). Only
-    # invoked when the mechanical no-tool-turns condition already holds, so
-    # it fires rarely and stays cheap.
-    _GOAL_STALL_SYSTEM_PROMPT = (
-        "You are a strict, tool-less judge. You will be shown a short history "
-        "of reasons an evaluator gave, across consecutive turns, for why a "
-        "goal condition was not yet satisfied -- during a stretch where the "
-        "assistant took no tool actions at all. Decide whether these reasons "
-        "describe the SAME unresolved blocker recurring with no sign of new "
-        "progress (a stall), as opposed to reasons that, even with no tools "
-        "run, show the assistant narrowing down, ruling things out, or making "
-        "genuine incremental progress toward the condition.\n\n"
+    # invoked when one of the two mechanical pre-filters already holds --
+    # trigger (a) "idle" (goal["no_tool_turns"] >= goal_stall_threshold) or
+    # trigger (b) "busy" (_busy_stall_pretrip) -- so it fires rarely and
+    # stays cheap. See _GOAL_STALL_SYSTEM_PROMPT_IDLE / _BUSY below for why
+    # there are two prompts rather than one.
+    #
+    # Shared taxonomy block: the judge no longer answers a bare YES/NO. A
+    # locked verdict tells the *user* which kind of dead end they wrote --
+    # that's the whole point of naming it (see GOAL-HARDENING-DESIGN.md sec
+    # 1.2): "is this a stall?" doesn't say what to fix, "history-locked"
+    # does.
+    _GOAL_STALL_TAXONOMY_BLOCK: ClassVar[str] = (
+        "Classify the situation using EXACTLY one of these four words:\n"
+        "RESOLVABLE -- more work could plausibly close this; there is no "
+        "structural reason it cannot be resolved with further turns.\n"
+        "TIME-LOCKED -- the condition requires elapsed wall-clock time "
+        "(e.g. a soak period, waiting for an external event) that cannot "
+        "pass within this session no matter what the assistant does.\n"
+        "STRUCTURE-LOCKED -- the condition applies a universal "
+        'requirement over a set that contains a member which is '
+        'structurally exempt or unreachable (e.g. "all N sites" when one '
+        "site cannot produce the required measurement).\n"
+        "HISTORY-LOCKED -- the condition constrains the transcript's own "
+        'past (e.g. "proof must precede the claim") in a way that cannot '
+        "be retroactively repaired regardless of what happens from here.\n"
+        "\n"
         "Respond with EXACTLY two lines and nothing else:\n"
-        "Line 1: the single word YES (this is a stall) or NO (not a stall), "
-        "verbatim\n"
+        "Line 1: the single word above, verbatim\n"
         "Line 2: one sentence explaining why\n"
     )
+
+    # Idle framing: used when trigger="idle" (goal["no_tool_turns"] reached
+    # threshold -- the assistant took NO tool actions for that whole
+    # streak). This is the original (pre-taxonomy) trigger.
+    _GOAL_STALL_SYSTEM_PROMPT_IDLE: ClassVar[str] = (
+        "You are a strict, tool-less judge. You will be shown a short "
+        "history of reasons an evaluator gave, across consecutive turns, "
+        "for why a goal condition was not yet satisfied -- during a "
+        "stretch where the assistant took NO TOOL ACTIONS AT ALL. Decide "
+        "whether the goal is durably stuck (and if so, why), as opposed to "
+        "reasons that, even with no tools run, show the assistant "
+        "narrowing down, ruling things out, or making genuine incremental "
+        "progress toward the condition.\n\n" + _GOAL_STALL_TAXONOMY_BLOCK
+    )
+
+    # Busy framing: used when trigger="busy" (_busy_stall_pretrip tripped --
+    # the assistant HAS been taking tool actions every turn, but the same
+    # kind of blocker keeps recurring regardless). Real long stalls
+    # (a3126f2f, 6e64b3db -- see GOAL-HARDENING-DESIGN.md sec 1.2) were all
+    # busy every turn; feeding that situation into the idle prompt above
+    # would hand the judge a false premise ("took no tool actions"), so
+    # this is a genuinely separate prompt, not a parameter substitution
+    # into the same string.
+    _GOAL_STALL_SYSTEM_PROMPT_BUSY: ClassVar[str] = (
+        "You are a strict, tool-less judge. You will be shown a short "
+        "history of reasons an evaluator gave, across consecutive turns, "
+        "for why a goal condition was not yet satisfied -- during a "
+        "stretch where the assistant WAS ACTIVELY TAKING TOOL ACTIONS "
+        "EVERY TURN, but the same kind of blocker kept recurring "
+        "regardless of that activity. Decide whether the goal is durably "
+        "stuck (and if so, why), as opposed to reasons that, despite "
+        "looking repetitive, show the assistant making genuine incremental "
+        "progress toward the condition (e.g. re-running a test after a "
+        "real fix).\n\n" + _GOAL_STALL_TAXONOMY_BLOCK
+    )
+
+    # Verdicts a judge call may return (see _judge_stall). Any verdict other
+    # than "resolvable" trips is_stalled -- i.e. falls through into the
+    # existing (already tool-agnostic) escalate-then-hard-stop machinery in
+    # execute(), unchanged from before the taxonomy existed.
+    _GOAL_STALL_LOCKED_VERDICTS: ClassVar[frozenset[str]] = frozenset(
+        {"time-locked", "structure-locked", "history-locked"}
+    )
+
+    # Wire-word (as instructed in _GOAL_STALL_TAXONOMY_BLOCK, uppercase) ->
+    # internal verdict string (lowercase, hyphenated -- matches
+    # _GOAL_STALL_LOCKED_VERDICTS and the payload's `stall_verdict` field).
+    # A word outside this map is an unparseable response (see _judge_stall).
+    _GOAL_STALL_VERDICT_WORDS: ClassVar[dict[str, str]] = {
+        "RESOLVABLE": "resolvable",
+        "TIME-LOCKED": "time-locked",
+        "STRUCTURE-LOCKED": "structure-locked",
+        "HISTORY-LOCKED": "history-locked",
+    }
+
+    # One-line, user-facing explanation per locked verdict -- reused in the
+    # one-shot escalation prompt sent back to the agent (see
+    # _goal_stall_escalation_prompt) so the agent gets the judge's own
+    # classification, not just the evaluator's raw reason.
+    _GOAL_STALL_VERDICT_EXPLANATIONS: ClassVar[dict[str, str]] = {
+        "time-locked": (
+            "the condition requires elapsed wall-clock time that cannot "
+            "pass within this session"
+        ),
+        "structure-locked": (
+            "the condition applies a universal requirement to a set that "
+            "contains a structurally-exempt member"
+        ),
+        "history-locked": (
+            "the condition constrains the transcript's own past in a way "
+            "this session cannot retroactively repair"
+        ),
+    }
 
     # Fast-model run-summary prompts (terminal goal_progress states only),
     # one per terminal state. The reader watched the entire run happen
@@ -339,10 +518,23 @@ class StreamingOrchestrator:
         ),
     }
 
-    # Hard ceiling enforced in code on every generated run summary (see
-    # _enforce_summary_length below) -- the prompts above ask the model for
-    # ~120 characters, but a model instruction is not a guarantee.
-    _GOAL_SUMMARY_MAX_CHARS = 120
+    # Monotonic integer identifying the `orchestrator:goal_progress` payload's
+    # field set (see _goal_progress_payload). Bump by 1 whenever a field is
+    # added, removed, or renamed. Always an explicit int on every emitted
+    # event -- never null -- so a consumer can tell "this event carries a
+    # versioned contract" (key present) from "this predates versioning
+    # entirely" (key absent), rather than confusing an absent key with a
+    # null value (the exact confusion that broke consumers of the `metadata`
+    # field, which shipped null on 100% of measured events).
+    #
+    # Version 1 (this change): adds `condition` (the fully-expanded goal text
+    # the evaluator actually judged) and this `schema_version` field itself;
+    # removes the always-null `metadata` slot (zero readers found in either
+    # this repo or amplifier-app-cli). The three prior wire shapes --
+    # baseline; +reasons/summary/stall_detail/continuations; +distinct_
+    # blockers -- all shipped with no version key at all, so an absent key
+    # unambiguously means "one of those three", never a specific one of them.
+    _GOAL_PROGRESS_SCHEMA_VERSION: ClassVar[int] = 1
 
     # DEFECT 4 fix: shared cap for the evaluator/stall-judge/summary calls'
     # `max_output_tokens`. Each of these three calls has a contract of
@@ -409,6 +601,62 @@ class StreamingOrchestrator:
         # Defaults to `_DEFAULT_GOAL_PROVIDER_PREFERENCES`.
         self.goal_provider_preferences: list[dict[str, Any]] = config.get(
             "goal_provider_preferences", self._DEFAULT_GOAL_PROVIDER_PREFERENCES
+        )
+        # Evaluator input hygiene (see _flatten_message_for_evaluator,
+        # _evaluate_goal). Promoted from a bare class constant to a config
+        # knob, same override pattern as `goal_stall_threshold` above.
+        #
+        # Message-count window: how many of the most recent messages are
+        # even considered before the char-based bounds below apply.
+        self.goal_max_transcript_messages = int(
+            config.get(
+                "goal_max_transcript_messages", self._GOAL_MAX_TRANSCRIPT_MESSAGES
+            )
+        )
+        # Per-tool-result / tool-call-argument clip, in characters (see
+        # `_clip_head_tail`). `<= 0` disables clipping.
+        self.goal_tool_content_clip_chars = int(
+            config.get(
+                "goal_tool_content_clip_chars", _GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS
+            )
+        )
+        # Total transcript character budget -- a backstop applied
+        # NEWEST-FIRST above the per-message clip and the message-count
+        # window (see `_evaluate_goal`). `<= 0` disables the budget.
+        self.goal_transcript_char_budget = int(
+            config.get(
+                "goal_transcript_char_budget",
+                self._GOAL_DEFAULT_TRANSCRIPT_CHAR_BUDGET,
+            )
+        )
+        # Busy-stall trigger (b) -- see `_busy_stall_pretrip` and
+        # execute()'s stall-detection block. Independent of
+        # `goal_stall_threshold`/`no_tool_turns` above, which can never
+        # observe a stall where the agent keeps making tool calls every
+        # turn (the dominant real-world failure mode -- see
+        # GOAL-HARDENING-DESIGN.md sec 1.2; real sessions a3126f2f,
+        # 6e64b3db). Number of most recent evaluator reasons (regardless of
+        # tool activity that turn) inspected by the cheap, free,
+        # every-turn token-overlap pre-filter. `< 2` disables trigger (b)
+        # entirely (a single reason can't show recurrence).
+        self.goal_busy_stall_window = int(config.get("goal_busy_stall_window", 3))
+        # Minimum token-set (Jaccard) overlap ratio between the oldest
+        # reason in that window and each subsequent one, required for the
+        # pre-filter to trip. Only a trip pays for the (rare) `_judge_stall`
+        # call -- this knob controls how readily that happens, not whether
+        # a stall is ultimately declared (the judge still must confirm).
+        self.goal_busy_stall_min_overlap = float(
+            config.get("goal_busy_stall_min_overlap", 0.5)
+        )
+        # Cap on how many of `goal["reasons"]` are shipped to the summary
+        # model (see `_summarize_goal_run`/`_cap_reasons_for_summary`).
+        # `goal["reasons"]` grows one entry per turn with no cap of its
+        # own (by design -- `_judge_stall` and the CLI's dedupe both need
+        # the full history); the summary call only needs the CURRENT
+        # state, which the tail of a long run already establishes. `<= 0`
+        # disables the cap (send the whole list, pre-existing behavior).
+        self.goal_summary_max_reasons = int(
+            config.get("goal_summary_max_reasons", 20)
         )
         # Per-execute()-call cache for `_resolve_goal_model`'s result (see
         # that method's CRITICAL PERF note) -- reset to None at the top of
@@ -684,24 +932,54 @@ class StreamingOrchestrator:
             # comment above `cap_hit`).
             is_stalled = False
             stall_detail: str | None = None
+            stall_verdict: str | None = None
+            stall_trigger: str | None = None
             if is_continuation_turn:
                 if self._tool_calls_this_turn == 0:
                     goal["no_tool_turns"] += 1
                 else:
                     goal["no_tool_turns"] = 0
 
-                if goal["no_tool_turns"] >= self.goal_stall_threshold:
-                    # Condition (a) -- absence of action -- holds. Only now
+                # Trigger (a) -- idle: mechanical absence-of-action streak
+                # (original trigger).
+                idle_trip = goal["no_tool_turns"] >= self.goal_stall_threshold
+                # Trigger (b) -- busy: tool-activity-INDEPENDENT pre-filter
+                # (see `_busy_stall_pretrip`). `idle_trip` can only ever
+                # observe a stall during turns with ZERO tool calls -- it
+                # never fires for the dominant real-world failure mode: the
+                # agent stays busy (tool calls every turn) while the goal
+                # has already become unsatisfiable (see
+                # GOAL-HARDENING-DESIGN.md sec 1.2; real sessions
+                # a3126f2f r8, 6e64b3db r1/r2 -- 9/15/8 turns wasted past
+                # the point the evaluator itself named the lock). Skipped
+                # once `idle_trip` already holds, so a turn never pays for
+                # two judge calls; idle framing wins on the rare turn where
+                # both mechanical conditions happen to hold at once (a
+                # busy-then-suddenly-idle transition).
+                busy_trip = (not idle_trip) and self._busy_stall_pretrip(goal)
+
+                if idle_trip or busy_trip:
+                    stall_trigger = "idle" if idle_trip else "busy"
+                    # Condition (a)/(b) above -- absence of action, or a
+                    # recurring blocker despite activity -- holds. Only now
                     # do we pay for the (rare) stall-judge call to check
-                    # condition (b): is this a static, unresolved blocker, or
-                    # does it just look repetitive while genuinely
-                    # progressing? Both conditions are required to ever trip
-                    # -- text-similarity/repetition alone is never enough,
-                    # since legitimate agent work (e.g. re-running a test
-                    # after a fix) can look repetitive too.
+                    # the other half of the dual condition: is this a
+                    # static, unresolved blocker, or does it just look
+                    # repetitive while genuinely progressing? Both the
+                    # mechanical pre-filter AND the judge are required to
+                    # ever trip -- text-similarity/repetition alone is
+                    # never enough, since legitimate agent work (e.g.
+                    # re-running a test after a fix) can look repetitive
+                    # too. See TestDualConditionStallTrip.
                     try:
-                        is_stalled, stall_detail = await self._judge_stall(
-                            goal, providers, hooks, coordinator
+                        is_stalled, stall_detail, stall_verdict = (
+                            await self._judge_stall(
+                                goal,
+                                providers,
+                                hooks,
+                                coordinator,
+                                trigger=stall_trigger,
+                            )
                         )
                     except Exception as e:
                         # Fail open: a flaky judge call must never itself
@@ -709,7 +987,7 @@ class StreamingOrchestrator:
                         logger.warning(
                             f"/goal: stall judge failed, continuing normally: {e}"
                         )
-                        is_stalled, stall_detail = False, None
+                        is_stalled, stall_detail, stall_verdict = False, None, None
 
             if is_stalled and (goal["escalated"] or cap_hit):
                 # Either this is the second trip (escalation already used
@@ -736,6 +1014,7 @@ class StreamingOrchestrator:
                         state="stalled",
                         reason=reason,
                         stall_detail=stall_detail,
+                        stall_verdict=stall_verdict,
                         summary=summary,
                     ),
                 )
@@ -751,23 +1030,18 @@ class StreamingOrchestrator:
                 await hooks.emit(
                     "orchestrator:goal_progress",
                     self._goal_progress_payload(
-                        goal, state="continuing", reason=reason
+                        goal,
+                        state="continuing",
+                        reason=reason,
+                        stall_verdict=stall_verdict,
                     ),
                 )
                 goal["continuations"] += 1
-                stall_prompt = (
-                    f"You've been asked to work toward this goal: "
-                    f"{goal['condition']}\n\n"
-                    f"For the last {goal['no_tool_turns']} turns you "
-                    "haven't taken any actions (no tool calls), and "
-                    "the evaluator keeps reporting the same kind of "
-                    f"blocker: {reason}\n\n"
-                    "You appear stuck. Either try a genuinely "
-                    "different approach to make progress, or, if you "
-                    "believe this goal cannot be achieved as it's "
-                    "currently defined, say so plainly and explain "
-                    "specifically why -- don't just repeat what "
-                    "you've already said."
+                stall_prompt = self._goal_stall_escalation_prompt(
+                    goal,
+                    reason,
+                    trigger=stall_trigger or "idle",
+                    verdict=stall_verdict,
                 )
                 full_response = await self._execute_one_turn(
                     stall_prompt,
@@ -944,6 +1218,118 @@ class StreamingOrchestrator:
         goal.setdefault("continuations", 0)
         goal.setdefault("no_tool_turns", 0)
         goal.setdefault("escalated", False)
+
+    _REASON_TOKEN_RE: ClassVar[re.Pattern[str]] = re.compile(r"[a-z0-9]+")
+
+    @classmethod
+    def _reason_token_set(cls, text: str) -> set[str]:
+        """Lowercase, alnum-run tokenization for the busy-stall pre-filter
+        (see `_busy_stall_pretrip`). Deliberately crude -- this is a cheap,
+        free, every-turn heuristic whose only job is deciding whether to
+        PAY for a judge call, not deciding the stall itself (the judge
+        always confirms; see TestDualConditionStallTrip).
+        """
+        return set(cls._REASON_TOKEN_RE.findall(text.lower()))
+
+    @staticmethod
+    def _token_overlap_ratio(a: set[str], b: set[str]) -> float:
+        """Jaccard similarity between two token sets. Two empty sets are
+        treated as fully overlapping (both say "nothing"); one empty and
+        one non-empty are treated as fully disjoint.
+        """
+        if not a and not b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
+    def _busy_stall_pretrip(self, goal: dict[str, Any]) -> bool:
+        """Trigger (b)'s cheap, deterministic, tool-activity-INDEPENDENT
+        pre-filter (see execute()'s stall-detection block).
+
+        Runs every continuation turn at zero LLM cost -- only a trip here
+        pays for a `_judge_stall` call, mirroring how trigger (a)
+        (`no_tool_turns >= goal_stall_threshold`) already gates the
+        original judge call. Trips when the most recent
+        `goal_busy_stall_window` evaluator reasons (regardless of whether
+        the assistant made tool calls on those turns) all share at least
+        `goal_busy_stall_min_overlap` token-set overlap with the OLDEST
+        reason in that window -- i.e. the evaluator has been reporting
+        essentially the same blocker for `goal_busy_stall_window` turns
+        straight.
+
+        This is the trigger the real long stalls needed and trigger (a)
+        structurally cannot provide: `no_tool_turns` can only ever
+        increment on a turn with ZERO tool calls, so an agent that stays
+        busy (tool calls every turn) while the goal has already become
+        unsatisfiable never trips it at all (see GOAL-HARDENING-DESIGN.md
+        sec 1.2; real sessions a3126f2f r8, 6e64b3db r1/r2 ran 9/15/8 turns
+        past the point the evaluator itself named the lock).
+        """
+        window = self.goal_busy_stall_window
+        if window < 2:
+            return False
+        reasons = goal.get("reasons") or []
+        if len(reasons) < window:
+            return False
+        recent = reasons[-window:]
+        anchor = self._reason_token_set(recent[0])
+        threshold = self.goal_busy_stall_min_overlap
+        return all(
+            self._token_overlap_ratio(anchor, self._reason_token_set(r)) >= threshold
+            for r in recent[1:]
+        )
+
+    def _goal_stall_escalation_prompt(
+        self,
+        goal: dict[str, Any],
+        reason: str,
+        *,
+        trigger: str,
+        verdict: str | None,
+    ) -> str:
+        """Build the one-shot rescue prompt sent back to the agent on a
+        first stall trip (see execute()'s escalation branch -- reused
+        unchanged, and unchanged in structure, for both triggers).
+
+        Framing must match the REAL situation for whichever trigger fired:
+        telling a busy agent "you haven't taken any actions" would hand it
+        as false a premise as the stall judge's own prompt would get
+        without the `_GOAL_STALL_SYSTEM_PROMPT_IDLE`/`_BUSY` split (see
+        those constants for the matching concern on the judge side).
+        """
+        if trigger == "busy":
+            activity_clause = (
+                f"Across the last {self.goal_busy_stall_window} turns the "
+                "evaluator keeps reporting the same kind of blocker "
+                f"regardless of what tool activity did or didn't happen "
+                f"those turns: {reason}"
+            )
+        else:
+            activity_clause = (
+                f"For the last {goal['no_tool_turns']} turns you haven't "
+                "taken any actions (no tool calls), and the evaluator "
+                f"keeps reporting the same kind of blocker: {reason}"
+            )
+
+        verdict_clause = ""
+        explanation = self._GOAL_STALL_VERDICT_EXPLANATIONS.get(verdict or "")
+        if explanation:
+            verdict_clause = (
+                f" A reviewing judge classified this as {verdict}: "
+                f"{explanation}."
+            )
+
+        return (
+            f"You've been asked to work toward this goal: "
+            f"{goal['condition']}\n\n"
+            f"{activity_clause}{verdict_clause}\n\n"
+            "You appear stuck. Either try a genuinely different approach "
+            "to make progress, or, if you believe this goal cannot be "
+            "achieved as it's currently defined, say so plainly and "
+            "explain specifically why -- don't just repeat what you've "
+            "already said."
+        )
 
     async def _resolve_goal_provider_preferences(
         self,
@@ -1279,6 +1665,7 @@ class StreamingOrchestrator:
         state: str,
         reason: str | None,
         stall_detail: str | None = None,
+        stall_verdict: str | None = None,
         summary: str | None = None,
     ) -> dict[str, Any]:
         """Build the exact ``orchestrator:goal_progress`` payload contract.
@@ -1300,9 +1687,37 @@ class StreamingOrchestrator:
             "summary": summary,
             # Additive field (see _distinct_blocker_count): count of
             # distinct evaluator-reason signatures across the whole run --
-            # distinguishes "hit a wall" (1) from "flailing" (N).
+            # distinguishes "hit a wall" (1) from "flailing" (N). Left in
+            # place unchanged -- see `stall_verdict` below for the fix to
+            # the actual downstream bug (a rephrased-every-turn blocker
+            # reads as "flailing" here even when it's really a wall).
             "distinct_blockers": self._distinct_blocker_count(reasons),
-            "metadata": None,
+            # The taxonomy verdict from `_judge_stall` (see
+            # _GOAL_STALL_TAXONOMY_BLOCK): "resolvable", "time-locked",
+            # "structure-locked", "history-locked", or None (no stall
+            # judge call was made this turn -- the common case). This is
+            # the SEMANTIC signal `distinct_blockers` was being asked to
+            # stand in for; consumers (see amplifier-app-cli's
+            # goal_progress_hook.py) should prefer this for wall-vs-
+            # flailing wording over re-deriving it from `reasons`.
+            "stall_verdict": stall_verdict,
+            # The fully-expanded goal condition -- @mentions already resolved
+            # at /goal set-time (see amplifier-app-cli's process_runtime_
+            # mentions call sites), i.e. the exact text re-sent to the
+            # evaluator every turn. Deliberately the expanded form, not the
+            # raw user-typed text: a reader of this event should see exactly
+            # what the evaluator judged. Previously reconstructable only via
+            # a fragile 4-step procedure (split runs on turn reset, find the
+            # nearest preceding Prompt node, then distinguish the real user
+            # prompt from this loop's own auto-injected continuation
+            # prompts -- indistinguishable by node type alone).
+            "condition": goal.get("condition"),
+            # See _GOAL_PROGRESS_SCHEMA_VERSION for the versioning contract.
+            # `metadata` (previously a hardcoded-None slot here) is removed:
+            # it measured null on 100% of 328 sampled events across three
+            # graph endpoints, and a repo-wide grep of both this repo and
+            # amplifier-app-cli found zero readers of it on this event.
+            "schema_version": self._GOAL_PROGRESS_SCHEMA_VERSION,
         }
 
     async def _judge_stall(
@@ -1311,24 +1726,59 @@ class StreamingOrchestrator:
         providers: dict[str, Any],
         hooks: HookRegistry,
         coordinator: ModuleCoordinator | None = None,
-    ) -> tuple[bool, str | None]:
-        """Ask a cheap, tool-less model whether the recent run of no-tool-turn
-        evaluator reasons describes a static, unresolved blocker (a stall) or
-        genuine incremental progress despite no tool calls.
+        *,
+        trigger: str = "idle",
+    ) -> tuple[bool, str | None, str | None]:
+        """Ask a cheap, tool-less model to classify the recent run of
+        evaluator reasons: is the goal durably stuck (and, if so, which
+        taxonomy of lock), or is this genuine incremental progress that
+        merely looks repetitive?
 
-        Only called from execute()'s stall-detection block, and only once the
-        mechanical condition (``no_tool_turns >= self.goal_stall_threshold``)
-        already holds -- that's what keeps this rare and cheap. Returns
-        (is_stalled, detail). Raises on failure; the caller treats a raised
-        exception as "not stalled" (fail open on the judge -- a flaky judge
-        call must never itself manufacture a false stall; the mechanical
-        absence-of-action condition is what keeps stall detection safe).
+        ``trigger`` selects which of the two mechanical pre-filters called
+        this (see execute()'s stall-detection block) and therefore which
+        framing is TRUE for this call -- passing the wrong one would hand
+        the judge a false premise, exactly the defect
+        _GOAL_STALL_SYSTEM_PROMPT_IDLE/_BUSY exist to avoid:
+
+        - ``"idle"`` (default): trigger (a), ``no_tool_turns >=
+          goal_stall_threshold`` already holds -- the assistant took NO
+          tool actions for that whole streak. Recent-reasons window is
+          ``goal["reasons"][-goal["no_tool_turns"]:]``.
+        - ``"busy"``: trigger (b), ``_busy_stall_pretrip`` already tripped
+          -- the assistant HAS been taking tool actions, but the same
+          blocker keeps recurring regardless. Recent-reasons window is
+          ``goal["reasons"][-goal_busy_stall_window:]``.
+
+        Only called once the relevant mechanical pre-filter already holds
+        -- that's what keeps this rare and cheap. Returns
+        ``(is_stalled, detail, verdict)`` where ``verdict`` is one of
+        ``"resolvable"``, ``"time-locked"``, ``"structure-locked"``,
+        ``"history-locked"`` (or ``None`` when there was nothing to judge).
+        ``is_stalled`` is ``verdict != "resolvable"``. Raises on failure;
+        the caller treats a raised exception as "not stalled" (fail open on
+        the judge -- a flaky judge call must never itself manufacture a
+        false stall; the mechanical pre-filter is what keeps stall
+        detection safe).
         """
-        recent_reasons = (
-            goal["reasons"][-goal["no_tool_turns"] :] if goal.get("reasons") else []
-        )
+        if trigger == "busy":
+            window = self.goal_busy_stall_window
+            recent_reasons = goal["reasons"][-window:] if goal.get("reasons") else []
+            system_prompt = self._GOAL_STALL_SYSTEM_PROMPT_BUSY
+            activity_clause = (
+                "the same kind of blocker kept recurring regardless of "
+                "whatever tool activity did or didn't happen those turns"
+            )
+        else:
+            recent_reasons = (
+                goal["reasons"][-goal["no_tool_turns"] :]
+                if goal.get("reasons")
+                else []
+            )
+            system_prompt = self._GOAL_STALL_SYSTEM_PROMPT_IDLE
+            activity_clause = "the assistant took no tool actions at all"
+
         if not recent_reasons:
-            return False, None
+            return False, None, None
 
         if not providers:
             raise RuntimeError("no provider mounted for stall judgment")
@@ -1343,13 +1793,13 @@ class StreamingOrchestrator:
         user_prompt = (
             f"GOAL CONDITION:\n{goal['condition']}\n\n"
             f"EVALUATOR REASONS across the last {len(recent_reasons)} turns, "
-            "during which the assistant took no tool actions at all:\n"
+            f"during which {activity_clause}:\n"
             f"{history_text}\n\n"
-            "Is this a stall? Respond in the required two-line format."
+            "Classify this using the required two-line format."
         )
 
         judge_messages = [
-            Message(role="system", content=self._GOAL_STALL_SYSTEM_PROMPT),
+            Message(role="system", content=system_prompt),
             Message(role="user", content=user_prompt),
         ]
         # DEFECT 4 fix (real session e97e192b): this internal utility call was
@@ -1457,36 +1907,14 @@ class StreamingOrchestrator:
         if not lines:
             raise ValueError("stall judge returned an empty response")
 
-        verdict = lines[0].strip().upper()
-        if verdict not in ("YES", "NO"):
+        verdict_word = lines[0].strip().upper()
+        verdict = self._GOAL_STALL_VERDICT_WORDS.get(verdict_word)
+        if verdict is None:
             raise ValueError(f"unparseable stall judge verdict: {lines[0]!r}")
 
         detail = lines[1] if len(lines) > 1 else "(judge gave no reason)"
-        return verdict == "YES", detail
-
-    @staticmethod
-    def _enforce_summary_length(text: str, max_chars: int | None = None) -> str:
-        """Hard-truncate ``text`` to at most ``max_chars`` (default
-        ``_GOAL_SUMMARY_MAX_CHARS``), breaking at the last whole word rather
-        than mid-word.
-
-        The per-state system prompts ask the model for "no more than about
-        120 characters", but a model instruction is not a guarantee -- this
-        is the code-level backstop that actually enforces it.
-        """
-        cap = (
-            max_chars
-            if max_chars is not None
-            else StreamingOrchestrator._GOAL_SUMMARY_MAX_CHARS
-        )
-        text = text.strip()
-        if len(text) <= cap:
-            return text
-        truncated = text[:cap]
-        last_space = truncated.rfind(" ")
-        if last_space > 0:
-            truncated = truncated[:last_space]
-        return truncated.rstrip()
+        is_stalled = verdict in self._GOAL_STALL_LOCKED_VERDICTS
+        return is_stalled, detail, verdict
 
     @staticmethod
     def _goal_summary_fallback(goal: dict[str, Any], final_state: str) -> str | None:
@@ -1510,6 +1938,28 @@ class StreamingOrchestrator:
         if final_state == "error":
             return "evaluator failed"
         return None
+
+    def _cap_reasons_for_summary(
+        self, reasons: list[str]
+    ) -> tuple[list[str], int]:
+        """Bound how many of ``goal["reasons"]`` are shipped to the summary
+        model (see ``_summarize_goal_run``).
+
+        ``goal["reasons"]`` grows one entry per turn with no cap of its own
+        by design -- ``_judge_stall`` and the CLI's dedupe both need the
+        full history -- so a long stalled/cap_hit run (54 turns in the
+        worst recorded case, real session a3126f2f) previously shipped the
+        ENTIRE list, whole, to the summary call every time. The summary
+        only ever needs to explain the CURRENT state, which the tail of
+        the run already establishes, so only the most recent
+        ``goal_summary_max_reasons`` entries are kept. Returns
+        ``(kept_reasons, omitted_count)`` -- ``omitted_count`` is 0 when
+        nothing was cut (including when the cap is disabled via ``<= 0``).
+        """
+        cap = self.goal_summary_max_reasons
+        if cap <= 0 or len(reasons) <= cap:
+            return list(reasons), 0
+        return list(reasons[-cap:]), len(reasons) - cap
 
     async def _summarize_goal_run(
         self,
@@ -1536,9 +1986,18 @@ class StreamingOrchestrator:
         on any failure, or an empty model response, this falls back to a
         deterministic per-state string (``_goal_summary_fallback``) so the
         payload's ``summary`` field always carries *something* actionable
-        rather than silently going missing. The length cap is enforced in
-        code (``_enforce_summary_length``) regardless of what the model
-        actually returned.
+        rather than silently going missing.
+
+        Returns the model's text in full, with no length cap -- storage and
+        display are different concerns (previously this truncated to
+        ``_GOAL_SUMMARY_MAX_CHARS`` before storage, so a stalled/cap_hit
+        run's stored summary could end mid-clause and the full model text
+        was never retained anywhere). Truncation for one-line terminal
+        rendering is now applied only at display time, in amplifier-app-cli's
+        ``goal_progress_hook.py``. The per-state system prompts above still
+        ask the model for "no more than about 120 characters" to keep the
+        text itself short, but that is a request to the model, not an
+        enforced ceiling on what gets stored.
         """
         try:
             if not providers:
@@ -1561,9 +2020,17 @@ class StreamingOrchestrator:
                 )
             else:
                 reasons = goal.get("reasons", [])
+                kept_reasons, omitted_count = self._cap_reasons_for_summary(reasons)
+                reasons_lines = [
+                    f"{i + 1}. {r}" for i, r in enumerate(kept_reasons)
+                ]
+                if omitted_count:
+                    reasons_lines.insert(
+                        0, f"(earliest {omitted_count} reasons omitted)"
+                    )
                 reasons_text = (
-                    "\n".join(f"{i + 1}. {r}" for i, r in enumerate(reasons))
-                    if reasons
+                    "\n".join(reasons_lines)
+                    if reasons_lines
                     else "(no evaluator reasons recorded)"
                 )
                 user_prompt = (
@@ -1626,7 +2093,7 @@ class StreamingOrchestrator:
             summary_text = summary_text.strip()
             if not summary_text:
                 return self._goal_summary_fallback(goal, final_state)
-            return self._enforce_summary_length(summary_text)
+            return summary_text
         except Exception as e:
             logger.warning(
                 f"/goal: summary generation failed, falling back to a "
@@ -1662,13 +2129,42 @@ class StreamingOrchestrator:
 
         truncated = False
         messages = all_messages
-        if len(messages) > self._GOAL_MAX_TRANSCRIPT_MESSAGES:
-            messages = messages[-self._GOAL_MAX_TRANSCRIPT_MESSAGES :]
+        if len(messages) > self.goal_max_transcript_messages:
+            messages = messages[-self.goal_max_transcript_messages :]
             truncated = True
 
-        transcript_text = "\n\n".join(
-            t for t in (_flatten_message_for_evaluator(m) for m in messages) if t
-        )
+        flattened = [
+            t
+            for t in (
+                _flatten_message_for_evaluator(m, self.goal_tool_content_clip_chars)
+                for m in messages
+            )
+            if t
+        ]
+
+        # Total transcript character budget: a backstop ABOVE the
+        # per-message clip and the message-count window above. Walked
+        # NEWEST-FIRST so that when the budget binds, the most recent
+        # (most verdict-relevant) turns survive and OLDER messages within
+        # the window are what gets dropped -- then restored to
+        # chronological order for the final prompt. The newest message is
+        # always kept even if it alone exceeds the budget, so the
+        # evaluator is never handed an empty transcript.
+        budget = self.goal_transcript_char_budget
+        if budget > 0 and flattened:
+            kept_reversed: list[str] = []
+            used = 0
+            for text in reversed(flattened):
+                # "\n\n".join cost: 2 extra chars per joiner once >1 kept.
+                cost = len(text) + (2 if kept_reversed else 0)
+                if used + cost > budget and kept_reversed:
+                    truncated = True
+                    break
+                kept_reversed.append(text)
+                used += cost
+            flattened = list(reversed(kept_reversed))
+
+        transcript_text = "\n\n".join(flattened)
 
         if not providers:
             raise RuntimeError("no provider mounted for evaluation")
