@@ -104,6 +104,14 @@ class MockCoordinator:
         self.cancellation = MockCancellation()
         self._capabilities: dict = {}
         self._mounts: dict = {}
+        # `session_state` is part of the real ModuleCoordinator contract, and
+        # the orchestrator reads it unguarded (`coordinator.session_state.get(...)`
+        # in execute()). This mock predates that access and omitting it failed
+        # 13 tests in this file with AttributeError raised from *production*
+        # code, which reads as an orchestrator bug rather than mock drift.
+        # test_goal_loop.py's MockCoordinator already carries it - these two
+        # mocks are duplicates that fell out of sync.
+        self.session_state: dict = {}
 
     def register_contributor(self, name: str, source: str, fn) -> None:  # noqa: ANN001
         pass
