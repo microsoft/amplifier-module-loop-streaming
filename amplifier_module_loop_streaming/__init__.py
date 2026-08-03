@@ -36,6 +36,60 @@ from .steering import SteeringQueue
 logger = logging.getLogger(__name__)
 
 
+def _build_tool_spec(tool: Any) -> ToolSpec:
+    """Build a `ToolSpec` for one mounted tool, preserving model-native form.
+
+    Most tools are plain function tools: name + description + JSON schema.
+
+    A *model-native* tool (Anthropic's `computer_20251124`, `web_search_*`,
+    ...) is instead a server-side definition whose shape is fixed by the
+    provider. It is declared on the wire as `{"type": "<tool_type>", ...}`,
+    and the model is post-trained on that exact definition - a lookalike
+    function tool measurably degrades its behaviour, so the native form has
+    to survive the trip to the provider.
+
+    Building the spec from only (name, description, parameters) silently
+    discarded that form, and no error surfaced: the request was still valid,
+    the tool still appeared, and the model simply got the weaker definition.
+    Providers already accept the native shape (`type != "function"` is passed
+    through untouched) - it just never reached them.
+
+    A tool opts in by exposing `native_tool_spec`: a dict of the provider's
+    native definition. `ToolSpec` is declared `extra="allow"`, so those keys
+    ride along as extras and reach the provider intact. Tools without the
+    attribute are unaffected.
+    """
+    spec_source = getattr(type(tool), "native_tool_spec", None)
+    if spec_source is not None:
+        try:
+            native = tool.native_tool_spec
+        except Exception:
+            # A tool that cannot describe its native form is still a usable
+            # function tool. Degrade to the function shape rather than failing
+            # the whole request, but say so - a silent downgrade here is what
+            # made the original bug invisible.
+            logger.warning(
+                "tool %r raised while reading native_tool_spec; "
+                "falling back to its function-tool definition",
+                getattr(tool, "name", "<unknown>"),
+                exc_info=True,
+            )
+        else:
+            if isinstance(native, dict) and native.get("type"):
+                return ToolSpec(
+                    name=native.get("name") or tool.name,
+                    description=tool.description,
+                    parameters=tool.input_schema,
+                    **{k: v for k, v in native.items() if k not in ("name",)},
+                )
+
+    return ToolSpec(
+        name=tool.name,
+        description=tool.description,
+        parameters=tool.input_schema,
+    )
+
+
 def _flatten_message_for_evaluator(msg: dict) -> str:
     """Render one stored (dict) message as plain text for the goal evaluator.
 
@@ -1579,11 +1633,7 @@ class StreamingOrchestrator:
             tools_list = None
             if tools:
                 tools_list = [
-                    ToolSpec(
-                        name=t.name,
-                        description=t.description,
-                        parameters=t.input_schema,
-                    )
+                    _build_tool_spec(t)
                     for t in tools.values()
                 ]
 
@@ -2054,11 +2104,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 tools_list = None
                 if tools:
                     tools_list = [
-                        ToolSpec(
-                            name=t.name,
-                            description=t.description,
-                            parameters=t.input_schema,
-                        )
+                        _build_tool_spec(t)
                         for t in tools.values()
                     ]
 
