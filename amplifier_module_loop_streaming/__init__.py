@@ -167,25 +167,18 @@ class StreamingOrchestrator:
         "Line 2: one sentence explaining why\n"
     )
 
-    # Best-effort cheap-model hints per provider-name substring. Spike-level
-    # heuristic only -- mirrors amplifier-app-cli's hint table.
-    #
     # NOTE on model-role routing (investigated for the stall-detection work,
-    # docs/designs/goal-command.md): Amplifier's routing-matrix `fast` role
-    # is a delegation-time concept -- it's only reachable through the
-    # `delegate` tool's sub-session spawning (`model_role` param). It is not
-    # exposed as a coordinator capability (see amplifier-core's
-    # CAPABILITY_REGISTRY.md -- the only standard capabilities are
-    # `session.spawn` / `session.resume`), so there is nothing for a module
-    # making a direct `provider.complete()` call, like this one, to reach.
-    # If a `model.route`-style capability is ever registered, this hint
-    # table (and `_select_cheap_model` below) is the place to swap it in.
-    _GOAL_CHEAP_MODEL_HINTS: ClassVar[dict[str, str]] = {
-        "anthropic": "claude-haiku-4-5",
-        "openai": "gpt-5-mini",
-        "azure-openai": "gpt-5-mini",
-        "azure_openai": "gpt-5-mini",
-    }
+    # docs/designs/goal-command.md): the routing-matrix `fast` role IS
+    # reachable from here. `hooks-routing` registers a coordinator capability
+    # named `model_role_resolver` (contract: `async def resolve(model_role:
+    # str | list[str]) -> list[ProviderPreference]`, see amplifier_foundation's
+    # `ProviderPreference`). This orchestrator looks that capability up
+    # lazily -- inside `_resolve_goal_model`, never at mount()/__init__ time
+    # -- because hooks mount *after* the orchestrator does, so the capability
+    # is not yet registered when this class is constructed. See
+    # `_resolve_goal_model` below for the resolution + caching + fallback
+    # logic, matching the pattern established by tool-delegate's own
+    # `model_role_resolver` consumption.
 
     _GOAL_MAX_TRANSCRIPT_MESSAGES = 40
 
@@ -290,6 +283,18 @@ class StreamingOrchestrator:
         # calls required before the stall judge is even consulted (see
         # execute()'s stall-detection block and _judge_stall).
         self.goal_stall_threshold = int(config.get("goal_stall_threshold", 3))
+        # Model role (routing-matrix name) requested for the goal-loop's
+        # internal LLM calls (evaluator, stall judge, run summary) via the
+        # `model_role_resolver` coordinator capability -- see
+        # `_resolve_goal_model`. Default "fast" matches these calls' actual
+        # shape (cheap, tool-less, two-line/one-sentence verdicts).
+        self.goal_model_role = config.get("goal_model_role", "fast")
+        # Per-execute()-call cache for `_resolve_goal_model`'s result (see
+        # that method's CRITICAL PERF note) -- reset to None at the top of
+        # execute() so each run re-resolves once, not on every turn.
+        self._goal_model_cache: tuple[str, Any, str | None, dict[str, Any]] | None = (
+            None
+        )
         # Per-token artificial delay (seconds) injected after each non-whitespace
         # token in _tokenize_stream(). Default 0.0 so headless callers (sub-sessions,
         # automated agents) pay no synthetic latency. Set to e.g. 0.01 to opt in to
@@ -407,6 +412,12 @@ class StreamingOrchestrator:
         goal is active this is a single pass-through call: zero behavior
         change from the pre-goal implementation.
         """
+        # Reset the per-run model-role resolution cache (see
+        # `_resolve_goal_model`'s CRITICAL PERF note) so each execute() call
+        # re-resolves the goal-loop model role exactly once, not once per
+        # turn.
+        self._goal_model_cache = None
+
         # Peek at goal state *before* the first turn. Goal state can only be
         # set (by the app layer's /goal command) before execute() is called,
         # and can only be cleared (never newly set) from within this method's
@@ -813,26 +824,113 @@ class StreamingOrchestrator:
         goal.setdefault("no_tool_turns", 0)
         goal.setdefault("escalated", False)
 
-    def _select_cheap_model(self, provider_name: str) -> str | None:
-        """Best-effort cheap/fast model selection for goal-loop LLM calls
-        (evaluator, stall judge, run summary).
+    async def _resolve_goal_model(
+        self,
+        providers: dict[str, Any],
+        coordinator: ModuleCoordinator | None,
+    ) -> tuple[str, Any, str | None, dict[str, Any]]:
+        """Resolve the provider/model/config to use for the goal-loop's
+        internal LLM calls (evaluator, stall judge, run summary) via the
+        coordinator's ``model_role_resolver`` capability, honoring
+        ``self.goal_model_role`` (default ``"fast"``).
 
-        Uses the hardcoded substring hint table because no coordinator
-        capability for model-role routing is reachable from here -- see the
-        note above ``_GOAL_CHEAP_MODEL_HINTS`` for what was investigated.
-        Logs a WARNING on a miss so silently falling back to the provider's
-        (potentially expensive) default model is visible instead of silent.
+        Returns ``(provider_name, provider, model, config)``:
+
+        - ``provider_name``/``provider``: the resolved provider INSTANCE to
+          call. This may be a *different* provider than the session default
+          -- e.g. the matrix's ``fast`` role points at an installed OpenAI
+          provider while the session's main conversation runs on Anthropic.
+          Calling the WRONG provider instance with a model name from a
+          DIFFERENT provider is a real failure mode this must avoid.
+        - ``model``: a concrete model name (globs are already resolved by
+          the resolver -- never re-glob here), or ``None`` when falling
+          back to the provider's own default model.
+        - ``config``: the role's per-provider config dict (e.g.
+          ``{"reasoning_effort": "high"}``) to forward as ``complete()``
+          kwargs. Callers must apply ``extended_thinking=False`` AFTER
+          spreading this so it always wins (see DEFECT 4).
+
+        CRITICAL TIMING: the ``model_role_resolver`` capability is
+        registered by a hooks module that mounts *after* the orchestrator,
+        so it must be looked up here (lazily, at call time) and never in
+        ``mount()``/``__init__``.
+
+        CRITICAL PERF: resolution is cached for the lifetime of one
+        ``execute()`` call (see ``self._goal_model_cache``, reset at the
+        top of ``execute()``) -- ``resolve()`` performs a live
+        ``provider.list_models()`` network round-trip whenever the matrix
+        entry is a glob (the common case), and the evaluator runs every
+        turn.
+
+        No silent fallbacks: when no resolver is registered, the resolver
+        returns no candidates, or the resolved provider isn't actually
+        mounted for this session, this logs a WARNING naming the specific
+        cause and falls back to the session's default (first-listed)
+        provider with no model override -- making it obvious the run is
+        NOT using the configured ``goal_model_role``.
         """
-        for hint_key, hint_model in self._GOAL_CHEAP_MODEL_HINTS.items():
-            if hint_key in provider_name.lower():
-                return hint_model
-        logger.warning(
-            f"/goal: no cheap-model hint for provider '{provider_name}' -- "
-            "falling back to the provider's default model for this "
-            "evaluator/stall-judge/summary call, which may be more expensive "
-            "than intended. Add a hint to _GOAL_CHEAP_MODEL_HINTS."
+        if self._goal_model_cache is not None:
+            return self._goal_model_cache
+
+        if not providers:
+            raise RuntimeError("no provider mounted for goal-loop model resolution")
+        default_name, default_provider = next(iter(providers.items()))
+
+        def _fallback(cause: str) -> tuple[str, Any, str | None, dict[str, Any]]:
+            logger.warning(
+                "/goal: model_role '%s' %s -- falling back to the session "
+                "default provider/model for the evaluator/stall-judge/"
+                "summary calls, which is NOT the configured fast role.",
+                self.goal_model_role,
+                cause,
+            )
+            return (default_name, default_provider, None, {})
+
+        resolver = (
+            coordinator.get_capability("model_role_resolver")
+            if coordinator and hasattr(coordinator, "get_capability")
+            else None
         )
-        return None
+        if resolver is None:
+            result = _fallback(
+                "specified but no model_role_resolver capability is "
+                "registered (install a routing bundle)"
+            )
+            self._goal_model_cache = result
+            return result
+
+        resolved = await resolver.resolve(self.goal_model_role)
+        if not resolved:
+            result = _fallback(
+                f"resolved to no candidates against installed providers "
+                f"(resolver={getattr(resolver, 'name', type(resolver).__name__)})"
+            )
+            self._goal_model_cache = result
+            return result
+
+        pref = resolved[0]
+        match: tuple[str, Any] | None = None
+        for name, provider in providers.items():
+            if pref.provider in (
+                name,
+                name.replace("provider-", ""),
+                f"provider-{pref.provider}",
+            ):
+                match = (name, provider)
+                break
+
+        if match is None:
+            result = _fallback(
+                f"resolved to provider '{pref.provider}', which is not "
+                "mounted/installed for this session"
+            )
+            self._goal_model_cache = result
+            return result
+
+        resolved_name, resolved_provider = match
+        result = (resolved_name, resolved_provider, pref.model, dict(pref.config or {}))
+        self._goal_model_cache = result
+        return result
 
     @staticmethod
     def _goal_run_needs_summary(final_state: str) -> bool:
@@ -1002,8 +1100,12 @@ class StreamingOrchestrator:
 
         if not providers:
             raise RuntimeError("no provider mounted for stall judgment")
-        provider_name, provider = next(iter(providers.items()))
-        model_override = self._select_cheap_model(provider_name)
+        (
+            provider_name,
+            provider,
+            model_override,
+            role_config,
+        ) = await self._resolve_goal_model(providers, coordinator)
 
         history_text = "\n".join(f"{i + 1}. {r}" for i, r in enumerate(recent_reasons))
         user_prompt = (
@@ -1079,9 +1181,16 @@ class StreamingOrchestrator:
         # explicit `extended_thinking=False` kwarg reliably opts out (mirrors
         # hooks-session-naming's identical opt-out, same file/line cited
         # above).
-        complete_kwargs: dict[str, Any] = {"extended_thinking": False}
+        #
+        # `role_config` (from the resolved model role's `ProviderPreference`,
+        # e.g. `{"reasoning_effort": "high"}`) is forwarded as complete()
+        # kwargs first -- `extended_thinking=False` is applied AFTER so it
+        # always wins regardless of what the routing matrix's per-role
+        # config carries.
+        complete_kwargs: dict[str, Any] = dict(role_config)
         if model_override:
             complete_kwargs["model"] = model_override
+        complete_kwargs["extended_thinking"] = False
         try:
             response = await provider.complete(chat_request, **complete_kwargs)
         except LLMError as e:
@@ -1202,8 +1311,12 @@ class StreamingOrchestrator:
         try:
             if not providers:
                 raise RuntimeError("no provider mounted for summary")
-            provider_name, provider = next(iter(providers.items()))
-            model_override = self._select_cheap_model(provider_name)
+            (
+                provider_name,
+                provider,
+                model_override,
+                role_config,
+            ) = await self._resolve_goal_model(providers, coordinator)
 
             system_prompt = self._GOAL_SUMMARY_SYSTEM_PROMPTS[final_state]
 
@@ -1265,9 +1378,14 @@ class StreamingOrchestrator:
             # explicitly -- see the matching comment in _judge_stall for why
             # simply not setting it is not sufficient (a session-level
             # provider config can force thinking on regardless).
-            complete_kwargs: dict[str, Any] = {"extended_thinking": False}
+            #
+            # `role_config` forwarded first, extended_thinking=False applied
+            # after so it always wins (see the matching comment in
+            # _judge_stall / _resolve_goal_model).
+            complete_kwargs: dict[str, Any] = dict(role_config)
             if model_override:
                 complete_kwargs["model"] = model_override
+            complete_kwargs["extended_thinking"] = False
             response = await provider.complete(chat_request, **complete_kwargs)
             summary_text = ""
             for block in response.content:
@@ -1322,9 +1440,12 @@ class StreamingOrchestrator:
 
         if not providers:
             raise RuntimeError("no provider mounted for evaluation")
-        provider_name, provider = next(iter(providers.items()))
-
-        model_override = self._select_cheap_model(provider_name)
+        (
+            provider_name,
+            provider,
+            model_override,
+            role_config,
+        ) = await self._resolve_goal_model(providers, coordinator)
 
         user_prompt = (
             f"GOAL CONDITION:\n{condition}\n\n"
@@ -1380,9 +1501,14 @@ class StreamingOrchestrator:
         # config can force thinking on regardless). This is the exact call
         # confirmed (via real-session telemetry) to have run with thinking
         # enabled and a 32000-token budget in session e97e192b.
-        complete_kwargs: dict[str, Any] = {"extended_thinking": False}
+        #
+        # `role_config` forwarded first, extended_thinking=False applied
+        # after so it always wins (see the matching comment in
+        # _judge_stall / _resolve_goal_model).
+        complete_kwargs: dict[str, Any] = dict(role_config)
         if model_override:
             complete_kwargs["model"] = model_override
+        complete_kwargs["extended_thinking"] = False
         try:
             response = await provider.complete(chat_request, **complete_kwargs)
         except LLMError as e:

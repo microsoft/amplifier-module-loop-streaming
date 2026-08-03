@@ -24,6 +24,7 @@ from typing import Any, ClassVar
 
 import pytest
 from amplifier_core import ToolResult
+from amplifier_foundation import ProviderPreference
 
 # ---------------------------------------------------------------------------
 # Shared stubs -- minimal, self-contained (pattern mirrors tests/test_steering.py)
@@ -101,14 +102,25 @@ class MockCoordinator:
     """Duck-typed coordinator stub carrying `session_state` (the real
     RustCoordinator has this; the test_steering.py stub predates goal
     support and lacks it -- see that file's pre-existing unrelated
-    failures)."""
+    failures).
 
-    def __init__(self) -> None:
+    Also carries a `get_capability` lookup (real coordinators expose this;
+    see `_resolve_goal_model`'s `model_role_resolver` lookup) backed by a
+    plain dict -- defaults to no capabilities registered (i.e. every
+    `get_capability` call returns None), matching a session with no
+    routing bundle installed.
+    """
+
+    def __init__(self, capabilities: dict[str, Any] | None = None) -> None:
         self.cancellation = MockCancellation()
         self.session_state: dict[str, Any] = {}
+        self._capabilities: dict[str, Any] = capabilities or {}
 
     async def process_hook_result(self, result, *args, **kwargs):
         return result
+
+    def get_capability(self, name: str) -> Any:
+        return self._capabilities.get(name)
 
 
 class MockToolCall:
@@ -238,6 +250,33 @@ class FakeProvider:
 
     def parse_tool_calls(self, response):
         return getattr(response, "_intended_tool_calls", [])
+
+
+class FakeModelRoleResolver:
+    """Test double for the ``model_role_resolver`` coordinator capability
+    (contract: ``async def resolve(model_role: str | list[str]) ->
+    list[ProviderPreference]``, per amplifier_module_hooks_routing's
+    ``MatrixModelRoleResolver`` and tool-delegate's consumption of the same
+    capability). Registered on a ``MockCoordinator`` via its
+    ``capabilities={"model_role_resolver": ...}`` constructor arg.
+
+    ``resolve_calls`` records every ``model_role`` argument passed in, so
+    tests can assert the resolver is only consulted once per run (caching)
+    and that it's asked for the configured ``goal_model_role``.
+    """
+
+    def __init__(
+        self,
+        preferences: list[ProviderPreference] | None = None,
+        name: str = "fake-matrix",
+    ) -> None:
+        self.preferences = preferences if preferences is not None else []
+        self.name = name
+        self.resolve_calls: list[str | list[str]] = []
+
+    async def resolve(self, model_role: str | list[str]) -> list[ProviderPreference]:
+        self.resolve_calls.append(model_role)
+        return list(self.preferences)
 
 
 def _make_orchestrator(config: dict | None = None):
@@ -889,7 +928,7 @@ class TestStallRearmsAfterEscalation:
 @pytest.mark.asyncio
 class TestCheapModelKwargPropagation:
     async def test_evaluator_judge_and_summary_pass_model_kwarg(self) -> None:
-        """DEFECT 2 root cause: `_select_cheap_model`'s result was set on
+        """DEFECT 2 root cause: the resolved model was set on
         `ChatRequest.model` but never passed as a `model=` kwarg to
         `provider.complete()`. The actually-installed Anthropic provider's
         `complete()` / `_complete_chat_request()` reads the effective model
@@ -898,6 +937,12 @@ class TestCheapModelKwargPropagation:
         evaluator/stall-judge/summary call ran on the session's default
         (expensive) model. Asserts the kwarg is now present for all three
         call kinds.
+
+        Model selection now goes through the `model_role_resolver`
+        coordinator capability (see `_resolve_goal_model`) rather than the
+        deleted hardcoded hint table -- this test registers a
+        `FakeModelRoleResolver` that resolves the configured `fast` role to
+        a concrete model, exactly as a real routing bundle would.
 
         The run ends "stalled" rather than "achieved" so that a summary
         call actually happens: `achieved` never generates a summary at all
@@ -908,7 +953,12 @@ class TestCheapModelKwargPropagation:
         orch = _make_orchestrator({"goal_stall_threshold": 1})
         ctx = MockContext()
         hooks = MockHooks()
-        coordinator = MockCoordinator()
+        resolver = FakeModelRoleResolver(
+            preferences=[
+                ProviderPreference(provider="main-anthropic", model="claude-haiku-4-5")
+            ]
+        )
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
         provider = FakeProvider()
 
         goal_dict = {
@@ -940,8 +990,6 @@ class TestCheapModelKwargPropagation:
             ]
         )
 
-        # Provider name contains "anthropic" so _select_cheap_model resolves
-        # to the hint-table entry "claude-haiku-4-5".
         await orch.execute(
             prompt="solve it",
             context=ctx,
@@ -964,6 +1012,308 @@ class TestCheapModelKwargPropagation:
             "claude-haiku-4-5",
         ]
         assert provider.summary_call_models == ["claude-haiku-4-5"]
+
+
+# ---------------------------------------------------------------------------
+# 7b. Model-role routing: goal-loop LLM calls must go through the
+#     `model_role_resolver` coordinator capability, not a hardcoded
+#     substring hint table.
+#
+# Root cause: `_select_cheap_model` picked a model from a hardcoded
+# provider-name substring table, ignoring the user's configured routing
+# matrix entirely -- even though `hooks-routing` registers a
+# `model_role_resolver` capability (contract: `async def
+# resolve(model_role) -> list[ProviderPreference]`) that IS reachable from
+# here. `_resolve_goal_model` now looks that capability up lazily (hooks
+# mount after the orchestrator), resolves `self.goal_model_role` (default
+# "fast"), and calls whichever provider INSTANCE the resolved preference
+# names -- which may differ from the session's default provider.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestModelRoleResolution:
+    async def test_resolver_present_all_three_call_kinds_use_resolved_model(
+        self,
+    ) -> None:
+        """When a `model_role_resolver` is registered, the evaluator, stall
+        judge, and summary calls all use its resolved model -- never a
+        hardcoded name (there is no longer a hint table to fall back to)."""
+        orch = _make_orchestrator({"goal_stall_threshold": 1})
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(
+            preferences=[ProviderPreference(provider="main", model="routed-fast-model")]
+        )
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        provider.turn_queue.append(MockTurnResponse(text="t0"))
+        provider.turn_queue.append(MockTurnResponse(text="A"))
+        provider.turn_queue.append(MockTurnResponse(text="escalation-turn"))
+        provider.eval_queue.extend(
+            [(False, "blocked"), (False, "blocked"), (False, "blocked")]
+        )
+        provider.judge_queue.extend(
+            [(True, "same blocker, escalate"), (True, "still blocked")]
+        )
+
+        await orch.execute(
+            prompt="solve it",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        assert provider.eval_call_models == ["routed-fast-model"] * 3
+        assert provider.judge_call_models == ["routed-fast-model"] * 2
+        assert provider.summary_call_models == ["routed-fast-model"]
+
+    async def test_resolver_names_a_different_provider_that_provider_is_called(
+        self,
+    ) -> None:
+        """The matrix's resolved role may point at an installed provider
+        other than the session default -- e.g. `fast` routes to an OpenAI
+        provider while the main conversation runs on Anthropic. Calling the
+        WRONG provider instance with a model name from a DIFFERENT provider
+        is a real failure mode this must avoid: only the resolved
+        provider's `complete()` must be invoked.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(
+            preferences=[ProviderPreference(provider="openai-secondary", model="gpt-5-mini")]
+        )
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+
+        anthropic_provider = FakeProvider()
+        openai_provider = FakeProvider()
+        anthropic_provider.eval_queue.append((True, "n/a"))  # must never be consulted
+        openai_provider.eval_queue.append((True, "resolved via the other provider"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        satisfied, reason = await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"anthropic-main": anthropic_provider, "openai-secondary": openai_provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert satisfied is True
+        assert reason == "resolved via the other provider"
+        # The resolved (non-default) provider was called with its own model.
+        assert openai_provider.eval_call_models == ["gpt-5-mini"]
+        # The session-default provider was never touched.
+        assert anthropic_provider.eval_call_requests == []
+        assert anthropic_provider.eval_queue == [(True, "n/a")]  # untouched, unconsumed
+
+    async def test_no_resolver_registered_warns_and_falls_back(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No routing bundle installed at all: `coordinator.get_capability`
+        returns None. Must log a WARNING naming the specific cause and fall
+        back to the session's default provider/model (no model override) --
+        the run must still complete rather than erroring out.
+        """
+        import logging
+
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no capabilities registered at all
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "solved anyway"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        with caplog.at_level(logging.WARNING):
+            satisfied, reason = await orch._evaluate_goal(
+                "the thing is done",
+                ctx,
+                {"main": provider},
+                hooks,  # type: ignore[arg-type]
+                coordinator,  # type: ignore[arg-type]
+            )
+
+        assert satisfied is True
+        assert reason == "solved anyway"
+        # Falls back to the session default provider, no model override.
+        assert provider.eval_call_models == [None]
+        assert any(
+            "no model_role_resolver capability is registered" in r.message
+            for r in caplog.records
+        )
+
+    async def test_resolver_returns_empty_warns_distinctly_and_falls_back(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A resolver IS registered but resolves the configured role to no
+        candidates (e.g. no installed provider serves it). This must log a
+        WARNING with a message DISTINCT from the no-resolver-registered
+        case, and still fall back to the session default so the run
+        completes.
+        """
+        import logging
+
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(preferences=[])  # resolves to []
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "solved anyway"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        with caplog.at_level(logging.WARNING):
+            satisfied, reason = await orch._evaluate_goal(
+                "the thing is done",
+                ctx,
+                {"main": provider},
+                hooks,  # type: ignore[arg-type]
+                coordinator,  # type: ignore[arg-type]
+            )
+
+        assert satisfied is True
+        assert reason == "solved anyway"
+        assert provider.eval_call_models == [None]
+        no_candidates_messages = [
+            r.message for r in caplog.records if "resolved to no candidates" in r.message
+        ]
+        assert no_candidates_messages
+        # Distinct from the no-resolver-registered message.
+        assert not any(
+            "no model_role_resolver capability is registered" in m
+            for m in no_candidates_messages
+        )
+
+    async def test_resolution_is_cached_across_a_multi_turn_run(self) -> None:
+        """`resolver.resolve()` performs a live `provider.list_models()`
+        round-trip whenever the matrix entry is a glob, and the evaluator
+        runs every turn -- resolution must be cached for the lifetime of
+        one `execute()` call, not repeated per turn.
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(
+            preferences=[ProviderPreference(provider="main", model="routed-fast-model")]
+        )
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+        provider = FakeProvider()
+
+        goal_dict = {
+            "condition": "the file exists",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for _ in range(3):
+            provider.turn_queue.append(MockTurnResponse(text="working"))
+        provider.eval_queue.extend(
+            [
+                (False, "not yet"),
+                (False, "still not yet"),
+                (True, "done now"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="create the file",
+            context=ctx,
+            providers={"main": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        # Three evaluator calls happened (one per turn)...
+        assert provider.eval_call_models == ["routed-fast-model"] * 3
+        # ...but the resolver itself was only ever consulted once.
+        assert resolver.resolve_calls == ["fast"]
+
+    async def test_pref_config_forwarded_as_kwargs_extended_thinking_wins(
+        self,
+    ) -> None:
+        """A resolved role's `ProviderPreference.config` (e.g.
+        `{"reasoning_effort": "high"}`) must be forwarded as `complete()`
+        kwargs -- this is how the delegate path applies per-role config.
+        `extended_thinking=False` must still win even when the role's own
+        config tries to turn it on (DEFECT 4 invariant).
+        """
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(
+            preferences=[
+                ProviderPreference(
+                    provider="main",
+                    model="routed-fast-model",
+                    config={"reasoning_effort": "high", "extended_thinking": True},
+                )
+            ]
+        )
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "looks satisfied"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        kwargs = provider.eval_call_kwargs[0]
+        assert kwargs.get("reasoning_effort") == "high"
+        # extended_thinking=False always wins, even though the role's own
+        # config tried to set it True.
+        assert kwargs.get("extended_thinking") is False
+        assert kwargs.get("model") == "routed-fast-model"
+
+    async def test_goal_model_role_config_knob_changes_requested_role(self) -> None:
+        """The `goal_model_role` config knob (default "fast") controls
+        which role name is requested from the resolver."""
+        orch = _make_orchestrator({"goal_model_role": "quality"})
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(
+            preferences=[ProviderPreference(provider="main", model="quality-model")]
+        )
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "looks satisfied"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert resolver.resolve_calls == ["quality"]
+        assert provider.eval_call_models == ["quality-model"]
 
 
 # ---------------------------------------------------------------------------

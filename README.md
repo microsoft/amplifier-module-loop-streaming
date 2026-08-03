@@ -43,9 +43,19 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 module = "loop-streaming"
 name = "streaming"
 config = {
-    buffer_size = 10,           # Tokens to buffer before flush
-    max_iterations = -1,        # Maximum iterations (-1 = unlimited, default)
-    timeout = 300               # Timeout in seconds
+    max_iterations = -1,             # Maximum iterations (-1 = unlimited, default)
+    goal_stall_threshold = 3,        # /goal: consecutive no-tool continuation turns
+                                      # before the stall judge is consulted
+    goal_model_role = "fast",        # /goal: routing-matrix model role requested for
+                                      # the evaluator/stall-judge/summary calls, via
+                                      # the model_role_resolver coordinator capability
+    stream_delay = 0.0,              # Per-token artificial delay (seconds), for
+                                      # human-facing typing animation (0.0 = off)
+    extended_thinking = false,       # Enable extended thinking on the main
+                                      # conversational turns (not the /goal internal
+                                      # calls, which always disable it)
+    min_delay_between_calls_ms = 0,  # Minimum delay between provider calls (rate
+                                      # limiting; 0 = disabled)
 }
 ```
 
