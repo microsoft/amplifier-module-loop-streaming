@@ -91,17 +91,78 @@ def _build_tool_spec(tool: Any) -> ToolSpec:
     )
 
 
-def _flatten_message_for_evaluator(msg: dict) -> str:
+# --- Evaluator input hygiene defaults (see _flatten_message_for_evaluator,
+# StreamingOrchestrator._evaluate_goal) ---
+#
+# Before this, the evaluator's transcript had exactly one bound: the
+# 40-message window (`_GOAL_MAX_TRANSCRIPT_MESSAGES`). A single large tool
+# result (file read, log dump) inside those 40 messages shipped to the
+# evaluator IN FULL, once per turn -- a cost problem and a signal-burial
+# problem. These module-level defaults back the `self.goal_*` config knobs
+# read in `StreamingOrchestrator.__init__` (same override pattern as
+# `goal_stall_threshold`).
+#
+# Per-tool-result / tool-call-argument clip, in characters. 2000 chars
+# (~500 tokens) is generous for a typical tool result while bounding the
+# worst case (a multi-MB file dump) to a fixed, cheap-to-evaluate size.
+_GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS = 2000
+
+
+def _clip_head_tail(text: str, limit: int) -> str:
+    """Clip ``text`` to roughly ``limit`` chars, keeping BOTH the head and
+    the tail with a marker naming how much was dropped in between.
+
+    Head+tail, not head-only: verdict-bearing detail in tool output
+    commonly sits at BOTH ends -- the command/args echo at the head, the
+    exit status or summary line at the tail. A naive head-only clip loses
+    exactly the part that usually decides the verdict.
+
+    ``limit <= 0`` disables clipping entirely (returns ``text`` unchanged).
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    # First-pass estimate of the marker's own size (using the naive
+    # dropped-char count) so it can be subtracted from `limit` before
+    # splitting head/tail. The exact dropped count is recomputed below from
+    # the actual split chosen, so this estimate only affects how much of
+    # `limit` the marker itself consumes -- not correctness.
+    estimated_marker = f"\n...[{len(text) - limit} chars truncated]...\n"
+    keep = limit - len(estimated_marker)
+    if keep < 20:
+        # `limit` too tight for a head+tail split plus a marker -- fall
+        # back to a hard cut rather than producing a nonsensical clip.
+        return text[:limit]
+    head_len = keep // 2
+    tail_len = keep - head_len
+    dropped = len(text) - head_len - tail_len
+    marker = f"\n...[{dropped} chars truncated]...\n"
+    return text[:head_len] + marker + text[-tail_len:]
+
+
+def _flatten_message_for_evaluator(
+    msg: dict, tool_content_clip_chars: int = _GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS
+) -> str:
     """Render one stored (dict) message as plain text for the goal evaluator.
 
-    Ported verbatim from amplifier-app-cli's `_flatten_message_for_evaluator`
-    (see docs/designs/goal-command.md). Kept as a module-level function since
-    it needs no orchestrator state.
+    Ported (with input-hygiene added -- see below) from amplifier-app-cli's
+    `_flatten_message_for_evaluator` (see docs/designs/goal-command.md).
+    Kept as a module-level function -- ``tool_content_clip_chars`` is a
+    plain parameter, not orchestrator state, so the function stays pure and
+    directly testable; `_evaluate_goal` passes its configured
+    `self.goal_tool_content_clip_chars`.
+
+    Tool results and tool-call arguments remain FULLY VISIBLE to the
+    evaluator -- they are just BOUNDED. A short tool result still appears
+    verbatim; an overlong one appears head+tail clipped (see
+    `_clip_head_tail`) with an explicit marker naming what was dropped, so
+    the evaluator knows it's looking at a clip, not the whole story.
     """
     role = msg.get("role", "unknown")
     content = msg.get("content", "")
     if isinstance(content, str):
         text = content
+        if role == "tool":
+            text = _clip_head_tail(text, tool_content_clip_chars)
     elif isinstance(content, list):
         parts = []
         for block in content:
@@ -111,7 +172,20 @@ def _flatten_message_for_evaluator(msg: dict) -> str:
             if btype == "text":
                 parts.append(block.get("text", ""))
             elif btype == "tool_call":
-                parts.append(f"[called tool: {block.get('name', '?')}]")
+                name = block.get("name", "?")
+                # `input` is the tool-call-argument dict per ToolCallBlock's
+                # schema (amplifier_core.message_models). Previously
+                # dropped entirely -- the evaluator could see WHICH tool ran
+                # but never WHAT it was asked to do. Clipped for the same
+                # cost-bound reason as tool results above.
+                args = block.get("input")
+                if args:
+                    args_text = _clip_head_tail(
+                        json.dumps(args, default=str), tool_content_clip_chars
+                    )
+                    parts.append(f"[called tool: {name} args: {args_text}]")
+                else:
+                    parts.append(f"[called tool: {name}]")
             elif btype == "tool_result":
                 parts.append("[tool result omitted]")
             # thinking/redacted_thinking/reasoning blocks are intentionally
@@ -245,6 +319,14 @@ class StreamingOrchestrator:
         "CONDITION and a transcript of an assistant's work so far in a "
         "coding/agent session. Decide whether the GOAL CONDITION has been "
         "satisfied by that work.\n\n"
+        "What you can and cannot see: tool results and tool-call arguments "
+        "are shown to you, but each is bounded in size -- an overlong one "
+        "is clipped and marked with '...[N chars truncated]...' showing "
+        "exactly how much was cut. Very old turns may be dropped entirely "
+        "if the transcript is marked truncated. When content is marked "
+        "clipped or the transcript is marked truncated, say so plainly in "
+        "your reasoning rather than inferring or guessing at what the "
+        "elided content contained.\n\n"
         "Respond with EXACTLY two lines and nothing else:\n"
         "Line 1: the single word YES or NO (verbatim, nothing else)\n"
         "Line 2: one sentence explaining why\n"
@@ -264,6 +346,16 @@ class StreamingOrchestrator:
     # `model_role_resolver` consumption.
 
     _GOAL_MAX_TRANSCRIPT_MESSAGES = 40
+
+    # Total transcript character budget: a backstop ABOVE the per-message
+    # clip (`_GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS`) and the message-count
+    # window above. Applied NEWEST-FIRST in `_evaluate_goal` so that when
+    # the budget binds, the most recent (most verdict-relevant) turns
+    # survive and older messages within the window are what gets dropped.
+    # 20000 chars (~5000 tokens) keeps the evaluator call cheap even in the
+    # worst case of all 40 messages sitting at the per-message clip ceiling
+    # (40 * 2000 = 80000 chars before this budget applies).
+    _GOAL_DEFAULT_TRANSCRIPT_CHAR_BUDGET: ClassVar[int] = 20000
 
     # Stall-detection judge (see execute()'s stall-detection block). Only
     # invoked when the mechanical no-tool-turns condition already holds, so
@@ -422,6 +514,33 @@ class StreamingOrchestrator:
         # Defaults to `_DEFAULT_GOAL_PROVIDER_PREFERENCES`.
         self.goal_provider_preferences: list[dict[str, Any]] = config.get(
             "goal_provider_preferences", self._DEFAULT_GOAL_PROVIDER_PREFERENCES
+        )
+        # Evaluator input hygiene (see _flatten_message_for_evaluator,
+        # _evaluate_goal). Promoted from a bare class constant to a config
+        # knob, same override pattern as `goal_stall_threshold` above.
+        #
+        # Message-count window: how many of the most recent messages are
+        # even considered before the char-based bounds below apply.
+        self.goal_max_transcript_messages = int(
+            config.get(
+                "goal_max_transcript_messages", self._GOAL_MAX_TRANSCRIPT_MESSAGES
+            )
+        )
+        # Per-tool-result / tool-call-argument clip, in characters (see
+        # `_clip_head_tail`). `<= 0` disables clipping.
+        self.goal_tool_content_clip_chars = int(
+            config.get(
+                "goal_tool_content_clip_chars", _GOAL_DEFAULT_TOOL_CONTENT_CLIP_CHARS
+            )
+        )
+        # Total transcript character budget -- a backstop applied
+        # NEWEST-FIRST above the per-message clip and the message-count
+        # window (see `_evaluate_goal`). `<= 0` disables the budget.
+        self.goal_transcript_char_budget = int(
+            config.get(
+                "goal_transcript_char_budget",
+                self._GOAL_DEFAULT_TRANSCRIPT_CHAR_BUDGET,
+            )
         )
         # Per-execute()-call cache for `_resolve_goal_model`'s result (see
         # that method's CRITICAL PERF note) -- reset to None at the top of
@@ -1676,13 +1795,42 @@ class StreamingOrchestrator:
 
         truncated = False
         messages = all_messages
-        if len(messages) > self._GOAL_MAX_TRANSCRIPT_MESSAGES:
-            messages = messages[-self._GOAL_MAX_TRANSCRIPT_MESSAGES :]
+        if len(messages) > self.goal_max_transcript_messages:
+            messages = messages[-self.goal_max_transcript_messages :]
             truncated = True
 
-        transcript_text = "\n\n".join(
-            t for t in (_flatten_message_for_evaluator(m) for m in messages) if t
-        )
+        flattened = [
+            t
+            for t in (
+                _flatten_message_for_evaluator(m, self.goal_tool_content_clip_chars)
+                for m in messages
+            )
+            if t
+        ]
+
+        # Total transcript character budget: a backstop ABOVE the
+        # per-message clip and the message-count window above. Walked
+        # NEWEST-FIRST so that when the budget binds, the most recent
+        # (most verdict-relevant) turns survive and OLDER messages within
+        # the window are what gets dropped -- then restored to
+        # chronological order for the final prompt. The newest message is
+        # always kept even if it alone exceeds the budget, so the
+        # evaluator is never handed an empty transcript.
+        budget = self.goal_transcript_char_budget
+        if budget > 0 and flattened:
+            kept_reversed: list[str] = []
+            used = 0
+            for text in reversed(flattened):
+                # "\n\n".join cost: 2 extra chars per joiner once >1 kept.
+                cost = len(text) + (2 if kept_reversed else 0)
+                if used + cost > budget and kept_reversed:
+                    truncated = True
+                    break
+                kept_reversed.append(text)
+                used += cost
+            flattened = list(reversed(kept_reversed))
+
+        transcript_text = "\n\n".join(flattened)
 
         if not providers:
             raise RuntimeError("no provider mounted for evaluation")

@@ -2543,23 +2543,27 @@ class TestFlattenMessageForEvaluator:
     def test_tool_role_message_as_this_orchestrator_writes_it_is_fully_visible(
         self,
     ) -> None:
-        """CRUX TEST -- pins that tool results DO reach the evaluator, in
-        full, refuting the docstring/`[tool result omitted]`-branch
-        implication that they don't.
+        """CRUX TEST (UPDATED for evaluator input hygiene) -- pins that tool
+        results DO reach the evaluator, refuting the docstring/`[tool
+        result omitted]`-branch implication that they don't.
 
         This orchestrator's own tool-result write sites (__init__.py
         :2416-2424 normal path, :2366-2374 graceful cancel, :2313-2321
         immediate cancel) all write `role="tool"` messages with a PLAIN
         STRING `content` -- never a `{"type": "tool_result", ...}` content
-        block. A plain string hits `isinstance(content, str)` (line 103),
-        not the `type == "tool_result"` block branch (line 115), so the
-        `[tool result omitted]` placeholder is never substituted: the tool
-        result text is emitted VERBATIM AND IN FULL to the evaluator.
+        block. A plain string hits `isinstance(content, str)`, not the
+        `type == "tool_result"` block branch, so the `[tool result
+        omitted]` placeholder is never substituted.
 
-        CONFIRMED (not refuted): tool results reach the evaluator in full.
-        The `type == "tool_result"` block-handling branch is dead code on
-        this orchestrator's own message-writing path (see the sibling test
-        `test_tool_result_content_block_form_renders_omitted_placeholder`
+        POST-HYGIENE: tool results remain VISIBLE, but are now BOUNDED --
+        a short result (well under `tool_content_clip_chars`, as here)
+        still renders VERBATIM AND IN FULL, unclipped. See the sibling
+        test `test_overlong_tool_result_is_head_tail_clipped_with_marker`
+        below for the overlong case, which is clipped rather than dropped.
+
+        The `type == "tool_result"` block-handling branch remains dead code
+        on this orchestrator's own message-writing path (see the sibling
+        test `test_tool_result_content_block_form_renders_omitted_placeholder`
         below, which is the only way to reach it).
         """
         from amplifier_module_loop_streaming import _flatten_message_for_evaluator
@@ -2576,11 +2580,43 @@ class TestFlattenMessageForEvaluator:
             "content": tool_result_content,
         }
 
+        # Default clip (2000 chars) -- well above this short result's
+        # length, so it is untouched.
         result = _flatten_message_for_evaluator(msg)
 
         assert result == f"tool: {tool_result_content}"
-        # Explicit, not-omitted, not-truncated assertions on the marker text.
+        # Explicit, not-omitted, not-clipped assertions on the marker text.
         assert "verbatim marker 8f3c2a should survive intact" in result
+        assert "[tool result omitted]" not in result
+        assert "chars truncated" not in result
+
+    def test_overlong_tool_result_is_head_tail_clipped_with_marker(self) -> None:
+        """Evaluator input hygiene: a tool result LONGER than
+        `tool_content_clip_chars` is clipped, not dropped -- it remains
+        VISIBLE (bounded, not omitted), with BOTH the head (e.g. a command
+        echo) and the tail (e.g. an exit-status line) retained, and an
+        explicit marker naming how many characters were cut in between.
+
+        Head+tail (not head-only) because verdict-bearing detail commonly
+        sits at both ends of tool output.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        head_marker = "HEAD_MARKER_running_command_abc123"
+        tail_marker = "TAIL_MARKER_exit_status_0_success"
+        middle_filler = "x" * 5000
+        tool_result_content = f"{head_marker}{middle_filler}{tail_marker}"
+        msg = {"role": "tool", "content": tool_result_content}
+
+        result = _flatten_message_for_evaluator(msg, tool_content_clip_chars=200)
+
+        assert result.startswith("tool: ")
+        assert head_marker in result
+        assert tail_marker in result
+        assert "chars truncated" in result
+        # The clip must actually have shrunk the content -- not merely
+        # decorated the full text with a marker.
+        assert len(result) < len(f"tool: {tool_result_content}")
         assert "[tool result omitted]" not in result
 
     def test_text_content_block_extracts_text_field(self) -> None:
@@ -2593,37 +2629,72 @@ class TestFlattenMessageForEvaluator:
         }
         assert _flatten_message_for_evaluator(msg) == "assistant: here is my answer"
 
-    def test_tool_call_block_renders_name_only_arguments_are_a_blind_spot(
+    def test_tool_call_block_includes_clipped_arguments(
         self,
     ) -> None:
-        """GAP: a `type: "tool_call"` block renders only `[called tool:
-        NAME]`. The call's arguments -- present in `block["input"]` per the
-        content-block schema, and separately on the message's top-level
-        `tool_calls` key -- are never read by this function. The evaluator
-        sees WHICH tool ran but never WHAT it was asked to do.
+        """GAP CLOSED (evaluator input hygiene): a `type: "tool_call"`
+        block used to render only `[called tool: NAME]`, dropping the
+        call's arguments entirely. The evaluator could see WHICH tool ran
+        but never WHAT it was asked to do -- a plausible cause of observed
+        confabulation.
+
+        Now `block["input"]` (the tool-call-argument dict per the
+        ToolCallBlock content-block schema) IS included, JSON-rendered and
+        clipped via the same `tool_content_clip_chars` bound as tool
+        results. This test uses a short argument dict (well under the
+        default clip) so it should appear verbatim, unclipped.
         """
         from amplifier_module_loop_streaming import _flatten_message_for_evaluator
 
-        secret_argument_marker = "/tmp/only-in-arguments-should-not-leak.txt"
+        argument_marker = "/tmp/argument-marker-should-now-be-visible.txt"
         msg = {
             "role": "assistant",
             "content": [
                 {
                     "type": "tool_call",
                     "name": "write_file",
-                    "input": {"path": secret_argument_marker, "content": "..."},
+                    "input": {"path": argument_marker, "content": "..."},
                 }
-            ],
-            # Top-level tool_calls key some callers also carry -- also unread.
-            "tool_calls": [
-                {"name": "write_file", "arguments": {"path": secret_argument_marker}}
             ],
         }
 
         result = _flatten_message_for_evaluator(msg)
 
-        assert result == "assistant: [called tool: write_file]"
-        assert secret_argument_marker not in result
+        assert result.startswith("assistant: [called tool: write_file args:")
+        assert argument_marker in result
+        assert "chars truncated" not in result
+
+    def test_tool_call_block_overlong_arguments_are_clipped(self) -> None:
+        """Evaluator input hygiene: tool-call arguments longer than
+        `tool_content_clip_chars` are clipped (head+tail, with a marker),
+        not shipped in full and not dropped back to the pre-hygiene
+        name-only rendering.
+        """
+        from amplifier_module_loop_streaming import _flatten_message_for_evaluator
+
+        head_marker = "HEAD_ARG_MARKER"
+        tail_marker = "TAIL_ARG_MARKER"
+        msg = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "input": {
+                        "path": head_marker,
+                        "content": "y" * 5000,
+                        "trailer": tail_marker,
+                    },
+                }
+            ],
+        }
+
+        result = _flatten_message_for_evaluator(msg, tool_content_clip_chars=200)
+
+        assert "[called tool: write_file args:" in result
+        assert "chars truncated" in result
+        # The tool name itself is always visible even when args are clipped.
+        assert "write_file" in result
 
     def test_tool_call_block_missing_name_falls_back_to_question_mark(
         self,
@@ -2839,3 +2910,175 @@ class TestEvaluatorTranscriptTruncation:
         assert "(truncated, most recent messages shown)" not in prompt_text
         assert "message number 0" in prompt_text
         assert "message number 39" in prompt_text
+
+    async def test_transcript_char_budget_drops_oldest_messages_first(
+        self,
+    ) -> None:
+        """Evaluator input hygiene: `goal_transcript_char_budget` is a
+        backstop ABOVE the message-count window, applied NEWEST-FIRST --
+        when it binds, the OLDEST messages within the window are dropped
+        and the most recent (most verdict-relevant) ones survive.
+        """
+        orch = _make_orchestrator(
+            {
+                # Budget only large enough for the last couple of messages.
+                "goal_transcript_char_budget": 60,
+                "goal_tool_content_clip_chars": 0,  # disabled -- not exercised here
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        for i in range(10):
+            await ctx.add_message({"role": "user", "content": f"MSG_{i}_END"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" in prompt_text
+        # The newest message must survive.
+        assert "MSG_9_END" in prompt_text
+        # The oldest message must have been dropped by the char budget.
+        assert "MSG_0_END" not in prompt_text
+
+    async def test_transcript_char_budget_disabled_by_non_positive_value(
+        self,
+    ) -> None:
+        """`goal_transcript_char_budget <= 0` disables the budget entirely
+        -- sanity counterpart proving the knob is opt-in, not a silent
+        always-on truncation.
+        """
+        orch = _make_orchestrator({"goal_transcript_char_budget": 0})
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "n/a"))
+
+        for i in range(10):
+            await ctx.add_message({"role": "user", "content": f"MSG_{i}_END"})
+
+        await orch._evaluate_goal(
+            "the condition",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        request = provider.eval_call_requests[0]
+        user_message = next(m for m in request.messages if m.role == "user")
+        prompt_text = user_message.content
+
+        assert "(truncated, most recent messages shown)" not in prompt_text
+        for i in range(10):
+            assert f"MSG_{i}_END" in prompt_text
+
+
+@pytest.mark.asyncio
+class TestEvaluatorInputHygieneEndToEnd:
+    """Empirical verification (see goal-build.md item 4): a real large tool
+    result run through the ACTUAL assembly path (`_evaluate_goal`) produces
+    a bounded evaluator prompt -- not merely a unit-level clip. Compares
+    the hygiene knobs DISABLED (reproducing the pre-hygiene unbounded
+    behavior exactly, since the only prior bound was message count) against
+    the hygiene knobs at their defaults.
+    """
+
+    async def test_large_tool_result_bounded_vs_unbounded_prompt_size(
+        self,
+    ) -> None:
+        large_tool_output = (
+            "COMMAND_ECHO_START read_file /var/log/huge.log\n"
+            + ("line of log output filler content here\n" * 6000)
+            + "EXIT_STATUS_END code=0"
+        )
+
+        async def _run(config: dict) -> str:
+            orch = _make_orchestrator(config)
+            ctx = MockContext()
+            hooks = MockHooks()
+            coordinator = MockCoordinator()
+            provider = FakeProvider()
+            provider.eval_queue.append((True, "n/a"))
+
+            await ctx.add_message({"role": "user", "content": "please read the log"})
+            await ctx.add_message(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_call",
+                            "name": "read_file",
+                            "input": {"path": "/var/log/huge.log"},
+                        }
+                    ],
+                }
+            )
+            await ctx.add_message(
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "tool_call_id": "call_1",
+                    "content": large_tool_output,
+                }
+            )
+
+            await orch._evaluate_goal(
+                "the log has been read",
+                ctx,
+                {"main": provider},
+                hooks,  # type: ignore[arg-type]
+                coordinator,  # type: ignore[arg-type]
+            )
+
+            request = provider.eval_call_requests[0]
+            user_message = next(m for m in request.messages if m.role == "user")
+            return user_message.content
+
+        # BEFORE (knobs disabled -- reproduces the pre-hygiene behavior,
+        # since a 40-message window was the ONLY bound that existed):
+        before_prompt = await _run(
+            {"goal_tool_content_clip_chars": 0, "goal_transcript_char_budget": 0}
+        )
+        # AFTER (default hygiene knobs):
+        after_prompt = await _run({})
+
+        before_size = len(before_prompt)
+        after_size = len(after_prompt)
+
+        print(
+            f"\n[evaluator input hygiene] tool-result char count: "
+            f"{len(large_tool_output)}\n"
+            f"[evaluator input hygiene] BEFORE (unbounded) prompt size: "
+            f"{before_size} chars\n"
+            f"[evaluator input hygiene] AFTER (bounded) prompt size: "
+            f"{after_size} chars\n"
+        )
+
+        # The unbounded run must actually contain the full tool output --
+        # otherwise this isn't a fair "before" baseline.
+        assert large_tool_output in before_prompt
+        # The bounded run must be dramatically smaller.
+        assert after_size < before_size
+        assert after_size < 5000
+        # But NOT empty / NOT silently dropped -- the clip marker and both
+        # ends of the tool output must still be visible (visibility, not
+        # omission).
+        assert "chars truncated" in after_prompt
+        assert "COMMAND_ECHO_START read_file /var/log/huge.log" in after_prompt
+        assert "EXIT_STATUS_END code=0" in after_prompt
+        # Tool-call arguments are now visible too.
+        assert "/var/log/huge.log" in after_prompt
