@@ -205,6 +205,18 @@ class FakeProvider:
         # response -- used to exercise _goal_summary_fallback's
         # generation-failed path.
         self.summary_should_raise: Exception | None = None
+        # `goal_provider_preferences` glob resolution support (see
+        # `_resolve_goal_pref_glob`): the model names this provider reports
+        # as available, and/or an exception to raise instead.
+        self.list_models_result: list[str] = []
+        self.list_models_error: Exception | None = None
+        self.list_models_call_count = 0
+
+    async def list_models(self) -> list[str]:
+        self.list_models_call_count += 1
+        if self.list_models_error:
+            raise self.list_models_error
+        return list(self.list_models_result)
 
     async def complete(self, chat_request, **kwargs):
         system_msg = next(
@@ -1093,7 +1105,9 @@ class TestModelRoleResolution:
         ctx = MockContext()
         hooks = MockHooks()
         resolver = FakeModelRoleResolver(
-            preferences=[ProviderPreference(provider="openai-secondary", model="gpt-5-mini")]
+            preferences=[
+                ProviderPreference(provider="openai-secondary", model="gpt-5-mini")
+            ]
         )
         coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
 
@@ -1191,7 +1205,9 @@ class TestModelRoleResolution:
         assert reason == "solved anyway"
         assert provider.eval_call_models == [None]
         no_candidates_messages = [
-            r.message for r in caplog.records if "resolved to no candidates" in r.message
+            r.message
+            for r in caplog.records
+            if "resolved to no candidates" in r.message
         ]
         assert no_candidates_messages
         # Distinct from the no-resolver-registered message.
@@ -1314,6 +1330,363 @@ class TestModelRoleResolution:
 
         assert resolver.resolve_calls == ["quality"]
         assert provider.eval_call_models == ["quality-model"]
+
+
+# ---------------------------------------------------------------------------
+# 7c. goal_provider_preferences: cost-regression fix. When model_role
+#     routing doesn't yield a usable provider (no routing bundle installed,
+#     empty resolution, or unmounted provider), the previous behavior fell
+#     straight through to the session's DEFAULT (expensive, conversational)
+#     provider/model -- a cost regression relative to the hardcoded
+#     cheap-model table this replaced. `goal_provider_preferences` is an
+#     ordered fallback list, consulted only in that gap, resolved with the
+#     same natural-sort glob ranking the routing matrix itself uses.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGoalProviderPreferencesFallback:
+    async def test_resolver_present_and_resolving_role_wins_preferences_not_consulted(
+        self,
+    ) -> None:
+        """When the role resolver yields a usable provider, the
+        `goal_provider_preferences` list is never even consulted -- the
+        preference-matching provider's `list_models()` is never called."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "anthropic", "model": "claude-haiku-*"}
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(
+            preferences=[ProviderPreference(provider="main", model="routed-model")]
+        )
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+        main_provider = FakeProvider()
+        main_provider.eval_queue.append((True, "role resolved this"))
+        # Also mount a provider that WOULD match the preference entry, to
+        # prove it is never touched when the role resolver already won.
+        anthropic_provider = FakeProvider()
+        anthropic_provider.list_models_result = ["claude-haiku-4-5"]
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        satisfied, reason = await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"main": main_provider, "anthropic": anthropic_provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert satisfied is True
+        assert reason == "role resolved this"
+        assert main_provider.eval_call_models == ["routed-model"]
+        # Preference-matching provider was never even queried for its
+        # model list -- proves the preference list was not consulted.
+        assert anthropic_provider.list_models_call_count == 0
+        assert anthropic_provider.eval_call_requests == []
+
+    async def test_no_resolver_registered_preference_list_used_not_session_default(
+        self,
+    ) -> None:
+        """No routing bundle installed at all (no resolver registered):
+        the evaluator call must use the configured preference's resolved
+        model, NOT the session default provider/model."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "anthropic", "model": "claude-haiku-*"}
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no capabilities registered at all
+        provider = FakeProvider()
+        provider.list_models_result = ["claude-haiku-4-5"]
+        provider.eval_queue.append((True, "solved via preference"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        satisfied, reason = await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"anthropic": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert satisfied is True
+        assert reason == "solved via preference"
+        assert provider.eval_call_models == ["claude-haiku-4-5"]
+
+    async def test_resolver_returns_empty_preference_list_used(self) -> None:
+        """A resolver IS registered but resolves to no candidates -- same
+        as the no-resolver case, the preference list must be used."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "anthropic", "model": "claude-haiku-*"}
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        resolver = FakeModelRoleResolver(preferences=[])
+        coordinator = MockCoordinator(capabilities={"model_role_resolver": resolver})
+        provider = FakeProvider()
+        provider.list_models_result = ["claude-haiku-4-5"]
+        provider.eval_queue.append((True, "solved via preference"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        satisfied, _reason = await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"anthropic": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert satisfied is True
+        assert provider.eval_call_models == ["claude-haiku-4-5"]
+
+    async def test_first_preference_provider_not_mounted_advances_to_next(
+        self,
+    ) -> None:
+        """A preference entry whose provider isn't mounted for this session
+        is skipped -- resolution advances to the next entry in the list."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "openai", "model": "gpt-5-mini"},
+                    {"provider": "anthropic", "model": "claude-haiku-*"},
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no resolver
+        provider = FakeProvider()
+        provider.list_models_result = ["claude-haiku-4-5"]
+        provider.eval_queue.append((True, "solved via second preference"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        # Only "anthropic" is mounted -- "openai" (first preference) is not.
+        satisfied, _reason = await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"anthropic": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert satisfied is True
+        assert provider.eval_call_models == ["claude-haiku-4-5"]
+
+    async def test_glob_matching_nothing_advances_to_next_preference(self) -> None:
+        """A preference glob that matches nothing in the provider's
+        `list_models()` result is skipped -- resolution advances to the
+        next entry, and the raw glob is never sent to the provider."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "anthropic", "model": "claude-opus-*"},
+                    {"provider": "anthropic", "model": "claude-haiku-*"},
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no resolver
+        provider = FakeProvider()
+        # No opus models available -- first preference's glob matches
+        # nothing; second preference's glob matches.
+        provider.list_models_result = ["claude-haiku-4-5", "claude-sonnet-4-5"]
+        provider.eval_queue.append((True, "solved via second glob"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        satisfied, _reason = await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"anthropic": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert satisfied is True
+        # Never the raw, unresolved "claude-opus-*" glob.
+        assert provider.eval_call_models == ["claude-haiku-4-5"]
+
+    async def test_ranking_parity_clean_alias_beats_dated_snapshot(self) -> None:
+        """Pins the deliberate divergence from
+        `amplifier_foundation.spawn_utils.resolve_model_pattern`'s bare
+        lexicographic `sort(reverse=True)`: given a clean alias alongside
+        date-stamped snapshots, the clean alias must win -- lexicographic
+        sort would instead pick a snapshot (a fixed string date sorts
+        higher than the bare alias)."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "anthropic", "model": "claude-haiku-*"}
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no resolver
+        provider = FakeProvider()
+        provider.list_models_result = [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5-20250101",
+        ]
+        provider.eval_queue.append((True, "resolved to clean alias"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"anthropic": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert provider.eval_call_models == ["claude-haiku-4-5"]
+
+    async def test_ranking_parity_multi_digit_version_sorts_numerically(
+        self,
+    ) -> None:
+        """Pins the second documented lexicographic-sort defect: multi-digit
+        version segments must compare as integers, so
+        `claude-opus-4-10` outranks `claude-opus-4-7` (a plain string sort
+        would rank `4-7` above `4-10` because `'7' > '1'`)."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "anthropic", "model": "claude-opus-4-*"}
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no resolver
+        provider = FakeProvider()
+        provider.list_models_result = ["claude-opus-4-7", "claude-opus-4-10"]
+        provider.eval_queue.append((True, "resolved to highest version"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"anthropic": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert provider.eval_call_models == ["claude-opus-4-10"]
+
+    async def test_nothing_resolves_anywhere_warns_and_uses_session_default(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No resolver, and no `goal_provider_preferences` entry resolves
+        either (provider not mounted): falls all the way back to the
+        session default with a WARNING, and the run still completes."""
+        import logging
+
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "openai", "model": "gpt-5-mini"}
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no resolver
+        provider = FakeProvider()  # mounted as "main" -- never matches "openai"
+        provider.eval_queue.append((True, "session default used"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+
+        with caplog.at_level(logging.WARNING):
+            satisfied, reason = await orch._evaluate_goal(
+                "the thing is done",
+                ctx,
+                {"main": provider},
+                hooks,  # type: ignore[arg-type]
+                coordinator,  # type: ignore[arg-type]
+            )
+
+        assert satisfied is True
+        assert reason == "session default used"
+        # Falls back to the session default provider, no model override.
+        assert provider.eval_call_models == [None]
+        assert any(
+            "no goal_provider_preferences entry resolved either" in r.message
+            for r in caplog.records
+        )
+
+    async def test_caching_holds_for_preference_resolution_across_multi_turn_run(
+        self,
+    ) -> None:
+        """`_resolve_goal_pref_glob` performs a live `provider.list_models()`
+        round-trip -- resolution via the preference-list fallback must
+        still be cached for the lifetime of one `execute()` call, exactly
+        like role-resolver resolution, not repeated on every turn."""
+        orch = _make_orchestrator(
+            {
+                "goal_provider_preferences": [
+                    {"provider": "anthropic", "model": "claude-haiku-*"}
+                ]
+            }
+        )
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator()  # no resolver
+        provider = FakeProvider()
+        provider.list_models_result = ["claude-haiku-4-5"]
+
+        goal_dict = {
+            "condition": "the file exists",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal_dict
+
+        for _ in range(3):
+            provider.turn_queue.append(MockTurnResponse(text="working"))
+        provider.eval_queue.extend(
+            [
+                (False, "not yet"),
+                (False, "still not yet"),
+                (True, "done now"),
+            ]
+        )
+
+        await orch.execute(
+            prompt="create the file",
+            context=ctx,
+            providers={"anthropic": provider},
+            tools={},
+            hooks=hooks,  # type: ignore[arg-type]
+            coordinator=coordinator,  # type: ignore[arg-type]
+        )
+
+        # Three evaluator calls happened (one per turn)...
+        assert provider.eval_call_models == ["claude-haiku-4-5"] * 3
+        # ...but `list_models()` (the expensive glob-resolution round-trip)
+        # was only ever called once.
+        assert provider.list_models_call_count == 1
 
 
 # ---------------------------------------------------------------------------
