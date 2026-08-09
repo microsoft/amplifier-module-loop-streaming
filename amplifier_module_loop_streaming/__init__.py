@@ -2424,10 +2424,14 @@ class StreamingOrchestrator:
                         )
                     else:
                         # Fall back to new message if last message isn't a tool result
+                        # metadata.ephemeral marks this as regenerated-per-turn content
+                        # so the provider never places a prompt-cache breakpoint on it
+                        # (see amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
                         message_dicts.append(
                             {
                                 "role": result.context_injection_role,
                                 "content": result.context_injection,
+                                "metadata": {"ephemeral": True},
                             }
                         )
                         logger.debug(
@@ -2436,10 +2440,14 @@ class StreamingOrchestrator:
                         )
                 else:
                     # Default behavior: append as new message
+                    # metadata.ephemeral marks this as regenerated-per-turn content
+                    # so the provider never places a prompt-cache breakpoint on it
+                    # (see amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
                     message_dicts.append(
                         {
                             "role": result.context_injection_role,
                             "content": result.context_injection,
+                            "metadata": {"ephemeral": True},
                         }
                     )
 
@@ -2461,18 +2469,31 @@ class StreamingOrchestrator:
                                 "Applied pending ephemeral injection to last tool result"
                             )
                         else:
+                            # metadata.ephemeral marks this as regenerated-per-turn
+                            # content so the provider never places a prompt-cache
+                            # breakpoint on it (see
+                            # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
                             message_dicts.append(
                                 {
                                     "role": injection["role"],
                                     "content": injection["content"],
+                                    "metadata": {"ephemeral": True},
                                 }
                             )
                             logger.debug(
                                 "Last message not a tool result, created new message for injection"
                             )
                     else:
+                        # metadata.ephemeral marks this as regenerated-per-turn
+                        # content so the provider never places a prompt-cache
+                        # breakpoint on it (see
+                        # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
                         message_dicts.append(
-                            {"role": injection["role"], "content": injection["content"]}
+                            {
+                                "role": injection["role"],
+                                "content": injection["content"],
+                                "metadata": {"ephemeral": True},
+                            }
                         )
                         logger.debug(
                             "Applied pending ephemeral injection as new message"
