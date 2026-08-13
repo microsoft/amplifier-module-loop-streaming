@@ -25,6 +25,7 @@ from amplifier_core.events import (
     PROMPT_SUBMIT,
     PROVIDER_ERROR,
     PROVIDER_REQUEST,
+    PROVIDER_RESOLVE,
     TOOL_ERROR,
     TOOL_POST,
     TOOL_PRE,
@@ -278,6 +279,288 @@ async def _resolve_goal_pref_glob(pattern: str, provider: Any) -> str | None:
     return matched[0]
 
 
+class ConversationProviderPin:
+    """Coordinator capability ``conversation.provider_pin`` -- pin, unpin,
+    and read WHICH MOUNTED PROVIDER ANSWERS THE TOP-LEVEL CONVERSATION.
+
+    A caller (CLI ``/model``-style command, an app UI, a hook) does::
+
+        pin = coordinator.get_capability("conversation.provider_pin")
+        if pin is None:
+            ...  # this orchestrator does not support pinning -- SAY SO,
+                 # do not pretend the switch happened
+        pin.available()                 # -> ["anthropic-sonnet", "openai-gpt5"]
+        pin.pin("anthropic-sonnet")     # -> "anthropic-sonnet"
+        pin.current()                   # -> "anthropic-sonnet"
+        pin.unpin()                     # -> "anthropic-sonnet" (the one cleared)
+        pin.current()                   # -> None
+
+    WHY A CAPABILITY AND NOT A CONFIG KEY: provider selection is
+    *orchestrator policy*. A config key that only this orchestrator reads
+    would be silently ignored by every other orchestrator -- the user would
+    be told "switched" while nothing changed. Because this is a registered
+    capability, an app can detect its ABSENCE (``get_capability`` returns
+    None) and refuse loudly instead. This module already consumes a
+    capability in the other direction (``model_role_resolver``, see
+    ``StreamingOrchestrator._resolve_goal_model``); this is the same
+    contract, provided rather than consumed.
+
+    SCOPE -- read this before using it. The name says "conversation", not
+    "session", on purpose: the pin affects ONLY the top-level conversation
+    turn (``_execute_stream`` -> ``_select_provider``). It deliberately
+    does NOT affect:
+
+    - ``model_role_resolver`` routing or any ``model_role`` lookup;
+    - the /goal loop's evaluator, stall judge, or run summarizer (those
+      resolve independently via ``_resolve_goal_model``);
+    - sub-agent spawning, or any other consumer of the mounted providers.
+
+    NOTHING IS UNMOUNTED. The pin changes *selection*, not the mounted
+    set -- every provider stays mounted and available to all of the above.
+
+    SAME VENDOR ONLY -- see :meth:`pin`. Switching *models within one
+    vendor* (anthropic-sonnet -> anthropic-haiku) is the supported case.
+    Switching *vendors* mid-conversation is refused at pin time, because
+    it can permanently wedge the session (measured, see :meth:`pin`).
+
+    FAILS LOUD IN BOTH DIRECTIONS, never silently:
+
+    - :meth:`pin` raises ``ValueError`` SYNCHRONOUSLY, at pin time, if the
+      named provider is not currently mounted -- naming what IS mounted --
+      so a caller finds out before spending a turn.
+    - :meth:`pin` likewise raises ``ValueError`` at pin time for a
+      cross-vendor switch, or when a vendor identity cannot be verified.
+    - If a pinned provider is mounted at pin time but is GONE when a turn
+      actually resolves, ``_select_provider`` raises ``RuntimeError``
+      rather than quietly reverting to priority order. A user who believes
+      they are on a specific model must never be silently served another.
+    """
+
+    def __init__(
+        self, orchestrator: "StreamingOrchestrator", coordinator: ModuleCoordinator
+    ) -> None:
+        self._orchestrator = orchestrator
+        self._coordinator = coordinator
+
+    def available(self) -> list[str]:
+        """Mount names of every provider currently mounted, sorted.
+
+        These are exactly the names :meth:`pin` accepts. Read live from the
+        coordinator's ``providers`` mount point (the kernel contract), so it
+        reflects mounts/unmounts that happened after this session started.
+        """
+        mounted = self._coordinator.get("providers") or {}
+        return sorted(mounted)
+
+    def current(self) -> str | None:
+        """The currently pinned provider mount name, or None if unpinned.
+
+        None means "unpinned" -- the orchestrator's normal priority
+        ordering decides each turn.
+        """
+        return self._orchestrator._pinned_provider_name
+
+    @staticmethod
+    def _vendor_of(mount_name: str, provider: Any) -> str:
+        """Vendor identity for one provider, via the KERNEL CONTRACT:
+        ``get_info().id`` (e.g. ``"anthropic"``).
+
+        Two different mount names sharing an id (anthropic-sonnet /
+        anthropic-haiku / anthropic-fable) are the SAME vendor -- that is
+        the supported, proven switching case.
+
+        Uses only the contract surface: no vendor-specific attributes, no
+        parsing of mount names or module names (``anthropic-fable`` does
+        not contain a reliable vendor token, and a mount name is a
+        user-chosen label, not an identity).
+
+        Raises ValueError when the identity cannot be established --
+        ``get_info()`` raising, or no usable string id. An unverifiable
+        vendor identity is NOT permission to proceed: it is exactly the
+        case where a wrong guess wedges the session, so this refuses
+        instead of guessing.
+        """
+        try:
+            info = provider.get_info()
+        except Exception as exc:
+            raise ValueError(
+                f"cannot pin conversation provider {mount_name!r}: its vendor "
+                f"identity could not be established because get_info() raised "
+                f"{type(exc).__name__}: {exc}. Refusing rather than guessing -- "
+                f"an unverifiable vendor cannot be checked against the "
+                f"cross-vendor guard, and a wrong guess can wedge the session."
+            ) from exc
+
+        vendor = getattr(info, "id", None)
+        if not isinstance(vendor, str) or not vendor.strip():
+            raise ValueError(
+                f"cannot pin conversation provider {mount_name!r}: its "
+                f"get_info() reported no usable vendor id (got {vendor!r}). "
+                f"Refusing rather than guessing -- an unverifiable vendor "
+                f"cannot be checked against the cross-vendor guard."
+            )
+        return vendor.strip()
+
+    def _effective_provider_name(self, mounted: dict[str, Any]) -> str | None:
+        """Mount name of the provider currently answering the conversation
+        -- i.e. whose vendor owns the transcript's private payloads.
+
+        That is the pin when one is set, else the priority winner. Returns
+        None when it cannot be determined (nothing mounted, or a stale pin
+        whose provider is gone), which callers must treat as "refuse",
+        not "no conflict".
+        """
+        pinned = self._orchestrator._pinned_provider_name
+        if pinned is not None:
+            return pinned if pinned in mounted else None
+
+        # Unpinned: ask the real selector so this can never drift from the
+        # actual policy. Safe from _select_provider's stale-pin RuntimeError
+        # precisely because we just established there is no pin.
+        winner = self._orchestrator._select_provider(mounted)
+        if winner is None:
+            return None
+        for candidate_name, candidate in mounted.items():
+            if candidate is winner:
+                return candidate_name
+        return None
+
+    def pin(self, provider_name: str) -> str:
+        """Pin the top-level conversation to one mounted provider.
+
+        Returns the pinned mount name. Takes effect on the next turn and
+        persists until :meth:`unpin` -- no restart required.
+
+        SAME VENDOR ONLY. Switching models WITHIN one vendor
+        (anthropic-sonnet -> anthropic-haiku) is supported and is the
+        proven case. Switching ACROSS vendors mid-conversation is refused
+        here, synchronously, before any damage.
+
+        WHY (measured in a real cross-vendor test, not theoretical): a
+        transcript accumulates vendor-PRIVATE reasoning and tool payloads
+        -- Anthropic ``thinking.signature``, Gemini
+        ``functionCall.thought_signature``. Replaying those to a different
+        vendor is rejected by the receiving API (HTTP 400), and because
+        the poisoned message stays in history, EVERY subsequent turn fails
+        the same way. The observed outcome was a permanently wedged
+        conversation whose only escape was abandoning the session. Failing
+        at pin time costs the user one error message; failing at turn time
+        costs them the whole session.
+
+        NO EMPTY-HISTORY EXCEPTION -- deliberate. Cross-vendor pinning on a
+        conversation with nothing to replay is indeed harmless in itself,
+        but allowing it makes the FOLLOWING state unreachable safely: once
+        that pin has been conversed through, the transcript holds the new
+        vendor's private payloads, and :meth:`unpin` -- which returns to
+        priority selection, i.e. very likely the ORIGINAL vendor -- becomes
+        the wedge. Guarding unpin too would trap the user inside the pin
+        with no exit, which is a worse failure than the one being
+        prevented. Refusing unconditionally keeps one total invariant --
+        *the conversation's vendor never changes mid-session* -- and keeps
+        the pin always reversible: anything you can pin, you can always
+        unpin safely. Choosing the vendor for a NEW session remains a
+        startup concern (config/priority), not a pin concern.
+
+        Raises ValueError -- synchronously, before any turn is spent --
+        when ``provider_name`` is empty, is not currently mounted (the
+        message names every provider that IS mounted), belongs to a
+        different vendor than the current conversation provider, or has a
+        vendor identity that cannot be verified.
+        """
+        if provider_name is None or not str(provider_name).strip():
+            raise ValueError("provider name must be non-empty")
+        name = str(provider_name).strip()
+
+        mounted_providers: dict[str, Any] = self._coordinator.get("providers") or {}
+        mounted = sorted(mounted_providers)
+        if name not in mounted_providers:
+            raise ValueError(
+                f"cannot pin conversation provider {name!r}: it is not mounted "
+                f"in this session. Mounted providers: "
+                f"{', '.join(mounted) if mounted else '(none)'}"
+            )
+
+        current_name = self._effective_provider_name(mounted_providers)
+
+        # Re-pinning whatever is already answering changes no vendor, so it
+        # needs no vendor check -- and must not be refused just because that
+        # provider's get_info() is unhappy.
+        if current_name != name:
+            if current_name is None:
+                raise ValueError(
+                    f"cannot pin conversation provider {name!r}: the provider "
+                    f"currently pinned for this conversation is no longer "
+                    f"mounted, so the vendor that owns this conversation's "
+                    f"history cannot be verified. Unpin first (via this "
+                    f"capability's unpin()) to return to normal selection."
+                )
+
+            target_vendor = self._vendor_of(name, mounted_providers[name])
+            current_vendor = self._vendor_of(
+                current_name, mounted_providers[current_name]
+            )
+            if target_vendor.lower() != current_vendor.lower():
+                raise ValueError(
+                    f"cannot pin conversation provider {name!r}: that would "
+                    f"switch this conversation from vendor {current_vendor!r} "
+                    f"(currently {current_name!r}) to vendor {target_vendor!r} "
+                    f"mid-conversation, which is not supported yet. The "
+                    f"transcript holds vendor-private reasoning and tool "
+                    f"payloads (e.g. Anthropic 'thinking.signature', Gemini "
+                    f"'thought_signature'); replaying them to a different "
+                    f"vendor is rejected by the receiving API and poisons "
+                    f"every subsequent turn, permanently wedging the session. "
+                    f"Switching models WITHIN {current_vendor!r} is supported -- "
+                    f"same-vendor options here: "
+                    f"{', '.join(self._same_vendor_names(mounted_providers, current_vendor)) or '(none)'}."
+                )
+
+        self._orchestrator._pinned_provider_name = name
+        logger.info(
+            "conversation provider pinned to %r (conversation scope only; "
+            "model-role routing and /goal utility calls are unaffected)",
+            name,
+        )
+        return name
+
+    def _same_vendor_names(
+        self, mounted_providers: dict[str, Any], vendor: str
+    ) -> list[str]:
+        """Mount names sharing ``vendor``, for the refusal message's
+        "here's what you CAN switch to" hint.
+
+        Best-effort and message-only: a provider whose ``get_info()`` fails
+        is simply omitted rather than raising, because this runs while
+        already building an error and must not mask it.
+        """
+        names: list[str] = []
+        for candidate_name, candidate in mounted_providers.items():
+            try:
+                candidate_vendor = self._vendor_of(candidate_name, candidate)
+            except ValueError:
+                continue
+            if candidate_vendor.lower() == vendor.lower():
+                names.append(candidate_name)
+        return sorted(names)
+
+    def unpin(self) -> str | None:
+        """Clear the pin, returning to normal priority selection.
+
+        Returns the mount name that was pinned, or None if nothing was
+        pinned. Idempotent -- unpinning when already unpinned is not an
+        error.
+        """
+        previous = self._orchestrator._pinned_provider_name
+        self._orchestrator._pinned_provider_name = None
+        if previous is not None:
+            logger.info(
+                "conversation provider unpinned (was %r); "
+                "reverting to priority-based selection",
+                previous,
+            )
+        return previous
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """Mount the streaming orchestrator module."""
     config = config or {}
@@ -298,7 +581,17 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     orchestrator = StreamingOrchestrator(config)
     await coordinator.mount("orchestrator", orchestrator)
     coordinator.register_capability("session.steer", orchestrator.steer)
-    logger.info("Mounted StreamingOrchestrator with steering capability")
+    # Conversation-scope provider pin (see ConversationProviderPin). Registered
+    # as a capability, NOT read from config, so an app can detect its absence
+    # (`get_capability` -> None) under a different orchestrator and refuse
+    # loudly rather than reporting a switch that never happened.
+    coordinator.register_capability(
+        "conversation.provider_pin", ConversationProviderPin(orchestrator, coordinator)
+    )
+    logger.info(
+        "Mounted StreamingOrchestrator with steering and "
+        "conversation-provider-pin capabilities"
+    )
 
 
 class StreamingOrchestrator:
@@ -664,6 +957,29 @@ class StreamingOrchestrator:
         self._goal_model_cache: tuple[str, Any, str | None, dict[str, Any]] | None = (
             None
         )
+        # Basis (selection rationale) for the cached `_resolve_goal_model`
+        # result above -- set alongside `_goal_model_cache` at each of its
+        # three resolution branches (model_role_resolver /
+        # goal_provider_preferences / session_default_fallback) purely for
+        # `provider:resolve` observability. Carried separately so the cache
+        # tuple's shape (and thus `_resolve_goal_model`'s return contract)
+        # is never altered.
+        self._goal_model_basis: str | None = None
+        # Conversation-scope provider pin (capability
+        # `conversation.provider_pin`, see ConversationProviderPin). None =
+        # unpinned = today's priority ordering, byte-for-byte.
+        #
+        # SCOPE, deliberately narrow: this is read ONLY by
+        # `_select_provider`, which is called ONLY by `_execute_stream` --
+        # i.e. the top-level conversation. `_resolve_goal_model` (goal
+        # loop / stall judge / summarizer) does its own resolution and
+        # never consults this, so pinning the conversation does not
+        # perturb model-role routing or any utility call.
+        #
+        # NOT reset by execute(): a pin is a session-lifetime user
+        # decision that must survive turns (unlike `_goal_model_cache`,
+        # which is per-run). Only an explicit unpin clears it.
+        self._pinned_provider_name: str | None = None
         # Per-token artificial delay (seconds) injected after each non-whitespace
         # token in _tokenize_stream(). Default 0.0 so headless callers (sub-sessions,
         # automated agents) pay no synthetic latency. Set to e.g. 0.01 to opt in to
@@ -786,6 +1102,7 @@ class StreamingOrchestrator:
         # re-resolves the goal-loop model role exactly once, not once per
         # turn.
         self._goal_model_cache = None
+        self._goal_model_basis = None
 
         # Peek at goal state *before* the first turn. Goal state can only be
         # set (by the app layer's /goal command) before execute() is called,
@@ -1526,6 +1843,7 @@ class StreamingOrchestrator:
         role_result, role_cause = await _via_role_resolver()
         if role_result is not None:
             self._goal_model_cache = role_result
+            self._goal_model_basis = "model_role_resolver"
             return role_result
 
         # Role routing didn't yield a usable provider -- try the declared
@@ -1542,12 +1860,14 @@ class StreamingOrchestrator:
         pref_result = await self._resolve_goal_provider_preferences(providers)
         if pref_result is not None:
             self._goal_model_cache = pref_result
+            self._goal_model_basis = "goal_provider_preferences"
             return pref_result
 
         result = _fallback(
             f"{role_cause}, and no goal_provider_preferences entry resolved either"
         )
         self._goal_model_cache = result
+        self._goal_model_basis = "session_default_fallback"
         return result
 
     @staticmethod
@@ -1789,6 +2109,29 @@ class StreamingOrchestrator:
             role_config,
         ) = await self._resolve_goal_model(providers, coordinator)
 
+        # Pure observability -- see the matching PROVIDER_RESOLVE emit in
+        # _execute_stream for the rationale. `basis` reflects whichever of
+        # _resolve_goal_model's three branches actually produced this
+        # result (set alongside `_goal_model_cache`, see that method).
+        # `model` reports the model that will ACTUALLY be used, not the
+        # override that was requested: a None `model_override` means "no
+        # model was pinned, so the provider's own default applies", which
+        # is read locally through the kernel contract (see
+        # `_provider_default_model`) rather than reported as unknown.
+        await hooks.emit(
+            PROVIDER_RESOLVE,
+            {
+                "provider": provider_name,
+                "model": (
+                    model_override
+                    if model_override is not None
+                    else self._provider_default_model(provider)
+                ),
+                "basis": self._goal_model_basis,
+                "scope": "goal_utility",
+            },
+        )
+
         history_text = "\n".join(f"{i + 1}. {r}" for i, r in enumerate(recent_reasons))
         user_prompt = (
             f"GOAL CONDITION:\n{goal['condition']}\n\n"
@@ -2009,6 +2352,28 @@ class StreamingOrchestrator:
                 role_config,
             ) = await self._resolve_goal_model(providers, coordinator)
 
+            # Pure observability -- see the matching PROVIDER_RESOLVE emit
+            # in _execute_stream for the rationale. `basis` reflects
+            # whichever of _resolve_goal_model's three branches actually
+            # produced this result (set alongside `_goal_model_cache`, see
+            # that method). `model` reports the model that will ACTUALLY be
+            # used: a None `model_override` means "no model was pinned, so
+            # the provider's own default applies", read locally through the
+            # kernel contract (see `_provider_default_model`).
+            await hooks.emit(
+                PROVIDER_RESOLVE,
+                {
+                    "provider": provider_name,
+                    "model": (
+                        model_override
+                        if model_override is not None
+                        else self._provider_default_model(provider)
+                    ),
+                    "basis": self._goal_model_basis,
+                    "scope": "goal_utility",
+                },
+            )
+
             system_prompt = self._GOAL_SUMMARY_SYSTEM_PROMPTS[final_state]
 
             if final_state == "error":
@@ -2175,6 +2540,28 @@ class StreamingOrchestrator:
             role_config,
         ) = await self._resolve_goal_model(providers, coordinator)
 
+        # Pure observability -- see the matching PROVIDER_RESOLVE emit in
+        # _execute_stream for the rationale. `basis` reflects whichever of
+        # _resolve_goal_model's three branches actually produced this
+        # result (set alongside `_goal_model_cache`, see that method).
+        # `model` reports the model that will ACTUALLY be used: a None
+        # `model_override` means "no model was pinned, so the provider's
+        # own default applies", read locally through the kernel contract
+        # (see `_provider_default_model`).
+        await hooks.emit(
+            PROVIDER_RESOLVE,
+            {
+                "provider": provider_name,
+                "model": (
+                    model_override
+                    if model_override is not None
+                    else self._provider_default_model(provider)
+                ),
+                "basis": self._goal_model_basis,
+                "scope": "goal_utility",
+            },
+        )
+
         user_prompt = (
             f"GOAL CONDITION:\n{condition}\n\n"
             f"CONVERSATION SO FAR"
@@ -2340,6 +2727,34 @@ class StreamingOrchestrator:
             if prov is provider:
                 provider_name = name
                 break
+
+        # Pure observability. `basis` names WHY this provider won:
+        # "pinned" when the conversation-scope pin decided it (capability
+        # `conversation.provider_pin`), else "priority" -- the unpinned
+        # path, unchanged. Reading the pin here is sound because
+        # `_select_provider` above honors it whenever set and RAISES if a
+        # pin no longer resolves, so reaching this line with a pin set
+        # means the pin is what selected `provider`.
+        #
+        # The main conversation loop never sets an explicit model override
+        # (see the ChatRequest built below), so the model that will
+        # ACTUALLY be used is the provider's own default -- read locally
+        # through the kernel's Provider contract
+        # (`get_info().defaults["model"]`, no I/O), never via a network
+        # call and never via a vendor-specific attribute. See
+        # `_provider_default_model`; None there means "the provider could
+        # not tell us", not a guess.
+        await hooks.emit(
+            PROVIDER_RESOLVE,
+            {
+                "provider": provider_name,
+                "model": self._provider_default_model(provider),
+                "basis": (
+                    "pinned" if self._pinned_provider_name is not None else "priority"
+                ),
+                "scope": "conversation",
+            },
+        )
 
         iteration = 0
 
@@ -3559,7 +3974,44 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         # Simplified - would process tracked tool calls
 
     def _select_provider(self, providers: dict[str, Any]) -> Any:
-        """Select a provider based on priority."""
+        """Select the provider for the TOP-LEVEL CONVERSATION.
+
+        Called only from ``_execute_stream`` -- i.e. this decides the
+        conversation provider and nothing else. ``_resolve_goal_model``
+        (goal loop / stall judge / summarizer) resolves independently and
+        never calls this, so the pin below cannot perturb model-role
+        routing or any utility call.
+
+        Order:
+
+        1. The conversation-scope pin, when set (capability
+           ``conversation.provider_pin``, see ``ConversationProviderPin``).
+        2. Otherwise, priority ordering -- unchanged.
+
+        A pin that no longer resolves raises ``RuntimeError``. It does NOT
+        fall through to priority ordering: the pinned provider was mounted
+        when the user pinned it, so its absence now means someone unmounted
+        it mid-session, and silently answering on a *different* provider
+        than the user believes they are on is precisely the failure this
+        feature exists to prevent. The raise propagates out of
+        ``_execute_stream`` to ``_execute_one_turn``, which emits
+        ``orchestrator:complete`` with ``status="error"`` and re-raises --
+        the same fail-loud path as a provider error.
+        """
+        pinned = self._pinned_provider_name
+        if pinned is not None:
+            provider = providers.get(pinned) if providers else None
+            if provider is None:
+                mounted = ", ".join(sorted(providers)) if providers else "(none)"
+                raise RuntimeError(
+                    f"conversation provider is pinned to {pinned!r}, but that "
+                    f"provider is not mounted for this turn (mounted: {mounted}). "
+                    f"Refusing to silently fall back to priority selection. "
+                    f"Unpin via the 'conversation.provider_pin' capability, or "
+                    f"re-mount {pinned!r}."
+                )
+            return provider
+
         if not providers:
             return None
 
@@ -3583,3 +4035,45 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             return provider_list[0][2]
 
         return None
+
+    @staticmethod
+    def _provider_default_model(provider: Any) -> str | None:
+        """The model a provider uses when a request carries no override,
+        read through the KERNEL CONTRACT: ``get_info().defaults["model"]``.
+
+        `get_info()` is the Provider protocol's synchronous metadata
+        accessor (amplifier_core.interfaces) and performs no I/O, so this
+        is safe to call on the `provider:resolve` emit path -- unlike
+        `list_models()`, which is a network round trip and must never be
+        called here.
+
+        Deliberately does NOT read `provider.default_model`. That attribute
+        is a vendor-specific implementation detail of one provider, not part
+        of the protocol; depending on it is exactly the informal coupling
+        `provider:resolve` exists to eliminate (this file's own
+        `_select_provider` already sniffs a non-kernel `provider.priority`,
+        and that sort of coupling is what forced consumers to
+        reverse-engineer orchestrator policy). Only the contract surface is
+        used, so this works for ANY conforming provider.
+
+        Returns None -- explicitly, never a plausible-looking substitute --
+        when the provider cannot answer: `get_info()` raising, or `defaults`
+        carrying no "model" key. A raising `get_info()` is logged (mirroring
+        `_build_tool_spec`'s convention in this file) so a real provider bug
+        stays visible rather than vanishing into an observability path.
+        """
+        try:
+            info = provider.get_info()
+        except Exception:
+            logger.warning(
+                "provider %r raised from get_info(); reporting model=None on "
+                "provider:resolve rather than guessing",
+                getattr(provider, "name", "<unknown>"),
+                exc_info=True,
+            )
+            return None
+
+        defaults = getattr(info, "defaults", None)
+        if not isinstance(defaults, dict):
+            return None
+        return defaults.get("model")
