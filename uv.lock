@@ -15,6 +15,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "amplifier-foundation"
+version = "1.0.0"
+source = { git = "https://github.com/microsoft/amplifier-foundation?branch=main#3f9a6e28c8f92b36f83c44942cca18927cb3eeae" }
+dependencies = [
+    { name = "amplifier-core" },
+    { name = "pyyaml" },
+]
+
+[[package]]
 name = "amplifier-module-loop-streaming"
 version = "1.0.0"
 source = { editable = "." }
@@ -22,6 +31,7 @@ source = { editable = "." }
 [package.dev-dependencies]
 dev = [
     { name = "amplifier-core" },
+    { name = "amplifier-foundation" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -31,6 +41,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "amplifier-core", git = "https://github.com/microsoft/amplifier-core?branch=main" },
+    { name = "amplifier-foundation", git = "https://github.com/microsoft/amplifier-foundation?branch=main" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
 ]

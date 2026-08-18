@@ -34,12 +34,18 @@ allow-direct-references = true
 [dependency-groups]
 dev = [
     "amplifier-core",
+    # tests/test_goal_loop.py imports ProviderPreference from amplifier-foundation.
+    # Without it the whole file fails to COLLECT, which takes the suite down at
+    # collection time rather than failing one test -- so `uv run pytest` on a
+    # clean checkout errored out entirely.
+    "amplifier-foundation",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.0.0",
 ]
 
 [tool.uv.sources]
 amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }
+amplifier-foundation = { git = "https://github.com/microsoft/amplifier-foundation", branch = "main" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
