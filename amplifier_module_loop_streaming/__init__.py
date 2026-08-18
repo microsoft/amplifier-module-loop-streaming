@@ -670,7 +670,7 @@ class StreamingOrchestrator:
         "(e.g. a soak period, waiting for an external event) that cannot "
         "pass within this session no matter what the assistant does.\n"
         "STRUCTURE-LOCKED -- the condition applies a universal "
-        'requirement over a set that contains a member which is '
+        "requirement over a set that contains a member which is "
         'structurally exempt or unreachable (e.g. "all N sites" when one '
         "site cannot produce the required measurement).\n"
         "HISTORY-LOCKED -- the condition constrains the transcript's own "
@@ -948,9 +948,7 @@ class StreamingOrchestrator:
         # the full history); the summary call only needs the CURRENT
         # state, which the tail of a long run already establishes. `<= 0`
         # disables the cap (send the whole list, pre-existing behavior).
-        self.goal_summary_max_reasons = int(
-            config.get("goal_summary_max_reasons", 20)
-        )
+        self.goal_summary_max_reasons = int(config.get("goal_summary_max_reasons", 20))
         # Per-execute()-call cache for `_resolve_goal_model`'s result (see
         # that method's CRITICAL PERF note) -- reset to None at the top of
         # execute() so each run re-resolves once, not on every turn.
@@ -1289,14 +1287,16 @@ class StreamingOrchestrator:
                     # re-running a test after a fix) can look repetitive
                     # too. See TestDualConditionStallTrip.
                     try:
-                        is_stalled, stall_detail, stall_verdict = (
-                            await self._judge_stall(
-                                goal,
-                                providers,
-                                hooks,
-                                coordinator,
-                                trigger=stall_trigger,
-                            )
+                        (
+                            is_stalled,
+                            stall_detail,
+                            stall_verdict,
+                        ) = await self._judge_stall(
+                            goal,
+                            providers,
+                            hooks,
+                            coordinator,
+                            trigger=stall_trigger,
                         )
                     except Exception as e:
                         # Fail open: a flaky judge call must never itself
@@ -1633,8 +1633,7 @@ class StreamingOrchestrator:
         explanation = self._GOAL_STALL_VERDICT_EXPLANATIONS.get(verdict or "")
         if explanation:
             verdict_clause = (
-                f" A reviewing judge classified this as {verdict}: "
-                f"{explanation}."
+                f" A reviewing judge classified this as {verdict}: {explanation}."
             )
 
         return (
@@ -2090,9 +2089,7 @@ class StreamingOrchestrator:
             )
         else:
             recent_reasons = (
-                goal["reasons"][-goal["no_tool_turns"] :]
-                if goal.get("reasons")
-                else []
+                goal["reasons"][-goal["no_tool_turns"] :] if goal.get("reasons") else []
             )
             system_prompt = self._GOAL_STALL_SYSTEM_PROMPT_IDLE
             activity_clause = "the assistant took no tool actions at all"
@@ -2282,9 +2279,7 @@ class StreamingOrchestrator:
             return "evaluator failed"
         return None
 
-    def _cap_reasons_for_summary(
-        self, reasons: list[str]
-    ) -> tuple[list[str], int]:
+    def _cap_reasons_for_summary(self, reasons: list[str]) -> tuple[list[str], int]:
         """Bound how many of ``goal["reasons"]`` are shipped to the summary
         model (see ``_summarize_goal_run``).
 
@@ -2386,9 +2381,7 @@ class StreamingOrchestrator:
             else:
                 reasons = goal.get("reasons", [])
                 kept_reasons, omitted_count = self._cap_reasons_for_summary(reasons)
-                reasons_lines = [
-                    f"{i + 1}. {r}" for i, r in enumerate(kept_reasons)
-                ]
+                reasons_lines = [f"{i + 1}. {r}" for i, r in enumerate(kept_reasons)]
                 if omitted_count:
                     reasons_lines.insert(
                         0, f"(earliest {omitted_count} reasons omitted)"
@@ -2708,137 +2701,158 @@ class StreamingOrchestrator:
 
         # Emit execution start
         await hooks.emit("execution:start", {"prompt": prompt})
+        try:
+            # Reset rate limit tracking for new session
+            self._last_provider_call_end = None
 
-        # Reset rate limit tracking for new session
-        self._last_provider_call_end = None
+            # Add user message
+            await context.add_message({"role": "user", "content": prompt})
 
-        # Add user message
-        await context.add_message({"role": "user", "content": prompt})
+            # Select provider
+            provider = self._select_provider(providers)
+            if not provider:
+                yield ("Error: No providers available", 0)
+                return
 
-        # Select provider
-        provider = self._select_provider(providers)
-        if not provider:
-            yield ("Error: No providers available", 0)
-            return
+            # Find provider name for event emission
+            provider_name = None
+            for name, prov in providers.items():
+                if prov is provider:
+                    provider_name = name
+                    break
 
-        # Find provider name for event emission
-        provider_name = None
-        for name, prov in providers.items():
-            if prov is provider:
-                provider_name = name
-                break
+            # Pure observability. `basis` names WHY this provider won:
+            # "pinned" when the conversation-scope pin decided it (capability
+            # `conversation.provider_pin`), else "priority" -- the unpinned
+            # path, unchanged. Reading the pin here is sound because
+            # `_select_provider` above honors it whenever set and RAISES if a
+            # pin no longer resolves, so reaching this line with a pin set
+            # means the pin is what selected `provider`.
+            #
+            # The main conversation loop never sets an explicit model override
+            # (see the ChatRequest built below), so the model that will
+            # ACTUALLY be used is the provider's own default -- read locally
+            # through the kernel's Provider contract
+            # (`get_info().defaults["model"]`, no I/O), never via a network
+            # call and never via a vendor-specific attribute. See
+            # `_provider_default_model`; None there means "the provider could
+            # not tell us", not a guess.
+            await hooks.emit(
+                PROVIDER_RESOLVE,
+                {
+                    "provider": provider_name,
+                    "model": self._provider_default_model(provider),
+                    "basis": (
+                        "pinned"
+                        if self._pinned_provider_name is not None
+                        else "priority"
+                    ),
+                    "scope": "conversation",
+                },
+            )
 
-        # Pure observability. `basis` names WHY this provider won:
-        # "pinned" when the conversation-scope pin decided it (capability
-        # `conversation.provider_pin`), else "priority" -- the unpinned
-        # path, unchanged. Reading the pin here is sound because
-        # `_select_provider` above honors it whenever set and RAISES if a
-        # pin no longer resolves, so reaching this line with a pin set
-        # means the pin is what selected `provider`.
-        #
-        # The main conversation loop never sets an explicit model override
-        # (see the ChatRequest built below), so the model that will
-        # ACTUALLY be used is the provider's own default -- read locally
-        # through the kernel's Provider contract
-        # (`get_info().defaults["model"]`, no I/O), never via a network
-        # call and never via a vendor-specific attribute. See
-        # `_provider_default_model`; None there means "the provider could
-        # not tell us", not a guess.
-        await hooks.emit(
-            PROVIDER_RESOLVE,
-            {
-                "provider": provider_name,
-                "model": self._provider_default_model(provider),
-                "basis": (
-                    "pinned" if self._pinned_provider_name is not None else "priority"
-                ),
-                "scope": "conversation",
-            },
-        )
+            iteration = 0
 
-        iteration = 0
-
-        while self.max_iterations == -1 or iteration < self.max_iterations:
-            # Check for cancellation at iteration start
-            if coordinator and coordinator.cancellation.is_cancelled:
-                # Emit cancel:requested on first detection and trigger cleanup callbacks
-                if not self._cancel_requested_emitted:
-                    self._cancel_requested_emitted = True
+            while self.max_iterations == -1 or iteration < self.max_iterations:
+                # Check for cancellation at iteration start
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    # Emit cancel:requested on first detection and trigger cleanup callbacks
+                    if not self._cancel_requested_emitted:
+                        self._cancel_requested_emitted = True
+                        await hooks.emit(
+                            CANCEL_REQUESTED,
+                            {
+                                "orchestrator": "loop-streaming",
+                                "state": str(coordinator.cancellation.state),
+                                "turn_count": iteration,
+                            },
+                        )
+                        try:
+                            await coordinator.cancellation.trigger_callbacks()
+                        except Exception as e:
+                            logger.warning(f"Error in cancellation callbacks: {e}")
+                    # Emit cancel:completed — orchestrator is exiting due to cancellation
                     await hooks.emit(
-                        CANCEL_REQUESTED,
+                        CANCEL_COMPLETED,
                         {
                             "orchestrator": "loop-streaming",
-                            "state": str(coordinator.cancellation.state),
+                            "was_immediate": coordinator.cancellation.is_immediate,
                             "turn_count": iteration,
                         },
                     )
-                    try:
-                        await coordinator.cancellation.trigger_callbacks()
-                    except Exception as e:
-                        logger.warning(f"Error in cancellation callbacks: {e}")
-                # Emit cancel:completed — orchestrator is exiting due to cancellation
-                await hooks.emit(
-                    CANCEL_COMPLETED,
-                    {
-                        "orchestrator": "loop-streaming",
-                        "was_immediate": coordinator.cancellation.is_immediate,
-                        "turn_count": iteration,
-                    },
-                )
-                # Don't yield more content, just exit.
-                # Clear any pending steers so they cannot leak into the next turn
-                # (cancellation means "stop now" — stale steers have no next injection
-                # point and must not silently ride a future, unrelated turn). (spec §5.2)
-                self._steering_queue.clear()
-                return
-
-            iteration += 1
-
-            # Mid-turn steering: drain queued user messages BEFORE building the request,
-            # so they are part of this iteration's provider call. At iteration 1 this is
-            # "before the first LLM call"; at iteration N>1 this is "after the prior tool
-            # round, before the next provider call" — the single natural boundary.
-            await self._drain_steering(context, hooks, iteration)
-
-            # Emit provider request BEFORE getting messages (allows hook injections)
-            result = await hooks.emit(
-                PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration}
-            )
-            if coordinator:
-                result = await coordinator.process_hook_result(
-                    result, "provider:request", "orchestrator"
-                )
-                if result.action == "deny":
-                    yield (f"Operation denied: {result.reason}", iteration)
+                    # Don't yield more content, just exit.
+                    # Clear any pending steers so they cannot leak into the next turn
+                    # (cancellation means "stop now" — stale steers have no next injection
+                    # point and must not silently ride a future, unrelated turn). (spec §5.2)
+                    self._steering_queue.clear()
                     return
 
-            # Get messages for LLM request (context handles compaction internally)
-            # Pass provider for dynamic budget calculation based on model's context window
-            message_dicts = await context.get_messages_for_request(provider=provider)
-            message_dicts = list(message_dicts)  # Convert to list for modification
+                iteration += 1
 
-            # Append ephemeral injection if present (temporary, not stored)
-            if (
-                result.action == "inject_context"
-                and result.ephemeral
-                and result.context_injection
-            ):
-                # Check if we should append to last tool result
-                if result.append_to_last_tool_result and len(message_dicts) > 0:
-                    last_msg = message_dicts[-1]
-                    # Append to last message if it's a tool result
-                    if last_msg.get("role") == "tool":
-                        # Append to existing content
-                        original_content = last_msg.get("content", "")
-                        message_dicts[-1] = {
-                            **last_msg,
-                            "content": f"{original_content}\n\n{result.context_injection}",
-                        }
-                        logger.debug(
-                            "Appended ephemeral injection to last tool result message"
-                        )
+                # Mid-turn steering: drain queued user messages BEFORE building the request,
+                # so they are part of this iteration's provider call. At iteration 1 this is
+                # "before the first LLM call"; at iteration N>1 this is "after the prior tool
+                # round, before the next provider call" — the single natural boundary.
+                await self._drain_steering(context, hooks, iteration)
+
+                # Emit provider request BEFORE getting messages (allows hook injections)
+                result = await hooks.emit(
+                    PROVIDER_REQUEST,
+                    {"provider": provider_name, "iteration": iteration},
+                )
+                if coordinator:
+                    result = await coordinator.process_hook_result(
+                        result, "provider:request", "orchestrator"
+                    )
+                    if result.action == "deny":
+                        yield (f"Operation denied: {result.reason}", iteration)
+                        return
+
+                # Get messages for LLM request (context handles compaction internally)
+                # Pass provider for dynamic budget calculation based on model's context window
+                message_dicts = await context.get_messages_for_request(
+                    provider=provider
+                )
+                message_dicts = list(message_dicts)  # Convert to list for modification
+
+                # Append ephemeral injection if present (temporary, not stored)
+                if (
+                    result.action == "inject_context"
+                    and result.ephemeral
+                    and result.context_injection
+                ):
+                    # Check if we should append to last tool result
+                    if result.append_to_last_tool_result and len(message_dicts) > 0:
+                        last_msg = message_dicts[-1]
+                        # Append to last message if it's a tool result
+                        if last_msg.get("role") == "tool":
+                            # Append to existing content
+                            original_content = last_msg.get("content", "")
+                            message_dicts[-1] = {
+                                **last_msg,
+                                "content": f"{original_content}\n\n{result.context_injection}",
+                            }
+                            logger.debug(
+                                "Appended ephemeral injection to last tool result message"
+                            )
+                        else:
+                            # Fall back to new message if last message isn't a tool result
+                            # metadata.ephemeral marks this as regenerated-per-turn content
+                            # so the provider never places a prompt-cache breakpoint on it
+                            # (see amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
+                            message_dicts.append(
+                                {
+                                    "role": result.context_injection_role,
+                                    "content": result.context_injection,
+                                    "metadata": {"ephemeral": True},
+                                }
+                            )
+                            logger.debug(
+                                f"Last message role is '{last_msg.get('role')}', not 'tool' - "
+                                "created new message for injection"
+                            )
                     else:
-                        # Fall back to new message if last message isn't a tool result
+                        # Default behavior: append as new message
                         # metadata.ephemeral marks this as regenerated-per-turn content
                         # so the provider never places a prompt-cache breakpoint on it
                         # (see amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
@@ -2849,40 +2863,39 @@ class StreamingOrchestrator:
                                 "metadata": {"ephemeral": True},
                             }
                         )
-                        logger.debug(
-                            f"Last message role is '{last_msg.get('role')}', not 'tool' - "
-                            "created new message for injection"
-                        )
-                else:
-                    # Default behavior: append as new message
-                    # metadata.ephemeral marks this as regenerated-per-turn content
-                    # so the provider never places a prompt-cache breakpoint on it
-                    # (see amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
-                    message_dicts.append(
-                        {
-                            "role": result.context_injection_role,
-                            "content": result.context_injection,
-                            "metadata": {"ephemeral": True},
-                        }
-                    )
 
-            # Apply pending ephemeral injections from tool:post hooks
-            if self._pending_ephemeral_injections:
-                for injection in self._pending_ephemeral_injections:
-                    if (
-                        injection.get("append_to_last_tool_result")
-                        and len(message_dicts) > 0
-                    ):
-                        last_msg = message_dicts[-1]
-                        if last_msg.get("role") == "tool":
-                            original_content = last_msg.get("content", "")
-                            message_dicts[-1] = {
-                                **last_msg,
-                                "content": f"{original_content}\n\n{injection['content']}",
-                            }
-                            logger.debug(
-                                "Applied pending ephemeral injection to last tool result"
-                            )
+                # Apply pending ephemeral injections from tool:post hooks
+                if self._pending_ephemeral_injections:
+                    for injection in self._pending_ephemeral_injections:
+                        if (
+                            injection.get("append_to_last_tool_result")
+                            and len(message_dicts) > 0
+                        ):
+                            last_msg = message_dicts[-1]
+                            if last_msg.get("role") == "tool":
+                                original_content = last_msg.get("content", "")
+                                message_dicts[-1] = {
+                                    **last_msg,
+                                    "content": f"{original_content}\n\n{injection['content']}",
+                                }
+                                logger.debug(
+                                    "Applied pending ephemeral injection to last tool result"
+                                )
+                            else:
+                                # metadata.ephemeral marks this as regenerated-per-turn
+                                # content so the provider never places a prompt-cache
+                                # breakpoint on it (see
+                                # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
+                                message_dicts.append(
+                                    {
+                                        "role": injection["role"],
+                                        "content": injection["content"],
+                                        "metadata": {"ephemeral": True},
+                                    }
+                                )
+                                logger.debug(
+                                    "Last message not a tool result, created new message for injection"
+                                )
                         else:
                             # metadata.ephemeral marks this as regenerated-per-turn
                             # content so the provider never places a prompt-cache
@@ -2896,223 +2909,286 @@ class StreamingOrchestrator:
                                 }
                             )
                             logger.debug(
-                                "Last message not a tool result, created new message for injection"
+                                "Applied pending ephemeral injection as new message"
                             )
-                    else:
-                        # metadata.ephemeral marks this as regenerated-per-turn
-                        # content so the provider never places a prompt-cache
-                        # breakpoint on it (see
-                        # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
-                        message_dicts.append(
-                            {
-                                "role": injection["role"],
-                                "content": injection["content"],
-                                "metadata": {"ephemeral": True},
-                            }
-                        )
-                        logger.debug(
-                            "Applied pending ephemeral injection as new message"
-                        )
-                # Clear pending injections after applying
-                self._pending_ephemeral_injections = []
+                    # Clear pending injections after applying
+                    self._pending_ephemeral_injections = []
 
-            # Convert dicts to ChatRequest for provider
-            messages_objects = [Message(**msg) for msg in message_dicts]
+                # Convert dicts to ChatRequest for provider
+                messages_objects = [Message(**msg) for msg in message_dicts]
 
-            # Convert tools to ToolSpec format for ChatRequest
-            tools_list = None
-            if tools:
-                tools_list = [_build_tool_spec(t) for t in tools.values()]
+                # Convert tools to ToolSpec format for ChatRequest
+                tools_list = None
+                if tools:
+                    tools_list = [_build_tool_spec(t) for t in tools.values()]
 
-            chat_request = ChatRequest(
-                messages=messages_objects,
-                tools=tools_list,
-                reasoning_effort=self.config.get("reasoning_effort"),
-            )
-            logger.info(
-                f"[ORCHESTRATOR] ChatRequest created with {len(tools_list) if tools_list else 0} tools"
-            )
-            if tools_list:
-                logger.debug(
-                    f"[ORCHESTRATOR] Tool names: {[t.name for t in tools_list]}"
+                chat_request = ChatRequest(
+                    messages=messages_objects,
+                    tools=tools_list,
+                    reasoning_effort=self.config.get("reasoning_effort"),
                 )
+                logger.info(
+                    f"[ORCHESTRATOR] ChatRequest created with {len(tools_list) if tools_list else 0} tools"
+                )
+                if tools_list:
+                    logger.debug(
+                        f"[ORCHESTRATOR] Tool names: {[t.name for t in tools_list]}"
+                    )
 
-            # Apply rate limit delay before provider call
-            await self._apply_rate_limit_delay(hooks, iteration)
+                # Apply rate limit delay before provider call
+                await self._apply_rate_limit_delay(hooks, iteration)
 
-            # Check if provider supports streaming
-            if hasattr(provider, "stream"):
-                # Use streaming if available
-                async for chunk in self._stream_from_provider(
-                    provider,
-                    chat_request,
-                    context,
-                    tools,
-                    hooks,
-                    coordinator,
-                    provider_name=provider_name,
-                ):
-                    # Check for immediate cancellation between chunks
-                    if coordinator and coordinator.cancellation.is_immediate:
-                        # Clear pending steers: immediate cancellation ends the turn,
-                        # and any steer queued during streaming must not leak into a
-                        # future turn — matching the other cancellation exits. (spec §5.2)
-                        self._steering_queue.clear()
-                        return
-                    yield (chunk, iteration)
+                # Check if provider supports streaming
+                if hasattr(provider, "stream"):
+                    # Use streaming if available
+                    async for chunk in self._stream_from_provider(
+                        provider,
+                        chat_request,
+                        context,
+                        tools,
+                        hooks,
+                        coordinator,
+                        provider_name=provider_name,
+                    ):
+                        # Check for immediate cancellation between chunks
+                        if coordinator and coordinator.cancellation.is_immediate:
+                            # Clear pending steers: immediate cancellation ends the turn,
+                            # and any steer queued during streaming must not leak into a
+                            # future turn — matching the other cancellation exits. (spec §5.2)
+                            self._steering_queue.clear()
+                            return
+                        yield (chunk, iteration)
 
-                # Update rate limit timestamp after streaming completes
-                self._last_provider_call_end = time.monotonic()
+                    # Update rate limit timestamp after streaming completes
+                    self._last_provider_call_end = time.monotonic()
 
-                # Check for tool calls after streaming
-                # This is simplified - real implementation would parse during stream
-                if await self._has_pending_tools(context):
-                    # Process tools
-                    await self._process_tools(context, tools, hooks)
-                    continue
-                else:
-                    # Last-drain edge: if a steer arrived during the final generation,
-                    # loop once more so the model acts on it this turn. The top-of-
-                    # iteration drain performs the actual injection.
-                    if not self._steering_queue.is_empty:
+                    # Check for tool calls after streaming
+                    # This is simplified - real implementation would parse during stream
+                    if await self._has_pending_tools(context):
+                        # Process tools
+                        await self._process_tools(context, tools, hooks)
                         continue
-                    break
-            else:
-                # Fallback to non-streaming
-                # Build kwargs for provider
-                kwargs = {}
-                if self.extended_thinking:
-                    kwargs["extended_thinking"] = True
-                try:
-                    response = await provider.complete(chat_request, **kwargs)
-                except LLMError as e:
-                    await hooks.emit(
-                        PROVIDER_ERROR,
-                        {
-                            "provider": provider_name,
-                            "error": {"type": type(e).__name__, "msg": str(e)},
-                            "retryable": e.retryable,
-                            "status_code": e.status_code,
-                        },
-                    )
-                    raise
-                except Exception as e:
-                    await hooks.emit(
-                        PROVIDER_ERROR,
-                        {
-                            "provider": provider_name,
-                            "error": {"type": type(e).__name__, "msg": str(e)},
-                        },
-                    )
-                    raise
-
-                # Update rate limit timestamp after non-streaming response
-                self._last_provider_call_end = time.monotonic()
-
-                # Emit content block events if present
-                content_blocks = getattr(response, "content_blocks", None)
-                if content_blocks:
-                    total_blocks = len(content_blocks)
-                    for idx, block in enumerate(content_blocks):
-                        # Emit block start
+                    else:
+                        # Last-drain edge: if a steer arrived during the final generation,
+                        # loop once more so the model acts on it this turn. The top-of-
+                        # iteration drain performs the actual injection.
+                        if not self._steering_queue.is_empty:
+                            continue
+                        break
+                else:
+                    # Fallback to non-streaming
+                    # Build kwargs for provider
+                    kwargs = {}
+                    if self.extended_thinking:
+                        kwargs["extended_thinking"] = True
+                    try:
+                        response = await provider.complete(chat_request, **kwargs)
+                    except LLMError as e:
                         await hooks.emit(
-                            CONTENT_BLOCK_START,
+                            PROVIDER_ERROR,
                             {
-                                "block_type": block.type.value,
-                                "block_index": idx,
-                                "total_blocks": total_blocks,
-                                "metadata": getattr(block, "raw", None),
+                                "provider": provider_name,
+                                "error": {"type": type(e).__name__, "msg": str(e)},
+                                "retryable": e.retryable,
+                                "status_code": e.status_code,
                             },
                         )
-
-                        # Emit block end with complete block, usage, and total count
-                        event_data = {
-                            "block_index": idx,
-                            "total_blocks": total_blocks,
-                            "block": block.to_dict(),
-                        }
-                        if response.usage:
-                            event_data["usage"] = response.usage.model_dump()
-                        await hooks.emit(CONTENT_BLOCK_END, event_data)
-                elif response.content and isinstance(response.content, list):
-                    # Fallback for providers that populate response.content
-                    # (Pydantic ContentBlock models) but not content_blocks
-                    # (raw SDK objects). Synthesize content_block events so
-                    # downstream hooks (e.g. streaming-ui token usage) fire.
-                    total_blocks = len(response.content)
-                    for idx, block in enumerate(response.content):
-                        block_dict = (
-                            block.model_dump()
-                            if hasattr(block, "model_dump")
-                            else block
-                        )
-                        block_type = (
-                            block_dict.get("type", "text")
-                            if isinstance(block_dict, dict)
-                            else "text"
-                        )
+                        raise
+                    except Exception as e:
                         await hooks.emit(
-                            CONTENT_BLOCK_START,
+                            PROVIDER_ERROR,
                             {
-                                "block_type": block_type,
-                                "block_index": idx,
-                                "total_blocks": total_blocks,
+                                "provider": provider_name,
+                                "error": {"type": type(e).__name__, "msg": str(e)},
                             },
                         )
-                        event_data = {
-                            "block_index": idx,
-                            "total_blocks": total_blocks,
-                            "block": block_dict,
-                        }
-                        if response.usage:
-                            event_data["usage"] = response.usage.model_dump()
-                        await hooks.emit(CONTENT_BLOCK_END, event_data)
+                        raise
 
-                # Parse tool calls
-                tool_calls = provider.parse_tool_calls(response)
+                    # Update rate limit timestamp after non-streaming response
+                    self._last_provider_call_end = time.monotonic()
 
-                if not tool_calls:
-                    # Extract text content from response for streaming
-                    # Use .text field if available (e.g., OpenAI provider), otherwise extract from content blocks
+                    # Emit content block events if present
+                    content_blocks = getattr(response, "content_blocks", None)
+                    if content_blocks:
+                        total_blocks = len(content_blocks)
+                        for idx, block in enumerate(content_blocks):
+                            # Emit block start
+                            await hooks.emit(
+                                CONTENT_BLOCK_START,
+                                {
+                                    "block_type": block.type.value,
+                                    "block_index": idx,
+                                    "total_blocks": total_blocks,
+                                    "metadata": getattr(block, "raw", None),
+                                },
+                            )
+
+                            # Emit block end with complete block, usage, and total count
+                            event_data = {
+                                "block_index": idx,
+                                "total_blocks": total_blocks,
+                                "block": block.to_dict(),
+                            }
+                            if response.usage:
+                                event_data["usage"] = response.usage.model_dump()
+                            await hooks.emit(CONTENT_BLOCK_END, event_data)
+                    elif response.content and isinstance(response.content, list):
+                        # Fallback for providers that populate response.content
+                        # (Pydantic ContentBlock models) but not content_blocks
+                        # (raw SDK objects). Synthesize content_block events so
+                        # downstream hooks (e.g. streaming-ui token usage) fire.
+                        total_blocks = len(response.content)
+                        for idx, block in enumerate(response.content):
+                            block_dict = (
+                                block.model_dump()
+                                if hasattr(block, "model_dump")
+                                else block
+                            )
+                            block_type = (
+                                block_dict.get("type", "text")
+                                if isinstance(block_dict, dict)
+                                else "text"
+                            )
+                            await hooks.emit(
+                                CONTENT_BLOCK_START,
+                                {
+                                    "block_type": block_type,
+                                    "block_index": idx,
+                                    "total_blocks": total_blocks,
+                                },
+                            )
+                            event_data = {
+                                "block_index": idx,
+                                "total_blocks": total_blocks,
+                                "block": block_dict,
+                            }
+                            if response.usage:
+                                event_data["usage"] = response.usage.model_dump()
+                            await hooks.emit(CONTENT_BLOCK_END, event_data)
+
+                    # Parse tool calls
+                    tool_calls = provider.parse_tool_calls(response)
+
+                    if not tool_calls:
+                        # Extract text content from response for streaming
+                        # Use .text field if available (e.g., OpenAI provider), otherwise extract from content blocks
+                        if hasattr(response, "text") and response.text:
+                            response_text = response.text
+                        else:
+                            response_text = self._extract_text_from_content(
+                                response.content
+                            )
+
+                        # Stream the final response token by token
+                        async for token in self._tokenize_stream(response_text):
+                            yield (token, iteration)
+
+                        # Store structured content from response.content (our Pydantic models)
+                        # This preserves reasoning state, thinking blocks, etc.
+                        # response.content = list of our ContentBlock models (TextBlock, ThinkingBlock, etc.)
+                        # response.content_blocks = raw SDK objects (for streaming events only)
+                        response_content = getattr(response, "content", None)
+                        if response_content and isinstance(response_content, list):
+                            # Convert ContentBlock objects to dicts for serialization
+                            content_dicts = [
+                                block.model_dump()
+                                if hasattr(block, "model_dump")
+                                else block
+                                for block in response_content
+                            ]
+                            logger.info(
+                                f"[ORCHESTRATOR] Storing {len(content_dicts)} content blocks"
+                            )
+                            for i, block_dict in enumerate(content_dicts):
+                                logger.info(
+                                    f"[ORCHESTRATOR]   Block {i}: type={block_dict.get('type')}, has_content={'content' in block_dict}"
+                                )
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": content_dicts,
+                            }
+                        else:
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": response_text,
+                            }
+
+                        # Preserve thinking blocks for Anthropic extended thinking (backward compat)
+                        # Use response_content (our Pydantic models) not content_blocks (raw SDK objects)
+                        if response_content and isinstance(response_content, list):
+                            for block in response_content:
+                                block_type = getattr(block, "type", None)
+                                type_value = (
+                                    getattr(block_type, "value", block_type)
+                                    if block_type
+                                    else None
+                                )
+                                if type_value == "thinking":
+                                    # Store the thinking block as dict to preserve signature
+                                    assistant_msg["thinking_block"] = (
+                                        block.model_dump()
+                                        if hasattr(block, "model_dump")
+                                        else None
+                                    )
+                                    break
+
+                        # Preserve provider metadata (provider-agnostic passthrough)
+                        # This enables providers to maintain state across steps (e.g., OpenAI reasoning items)
+                        if hasattr(response, "metadata") and response.metadata:
+                            assistant_msg["metadata"] = response.metadata
+
+                        await context.add_message(assistant_msg)
+                        # Last-drain edge: if a steer arrived during the final generation,
+                        # loop once more so the model acts on it this turn. The top-of-
+                        # iteration drain performs the actual injection.
+                        if not self._steering_queue.is_empty:
+                            continue
+                        break
+
+                    # Add assistant message with tool calls
+                    # Store structured content blocks (preserves reasoning state, thinking blocks, etc.)
+                    # Extract text for display/logging only
                     if hasattr(response, "text") and response.text:
                         response_text = response.text
                     else:
-                        response_text = self._extract_text_from_content(
-                            response.content
+                        response_text = (
+                            self._extract_text_from_content(response.content)
+                            if response.content
+                            else ""
                         )
-
-                    # Stream the final response token by token
-                    async for token in self._tokenize_stream(response_text):
-                        yield (token, iteration)
 
                     # Store structured content from response.content (our Pydantic models)
-                    # This preserves reasoning state, thinking blocks, etc.
-                    # response.content = list of our ContentBlock models (TextBlock, ThinkingBlock, etc.)
-                    # response.content_blocks = raw SDK objects (for streaming events only)
                     response_content = getattr(response, "content", None)
                     if response_content and isinstance(response_content, list):
-                        # Convert ContentBlock objects to dicts for serialization
-                        content_dicts = [
-                            block.model_dump()
-                            if hasattr(block, "model_dump")
-                            else block
-                            for block in response_content
-                        ]
-                        logger.info(
-                            f"[ORCHESTRATOR] Storing {len(content_dicts)} content blocks"
-                        )
-                        for i, block_dict in enumerate(content_dicts):
-                            logger.info(
-                                f"[ORCHESTRATOR]   Block {i}: type={block_dict.get('type')}, has_content={'content' in block_dict}"
-                            )
                         assistant_msg = {
                             "role": "assistant",
-                            "content": content_dicts,
+                            "content": [
+                                block.model_dump()
+                                if hasattr(block, "model_dump")
+                                else block
+                                for block in response_content
+                            ],
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "tool": tc.name,
+                                    "arguments": tc.arguments,
+                                }
+                                for tc in tool_calls
+                            ],
                         }
                     else:
                         assistant_msg = {
                             "role": "assistant",
                             "content": response_text,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "tool": tc.name,
+                                    "arguments": tc.arguments,
+                                }
+                                for tc in tool_calls
+                            ],
                         }
 
                     # Preserve thinking blocks for Anthropic extended thinking (backward compat)
@@ -3140,133 +3216,108 @@ class StreamingOrchestrator:
                         assistant_msg["metadata"] = response.metadata
 
                     await context.add_message(assistant_msg)
-                    # Last-drain edge: if a steer arrived during the final generation,
-                    # loop once more so the model acts on it this turn. The top-of-
-                    # iteration drain performs the actual injection.
-                    if not self._steering_queue.is_empty:
-                        continue
-                    break
 
-                # Add assistant message with tool calls
-                # Store structured content blocks (preserves reasoning state, thinking blocks, etc.)
-                # Extract text for display/logging only
-                if hasattr(response, "text") and response.text:
-                    response_text = response.text
-                else:
-                    response_text = (
-                        self._extract_text_from_content(response.content)
-                        if response.content
-                        else ""
-                    )
+                    # Process tool calls in parallel (user guidance: assume parallel intent)
+                    # Execute tools concurrently, but add results to context sequentially for determinism
+                    import uuid
 
-                # Store structured content from response.content (our Pydantic models)
-                response_content = getattr(response, "content", None)
-                if response_content and isinstance(response_content, list):
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": [
-                            block.model_dump()
-                            if hasattr(block, "model_dump")
-                            else block
-                            for block in response_content
-                        ],
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "tool": tc.name,
-                                "arguments": tc.arguments,
-                            }
-                            for tc in tool_calls
-                        ],
-                    }
-                else:
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": response_text,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "tool": tc.name,
-                                "arguments": tc.arguments,
-                            }
-                            for tc in tool_calls
-                        ],
-                    }
+                    parallel_group_id = str(uuid.uuid4())
 
-                # Preserve thinking blocks for Anthropic extended thinking (backward compat)
-                # Use response_content (our Pydantic models) not content_blocks (raw SDK objects)
-                if response_content and isinstance(response_content, list):
-                    for block in response_content:
-                        block_type = getattr(block, "type", None)
-                        type_value = (
-                            getattr(block_type, "value", block_type)
-                            if block_type
-                            else None
+                    # Execute all tools in parallel (no context updates inside)
+                    # Wrap in try/except for CancelledError to handle immediate cancellation
+                    tool_tasks = [
+                        self._execute_tool_only(
+                            tc, tools, hooks, parallel_group_id, coordinator
                         )
-                        if type_value == "thinking":
-                            # Store the thinking block as dict to preserve signature
-                            assistant_msg["thinking_block"] = (
-                                block.model_dump()
-                                if hasattr(block, "model_dump")
-                                else None
+                        for tc in tool_calls
+                    ]
+
+                    try:
+                        tool_results = await asyncio.gather(*tool_tasks)
+                    except asyncio.CancelledError:
+                        # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
+                        # for ALL tool_calls to maintain tool_use/tool_result pairing
+                        logger.info(
+                            "Tool execution cancelled - synthesizing cancelled results"
+                        )
+                        for tc in tool_calls:
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "name": tc.name,
+                                    "tool_call_id": tc.id,
+                                    "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
+                                }
                             )
-                            break
-
-                # Preserve provider metadata (provider-agnostic passthrough)
-                # This enables providers to maintain state across steps (e.g., OpenAI reasoning items)
-                if hasattr(response, "metadata") and response.metadata:
-                    assistant_msg["metadata"] = response.metadata
-
-                await context.add_message(assistant_msg)
-
-                # Process tool calls in parallel (user guidance: assume parallel intent)
-                # Execute tools concurrently, but add results to context sequentially for determinism
-                import uuid
-
-                parallel_group_id = str(uuid.uuid4())
-
-                # Execute all tools in parallel (no context updates inside)
-                # Wrap in try/except for CancelledError to handle immediate cancellation
-                tool_tasks = [
-                    self._execute_tool_only(
-                        tc, tools, hooks, parallel_group_id, coordinator
-                    )
-                    for tc in tool_calls
-                ]
-
-                try:
-                    tool_results = await asyncio.gather(*tool_tasks)
-                except asyncio.CancelledError:
-                    # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
-                    # for ALL tool_calls to maintain tool_use/tool_result pairing
-                    logger.info(
-                        "Tool execution cancelled - synthesizing cancelled results"
-                    )
-                    for tc in tool_calls:
+                        # Emit cancel events before re-raising so hooks receive them
+                        if coordinator and not self._cancel_requested_emitted:
+                            self._cancel_requested_emitted = True
+                            await hooks.emit(
+                                CANCEL_REQUESTED,
+                                {
+                                    "orchestrator": "loop-streaming",
+                                    "state": str(coordinator.cancellation.state),
+                                    "turn_count": iteration,
+                                },
+                            )
+                            try:
+                                await coordinator.cancellation.trigger_callbacks()
+                            except Exception as e:
+                                logger.warning(f"Error in cancellation callbacks: {e}")
+                        if coordinator:
+                            await hooks.emit(
+                                CANCEL_COMPLETED,
+                                {
+                                    "orchestrator": "loop-streaming",
+                                    "was_immediate": coordinator.cancellation.is_immediate,
+                                    "turn_count": iteration,
+                                },
+                            )
+                        # Write synthetic assistant message to close the turn.
+                        # Without this, transcript has tool_results without a closing assistant
+                        # message, triggering FM3 (incomplete_assistant_turn) on resume.
                         await context.add_message(
                             {
-                                "role": "tool",
-                                "name": tc.name,
-                                "tool_call_id": tc.id,
-                                "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
+                                "role": "assistant",
+                                "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
                             }
                         )
-                    # Emit cancel events before re-raising so hooks receive them
-                    if coordinator and not self._cancel_requested_emitted:
-                        self._cancel_requested_emitted = True
-                        await hooks.emit(
-                            CANCEL_REQUESTED,
-                            {
-                                "orchestrator": "loop-streaming",
-                                "state": str(coordinator.cancellation.state),
-                                "turn_count": iteration,
-                            },
-                        )
-                        try:
-                            await coordinator.cancellation.trigger_callbacks()
-                        except Exception as e:
-                            logger.warning(f"Error in cancellation callbacks: {e}")
-                    if coordinator:
+                        # Re-raise to let the cancellation propagate.
+                        # Clear pending steers first — a steer queued during tool
+                        # execution must not leak into any future turn. (spec §5.2)
+                        self._steering_queue.clear()
+                        raise
+
+                    # Check for cancellation after tools complete (graceful cancellation)
+                    if coordinator and coordinator.cancellation.is_cancelled:
+                        # MUST add tool results to context before returning
+                        # Otherwise we leave orphaned tool_calls without matching tool_results
+                        # which violates provider API contracts (Anthropic, OpenAI)
+                        for tool_call_id, tool_name, content in tool_results:
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "tool_call_id": tool_call_id,
+                                    "content": content,
+                                }
+                            )
+                        # Emit cancel:requested on first detection and trigger cleanup callbacks
+                        if not self._cancel_requested_emitted:
+                            self._cancel_requested_emitted = True
+                            await hooks.emit(
+                                CANCEL_REQUESTED,
+                                {
+                                    "orchestrator": "loop-streaming",
+                                    "state": str(coordinator.cancellation.state),
+                                    "turn_count": iteration,
+                                },
+                            )
+                            try:
+                                await coordinator.cancellation.trigger_callbacks()
+                            except Exception as e:
+                                logger.warning(f"Error in cancellation callbacks: {e}")
+                        # Emit cancel:completed — orchestrator is exiting due to cancellation
                         await hooks.emit(
                             CANCEL_COMPLETED,
                             {
@@ -3275,26 +3326,23 @@ class StreamingOrchestrator:
                                 "turn_count": iteration,
                             },
                         )
-                    # Write synthetic assistant message to close the turn.
-                    # Without this, transcript has tool_results without a closing assistant
-                    # message, triggering FM3 (incomplete_assistant_turn) on resume.
-                    await context.add_message(
-                        {
-                            "role": "assistant",
-                            "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
-                        }
-                    )
-                    # Re-raise to let the cancellation propagate.
-                    # Clear pending steers first — a steer queued during tool
-                    # execution must not leak into any future turn. (spec §5.2)
-                    self._steering_queue.clear()
-                    raise
+                        # Write synthetic assistant message to close the turn.
+                        # Without this, transcript has tool_results without a closing assistant
+                        # message, triggering FM3 (incomplete_assistant_turn) on resume.
+                        await context.add_message(
+                            {
+                                "role": "assistant",
+                                "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
+                            }
+                        )
+                        # Exit the loop - orchestrator complete event will be emitted in execute().
+                        # Clear pending steers: cancellation closes the turn; any steer that
+                        # arrived after the last injection point must not ride a future turn. (spec §5.2)
+                        self._steering_queue.clear()
+                        return
 
-                # Check for cancellation after tools complete (graceful cancellation)
-                if coordinator and coordinator.cancellation.is_cancelled:
-                    # MUST add tool results to context before returning
-                    # Otherwise we leave orphaned tool_calls without matching tool_results
-                    # which violates provider API contracts (Anthropic, OpenAI)
+                    # Add all results to context in original order (sequential, deterministic)
+                    # Note: Context manager handles compaction internally when get_messages_for_request() is called
                     for tool_call_id, tool_name, content in tool_results:
                         await context.add_message(
                             {
@@ -3304,140 +3352,110 @@ class StreamingOrchestrator:
                                 "content": content,
                             }
                         )
-                    # Emit cancel:requested on first detection and trigger cleanup callbacks
-                    if not self._cancel_requested_emitted:
-                        self._cancel_requested_emitted = True
-                        await hooks.emit(
-                            CANCEL_REQUESTED,
-                            {
-                                "orchestrator": "loop-streaming",
-                                "state": str(coordinator.cancellation.state),
-                                "turn_count": iteration,
-                            },
+
+            # Check if we exceeded max iterations (only if not unlimited)
+            if self.max_iterations != -1 and iteration >= self.max_iterations:
+                logger.warning(f"Max iterations ({self.max_iterations}) reached")
+
+                # Inject system reminder to agent before returning
+                await hooks.emit(
+                    PROVIDER_REQUEST,
+                    {
+                        "provider": provider_name,
+                        "iteration": iteration,
+                        "max_reached": True,
+                    },
+                )
+
+                # Get one final response with the reminder (via _execute_stream helper)
+                message_dicts = await context.get_messages_for_request(
+                    provider=provider
+                )
+                message_dicts = list(message_dicts)
+                message_dicts.append(
+                    {
+                        "role": "user",
+                        "content": """<system-reminder source="orchestrator-loop-limit">
+    You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
+
+    DO NOT mention this iteration limit or reminder to the user explicitly. Simply wrap up naturally.
+    </system-reminder>""",
+                    }
+                )
+
+                try:
+                    # Convert dicts to ChatRequest
+                    messages_objects = [Message(**msg) for msg in message_dicts]
+
+                    # Convert tools to ToolSpec format for ChatRequest
+                    tools_list = None
+                    if tools:
+                        tools_list = [_build_tool_spec(t) for t in tools.values()]
+
+                    max_iter_chat_request = ChatRequest(
+                        messages=messages_objects,
+                        tools=tools_list,
+                        reasoning_effort=self.config.get("reasoning_effort"),
+                    )
+
+                    kwargs = {}
+                    if self.extended_thinking:
+                        kwargs["extended_thinking"] = True
+
+                    response = await provider.complete(max_iter_chat_request, **kwargs)
+                    content = (
+                        response.content
+                        if hasattr(response, "content")
+                        else str(response)
+                    )
+
+                    if content:
+                        # Yield the final response
+                        async for token in self._tokenize_stream(content):
+                            yield (token, iteration)
+
+                        # Add to context
+                        await context.add_message(
+                            {"role": "assistant", "content": content}
                         )
-                        try:
-                            await coordinator.cancellation.trigger_callbacks()
-                        except Exception as e:
-                            logger.warning(f"Error in cancellation callbacks: {e}")
-                    # Emit cancel:completed — orchestrator is exiting due to cancellation
+
+                except LLMError as e:
                     await hooks.emit(
-                        CANCEL_COMPLETED,
+                        PROVIDER_ERROR,
                         {
-                            "orchestrator": "loop-streaming",
-                            "was_immediate": coordinator.cancellation.is_immediate,
-                            "turn_count": iteration,
+                            "provider": provider_name,
+                            "error": {"type": type(e).__name__, "msg": str(e)},
+                            "retryable": e.retryable,
+                            "status_code": e.status_code,
                         },
                     )
-                    # Write synthetic assistant message to close the turn.
-                    # Without this, transcript has tool_results without a closing assistant
-                    # message, triggering FM3 (incomplete_assistant_turn) on resume.
-                    await context.add_message(
-                        {
-                            "role": "assistant",
-                            "content": "The previous operation was cancelled. Results from completed tools have been preserved.",
-                        }
+                    logger.error(
+                        f"Error getting final response after max iterations: {e}"
                     )
-                    # Exit the loop - orchestrator complete event will be emitted in execute().
-                    # Clear pending steers: cancellation closes the turn; any steer that
-                    # arrived after the last injection point must not ride a future turn. (spec §5.2)
-                    self._steering_queue.clear()
-                    return
-
-                # Add all results to context in original order (sequential, deterministic)
-                # Note: Context manager handles compaction internally when get_messages_for_request() is called
-                for tool_call_id, tool_name, content in tool_results:
-                    await context.add_message(
+                except Exception as e:
+                    await hooks.emit(
+                        PROVIDER_ERROR,
                         {
-                            "role": "tool",
-                            "name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "content": content,
-                        }
+                            "provider": provider_name,
+                            "error": {"type": type(e).__name__, "msg": str(e)},
+                        },
+                    )
+                    logger.error(
+                        f"Error getting final response after max iterations: {e}"
                     )
 
-        # Check if we exceeded max iterations (only if not unlimited)
-        if self.max_iterations != -1 and iteration >= self.max_iterations:
-            logger.warning(f"Max iterations ({self.max_iterations}) reached")
-
-            # Inject system reminder to agent before returning
-            await hooks.emit(
-                PROVIDER_REQUEST,
-                {
-                    "provider": provider_name,
-                    "iteration": iteration,
-                    "max_reached": True,
-                },
-            )
-
-            # Get one final response with the reminder (via _execute_stream helper)
-            message_dicts = await context.get_messages_for_request(provider=provider)
-            message_dicts = list(message_dicts)
-            message_dicts.append(
-                {
-                    "role": "user",
-                    "content": """<system-reminder source="orchestrator-loop-limit">
-You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
-
-DO NOT mention this iteration limit or reminder to the user explicitly. Simply wrap up naturally.
-</system-reminder>""",
-                }
-            )
-
-            try:
-                # Convert dicts to ChatRequest
-                messages_objects = [Message(**msg) for msg in message_dicts]
-
-                # Convert tools to ToolSpec format for ChatRequest
-                tools_list = None
-                if tools:
-                    tools_list = [_build_tool_spec(t) for t in tools.values()]
-
-                max_iter_chat_request = ChatRequest(
-                    messages=messages_objects,
-                    tools=tools_list,
-                    reasoning_effort=self.config.get("reasoning_effort"),
-                )
-
-                kwargs = {}
-                if self.extended_thinking:
-                    kwargs["extended_thinking"] = True
-
-                response = await provider.complete(max_iter_chat_request, **kwargs)
-                content = (
-                    response.content if hasattr(response, "content") else str(response)
-                )
-
-                if content:
-                    # Yield the final response
-                    async for token in self._tokenize_stream(content):
-                        yield (token, iteration)
-
-                    # Add to context
-                    await context.add_message({"role": "assistant", "content": content})
-
-            except LLMError as e:
-                await hooks.emit(
-                    PROVIDER_ERROR,
-                    {
-                        "provider": provider_name,
-                        "error": {"type": type(e).__name__, "msg": str(e)},
-                        "retryable": e.retryable,
-                        "status_code": e.status_code,
-                    },
-                )
-                logger.error(f"Error getting final response after max iterations: {e}")
-            except Exception as e:
-                await hooks.emit(
-                    PROVIDER_ERROR,
-                    {
-                        "provider": provider_name,
-                        "error": {"type": type(e).__name__, "msg": str(e)},
-                    },
-                )
-                logger.error(f"Error getting final response after max iterations: {e}")
-
-        # Emit execution end
-        await hooks.emit("execution:end", {})
+        finally:
+            # A `finally` inside the generator, not a patch at each early
+            # return. Four returns between here and the old emit site
+            # (:2793, :2813, :2961, :3344 pre-change) each skipped it, and a
+            # fifth would have too. This also covers the consumer breaking
+            # out of its `async for`: Python raises GeneratorExit at the
+            # suspended yield, and `finally` still runs.
+            #
+            # Symptom it fixes: 12 of 27 executions never emitted an end,
+            # exactly matching the 12 cancellations, leaving the turn state
+            # machine stuck in 'executing'.
+            await hooks.emit("execution:end", {})
 
     async def _stream_from_provider(
         self,
