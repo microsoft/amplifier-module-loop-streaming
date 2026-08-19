@@ -992,6 +992,10 @@ class StreamingOrchestrator:
         # callers of the tool-execution methods never hit an
         # AttributeError.
         self._tool_calls_this_turn: int = 0
+        # Identical-failure counter for the circuit breaker. Keyed on
+        # (tool, arguments, error) so only a call that fails the SAME way
+        # counts -- see `_apply_failure_breaker`.
+        self._repeated_failures: dict[str, int] = {}
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
         # Track whether cancel:requested has been emitted for the current execution
@@ -3629,6 +3633,57 @@ class StreamingOrchestrator:
             tool_call, tools, context, hooks, coordinator
         )
 
+    _FAILURE_BREAKER_THRESHOLD = 3
+
+    def _apply_failure_breaker(self, tool_call, result):
+        """Tell the model when a call keeps failing the exact same way.
+
+        Observed in session ``eec9ae98``: the SAME failing ``read_file`` call
+        was issued 13 times with nothing intervening. Whitespace-malformed
+        arguments fail deterministically -- same input, same error, forever --
+        so an agent that cannot notice the repetition burns tokens and
+        wall-clock producing nothing.
+
+        Keyed on (tool, arguments, error) and NOT on arguments alone, because
+        legitimate repeats exist: polling a file being written, ``git status``
+        in a loop, retrying after fixing something externally. Only a call that
+        fails the SAME way counts toward the trip.
+
+        The trip is SURFACED to the model, never silently dropped -- a silent
+        breaker is the same class of bug as a silent argument rewrite. The tool
+        still ran and its real error is preserved; a note is appended.
+        """
+        if getattr(result, "success", True):
+            return result
+
+        error = getattr(result, "error", None) or {}
+        message = error.get("message", "") if isinstance(error, dict) else str(error)
+        try:
+            arguments = json.dumps(tool_call.arguments, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            arguments = str(tool_call.arguments)
+        key = f"{tool_call.name}\x00{arguments}\x00{message}"
+
+        count = self._repeated_failures.get(key, 0) + 1
+        self._repeated_failures[key] = count
+        if count < self._FAILURE_BREAKER_THRESHOLD:
+            return result
+
+        logger.warning(
+            f"Identical failure repeated {count}x for tool '{tool_call.name}'; "
+            f"surfacing a breaker note to the model"
+        )
+        return ToolResult(
+            success=False,
+            error={
+                "message": (
+                    f"{message}\n\n[This exact call to `{tool_call.name}` has now failed "
+                    f"{count} times with an identical error. Repeating it will not "
+                    f"succeed. Change the arguments or take a different approach.]"
+                )
+            },
+        )
+
     async def _execute_tool_only(
         self,
         tool_call,
@@ -3750,6 +3805,8 @@ class StreamingOrchestrator:
                         coordinator._tool_dispatch_contexts.pop(
                             asyncio.current_task(), None
                         )
+
+            result = self._apply_failure_breaker(tool_call, result)
 
             # Serialize result for logging
             result_data = (
@@ -3930,6 +3987,8 @@ class StreamingOrchestrator:
                     coordinator._tool_dispatch_contexts.pop(
                         asyncio.current_task(), None
                     )
+
+            result = self._apply_failure_breaker(tool_call, result)
 
             # Serialize result for logging
             result_data = (
