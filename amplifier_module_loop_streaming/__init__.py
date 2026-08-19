@@ -3664,6 +3664,28 @@ class StreamingOrchestrator:
                         f"Denied by hook: {pre_result.reason}",
                     )
 
+                # Adopt hook-modified arguments. The kernel NORMALIZES a
+                # `modify` result away: `emit()` returns `action="continue"`
+                # with the modified payload in `data`, so a check for
+                # `action == "modify"` can never fire and the documented
+                # pattern in ORCHESTRATOR_CONTRACT.md is unreachable code.
+                # Reading `data` unconditionally is the only consumption that
+                # works -- `emit()` always populates it.
+                #
+                # Without this, every `tool:pre` handler that rewrites input
+                # (argument normalization, path jailing, secret scrubbing) is a
+                # silent no-op: the hook runs, returns its correction, and the
+                # original arguments execute anyway. `tool:post` already honors
+                # modifications; this makes `tool:pre` symmetric.
+                # `isinstance(dict)` and not just truthiness: a partial or
+                # mocked result can carry a non-dict `data`, and adopting from
+                # it would replace real arguments with nonsense.
+                hook_data = pre_result.data
+                if isinstance(hook_data, dict):
+                    hook_input = hook_data.get("tool_input")
+                    if hook_input is not None and hook_input != tool_call.arguments:
+                        tool_call.arguments = hook_input
+
             # Get tool
             tool = tools.get(tool_call.name)
             if not tool:
@@ -3843,6 +3865,28 @@ class StreamingOrchestrator:
                     )
                     response_added = True
                     return {"success": False, "error": f"Denied: {pre_result.reason}"}
+
+                # Adopt hook-modified arguments. The kernel NORMALIZES a
+                # `modify` result away: `emit()` returns `action="continue"`
+                # with the modified payload in `data`, so a check for
+                # `action == "modify"` can never fire and the documented
+                # pattern in ORCHESTRATOR_CONTRACT.md is unreachable code.
+                # Reading `data` unconditionally is the only consumption that
+                # works -- `emit()` always populates it.
+                #
+                # Without this, every `tool:pre` handler that rewrites input
+                # (argument normalization, path jailing, secret scrubbing) is a
+                # silent no-op: the hook runs, returns its correction, and the
+                # original arguments execute anyway. `tool:post` already honors
+                # modifications; this makes `tool:pre` symmetric.
+                # `isinstance(dict)` and not just truthiness: a partial or
+                # mocked result can carry a non-dict `data`, and adopting from
+                # it would replace real arguments with nonsense.
+                hook_data = pre_result.data
+                if isinstance(hook_data, dict):
+                    hook_input = hook_data.get("tool_input")
+                    if hook_input is not None and hook_input != tool_call.arguments:
+                        tool_call.arguments = hook_input
 
             # Get tool
             tool = tools.get(tool_call.name)
