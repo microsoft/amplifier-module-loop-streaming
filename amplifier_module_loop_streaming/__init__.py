@@ -4064,9 +4064,12 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     kwargs["extended_thinking"] = True
 
                 response = await provider.complete(max_iter_chat_request, **kwargs)
-                content = (
-                    response.content if hasattr(response, "content") else str(response)
-                )
+                if hasattr(response, "text") and response.text:
+                    content = response.text
+                elif hasattr(response, "content"):
+                    content = self._extract_text_from_content(response.content)
+                else:
+                    content = str(response)
 
                 if content:
                     # Yield the final response

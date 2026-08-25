@@ -184,7 +184,7 @@ async def test_reasoning_effort_on_max_iterations_fallback():
 
     provider = ToolCallThenTextProvider()
 
-    await orchestrator.execute(
+    result = await orchestrator.execute(
         prompt="Test",
         context=context,
         providers={"default": provider},
@@ -195,6 +195,7 @@ async def test_reasoning_effort_on_max_iterations_fallback():
     assert call_count == 2
     assert hasattr(provider, "last_request")
     assert provider.last_request.reasoning_effort == "high"
+    assert result == "Final response"
 
 
 # ---------------------------------------------------------------------------
