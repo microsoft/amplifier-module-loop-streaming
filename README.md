@@ -43,7 +43,14 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 module = "loop-streaming"
 name = "streaming"
 config = {
-    max_iterations = -1,             # Maximum iterations (-1 = unlimited, default)
+    max_iterations = -1,             # Maximum LLM calls for a single execute() turn
+                                      # (-1 = unlimited, default). This is also the
+                                      # mechanism a delegated child session's call
+                                      # budget is enforced through -- see "Delegated-
+                                      # session call budget (Layer 1)" below.
+    budget_warn_ratio = 0.8,         # Fraction of max_iterations at which a one-shot
+                                      # "start converging" system-reminder is injected
+                                      # (see below). Inert when max_iterations is -1.
     goal_stall_threshold = 3,        # /goal: consecutive no-tool continuation turns
                                       # before the stall judge is consulted
     goal_model_role = "fast",        # /goal: routing-matrix model role requested for
@@ -76,6 +83,60 @@ config = {
                                       # limiting; 0 = disabled)
 }
 ```
+
+## Delegated-session call budget (Layer 1)
+
+`max_iterations` doubles as the enforcement mechanism for a per-session-leg
+LLM-call budget (see `microsoft/amplifier-foundation`'s `tool-delegate`
+module, which injects a value here via `orchestrator_config` when it spawns
+a child session -- this module has no concept of "delegation" itself; it
+only counts main-loop LLM calls against whatever `max_iterations` it was
+given, root session or child).
+
+**Exhaustion is a normal turn ending, not an error.** When `iteration`
+reaches `max_iterations`, the loop makes **one additional** tool-less
+`provider.complete()` call with an injected
+`<system-reminder source="orchestrator-loop-limit">` asking the agent to
+wrap up and summarize -- so a budget of `N` permits at most `N + 1`
+main-loop provider calls, not `N`. This wrap-up call ends the turn with a
+normal return (`execution:end` fires, no exception raised), so the caller's
+usual persistence path runs and the resulting transcript is complete and
+resumable.
+
+`ORCHESTRATOR_COMPLETE`'s payload always carries a `metadata` bag:
+
+```python
+{
+    "llm_calls": 300,             # main-loop iterations actually used (not goal-loop internal calls -- see below)
+    "llm_call_budget": 300,       # the max_iterations this turn ran under, or None if unlimited
+    "budget_exhausted": True,     # whether this turn hit the budget (vs. finishing early)
+    "resumable": True,            # whether this exit path guarantees the transcript was persisted
+}
+```
+
+`status` gains a new value, `"budget_exhausted"`, with precedence
+`error > cancelled > budget_exhausted > success/incomplete` -- budget
+exhaustion sits above `success` because the wrap-up call fills the response
+with the agent's own summary text, which would otherwise look identical to
+an ordinary completed turn.
+
+At `budget_warn_ratio` (default 80%) of `max_iterations`, the loop emits
+`orchestrator:budget_warning` once per turn and injects a
+`<system-reminder>` telling the agent how many calls remain and to start
+converging. This is a single flat threshold, not an escalation ladder --
+unlike `hooks-progress-monitor` (which escalates because it is *guessing*
+the agent is stuck), the budget here is a known fact the agent can act on
+directly.
+
+The `/goal` auto-continue loop's own internal calls (evaluator, stall
+judge, run summary -- emitted with `iteration: 0`) are **not** counted
+against `max_iterations`; they are separately bounded by
+`goal_stall_threshold` and are ~3 calls per goal turn. This keeps the
+budget coupled to real conversational turns, not goal-loop internals.
+
+Both `max_iterations` and `budget_warn_ratio` default to today's behavior
+(unlimited, and an inert ratio) -- this feature is fully opt-in and ships
+with zero effect until a caller sets a budget.
 
 ## Usage
 
