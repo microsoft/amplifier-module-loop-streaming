@@ -575,6 +575,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "execution:end",  # When orchestrator execution completes
             "orchestrator:steering_injected",  # When a steer message is injected mid-turn
             "orchestrator:goal_progress",  # /goal auto-continue loop progress (see docs/designs/goal-command.md)
+            "orchestrator:budget_warning",  # Layer 1 call budget at budget_warn_ratio (see _execute_stream)
         ],
     )
 
@@ -873,6 +874,12 @@ class StreamingOrchestrator:
         # -1 means unlimited iterations (default)
         max_iter_config = config.get("max_iterations", -1)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
+        # Layer 1 call-budget warning threshold (spec: 298-replacement).
+        # Fraction of max_iterations at which a one-shot "start converging"
+        # nudge fires -- see the 80%-warning block in _execute_stream. Inert
+        # when max_iterations is -1 (unlimited), which is the default, so
+        # this ships dark until a caller (e.g. tool-delegate) sets a budget.
+        self.budget_warn_ratio: float = float(config.get("budget_warn_ratio", 0.8))
         # /goal stall detection: consecutive continuation turns with zero tool
         # calls required before the stall judge is even consulted (see
         # execute()'s stall-detection block and _judge_stall).
@@ -994,6 +1001,12 @@ class StreamingOrchestrator:
         # callers of the tool-execution methods never hit an
         # AttributeError.
         self._tool_calls_this_turn: int = 0
+        # Layer 1 call-budget bookkeeping (spec: 298-replacement). Both are
+        # per-execute()-call state, reset in _execute_one_turn alongside
+        # _tool_calls_this_turn. Initialized here so a fresh instance never
+        # AttributeErrors before its first _execute_one_turn call.
+        self._budget_exhausted: bool = False
+        self._budget_warned: bool = False
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
         # Track whether cancel:requested has been emitted for the current execution
@@ -1452,6 +1465,10 @@ class StreamingOrchestrator:
         # increment it) so execute()'s stall detection can read an accurate
         # "did this turn run any tools" count once this method returns.
         self._tool_calls_this_turn = 0
+        # Layer 1 call-budget bookkeeping, reset per turn alongside
+        # _tool_calls_this_turn above (spec: 298-replacement).
+        self._budget_exhausted = False
+        self._budget_warned = False
         full_response = ""
         iteration_count = 0
         error: Exception | None = None
@@ -1466,10 +1483,17 @@ class StreamingOrchestrator:
             error = e
 
         # Always emit orchestrator complete event (observability)
+        # Precedence: error > cancelled > budget_exhausted > success/incomplete.
+        # budget_exhausted sits ABOVE success because the wrap-up call (see
+        # the exhaustion branch in _execute_stream) fills full_response with
+        # the agent's own summary text, which would otherwise collapse to
+        # "success" and hide the exhaustion from the caller entirely.
         if error:
             status = "error"
         elif coordinator and coordinator.cancellation.is_cancelled:
             status = "cancelled"
+        elif self._budget_exhausted:
+            status = "budget_exhausted"
         else:
             status = "success" if full_response else "incomplete"
 
@@ -1495,6 +1519,27 @@ class StreamingOrchestrator:
             # above -- additive field, same discriminator pattern as
             # goal_turn/goal_final).
             "continuations": goal_state.get("continuations") if goal_state else None,
+            # Layer 1 call-budget telemetry (spec: 298-replacement). Always
+            # present (not gated on budget_exhausted) so a caller (e.g.
+            # tool-delegate) can observe the healthy llm_calls distribution
+            # even when no budget ever fires -- this is what lets S0 measure
+            # before S2/S3 ever enforce anything.
+            #
+            # `resumable` is a statement about THIS code path, not a wish:
+            # success/incomplete/budget_exhausted all reach this point via a
+            # normal return (no exception propagated past _execute_stream),
+            # so the caller's persistence step runs. error/cancelled do not
+            # get that guarantee here -- error re-raises below, and this
+            # module has no visibility into whether an upstream cancellation
+            # (e.g. a delegate's hard wall-clock deadline) skips the save.
+            "metadata": {
+                "llm_calls": iteration_count,
+                "llm_call_budget": (
+                    self.max_iterations if self.max_iterations != -1 else None
+                ),
+                "budget_exhausted": self._budget_exhausted,
+                "resumable": status in ("success", "incomplete", "budget_exhausted"),
+            },
         }
         if goal_turn is None:
             await hooks.emit(ORCHESTRATOR_COMPLETE, payload)
@@ -2800,6 +2845,50 @@ class StreamingOrchestrator:
             # round, before the next provider call" — the single natural boundary.
             await self._drain_steering(context, hooks, iteration)
 
+            # Layer 1 call-budget warning (spec: 298-replacement). One-shot per
+            # turn: once iteration reaches budget_warn_ratio (default 80%) of
+            # max_iterations, nudge the agent to start converging while it
+            # still has runway left, rather than hitting the hard cutoff cold.
+            # Deliberately a single flat threshold, not an escalation ladder --
+            # hooks-progress-monitor escalates because it is *guessing* the
+            # agent is stuck; here the budget is a known fact and the agent
+            # has a real number, so a ladder would be complexity without
+            # value. Inert (never fires) when max_iterations is -1
+            # (unlimited), which is the default -- ships dark until a caller
+            # sets a budget.
+            if (
+                self.max_iterations != -1
+                and not self._budget_warned
+                and iteration
+                >= max(1, int(self.max_iterations * self.budget_warn_ratio))
+            ):
+                self._budget_warned = True
+                remaining = self.max_iterations - iteration
+                await hooks.emit(
+                    "orchestrator:budget_warning",
+                    {
+                        "orchestrator": "loop-streaming",
+                        "iteration": iteration,
+                        "budget": self.max_iterations,
+                        "remaining": remaining,
+                    },
+                )
+                await context.add_message(
+                    {
+                        "role": "user",
+                        "content": (
+                            '<system-reminder source="orchestrator-loop-limit">\n'
+                            f"You have used {iteration} of {self.max_iterations} LLM "
+                            f"calls for this turn. About {remaining} remain.\n\n"
+                            "Start converging now. Finish the highest-value thread "
+                            "you have open, then summarise what you found and what "
+                            "remains. Do not start new exploration branches.\n\n"
+                            "Do not mention this budget to the user.\n"
+                            "</system-reminder>"
+                        ),
+                    }
+                )
+
             # Emit provider request BEFORE getting messages (allows hook injections)
             result = await hooks.emit(
                 PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration}
@@ -3357,6 +3446,11 @@ class StreamingOrchestrator:
 
         # Check if we exceeded max iterations (only if not unlimited)
         if self.max_iterations != -1 and iteration >= self.max_iterations:
+            # Layer 1 call-budget bookkeeping (spec: 298-replacement). Read by
+            # _execute_one_turn's status precedence and the payload's
+            # metadata bag -- this is the ONLY place it is set to True; it is
+            # reset to False at the top of every _execute_one_turn call.
+            self._budget_exhausted = True
             logger.warning(f"Max iterations ({self.max_iterations}) reached")
 
             # Inject system reminder to agent before returning
@@ -3387,14 +3481,18 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 # Convert dicts to ChatRequest
                 messages_objects = [Message(**msg) for msg in message_dicts]
 
-                # Convert tools to ToolSpec format for ChatRequest
-                tools_list = None
-                if tools:
-                    tools_list = [_build_tool_spec(t) for t in tools.values()]
-
+                # Deliberately tool-less (spec: 298-replacement D3 -- "one
+                # final tool-less wrap-up LLM call"). Offering tools here
+                # would let the model emit a tool_calls-only response with
+                # no text; this code path never calls parse_tool_calls() or
+                # processes a tool_call, so that response's content would be
+                # empty and the wrap-up would silently produce no summary --
+                # defeating Layer 1's whole point (success criterion: "a
+                # non-empty agent-authored response"). Forcing tools=None
+                # guarantees the model must answer in text.
                 max_iter_chat_request = ChatRequest(
                     messages=messages_objects,
-                    tools=tools_list,
+                    tools=None,
                     reasoning_effort=self.config.get("reasoning_effort"),
                 )
 
@@ -3437,7 +3535,13 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 logger.error(f"Error getting final response after max iterations: {e}")
 
         # Emit execution end
-        await hooks.emit("execution:end", {})
+        await hooks.emit(
+            "execution:end",
+            {
+                "response": "",
+                "status": "budget_exhausted" if self._budget_exhausted else "completed",
+            },
+        )
 
     async def _stream_from_provider(
         self,
