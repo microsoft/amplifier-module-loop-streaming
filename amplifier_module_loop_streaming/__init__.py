@@ -1009,6 +1009,24 @@ class StreamingOrchestrator:
         self._budget_warned: bool = False
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
+        # Ephemeral-cache fix (spec: ephemeral-cache-fix-spec.md §5.3). Default
+        # "tail" is byte-identical to today's behavior -- the persist path
+        # below is unreachable unless explicitly configured. An unknown value
+        # falls back to "tail" with a logged warning (mirrors
+        # amplifier_module_provider_openai's handling of an unknown
+        # reasoning_replay_scope -- same repo-family convention: fail visible
+        # and safe, never silently misbehave).
+        _ephemeral_injection_mode = (config or {}).get(
+            "ephemeral_injection_mode", "tail"
+        )
+        if _ephemeral_injection_mode not in ("tail", "persist"):
+            logger.warning(
+                "Unknown ephemeral_injection_mode %r; falling back to 'tail'.",
+                _ephemeral_injection_mode,
+            )
+            _ephemeral_injection_mode = "tail"
+        self._ephemeral_injection_mode: str = _ephemeral_injection_mode
+        self._last_persisted_injection: str | None = None
         # Track whether cancel:requested has been emitted for the current execution
         self._cancel_requested_emitted: bool = False
         # Bounded queue for mid-turn steering messages (session.steer capability)
@@ -2906,14 +2924,58 @@ class StreamingOrchestrator:
             message_dicts = await context.get_messages_for_request(provider=provider)
             message_dicts = list(message_dicts)  # Convert to list for modification
 
-            # Append ephemeral injection if present (temporary, not stored)
+            # Append ephemeral injection if present (temporary, not stored --
+            # unless ephemeral_injection_mode == "persist", see below).
             if (
                 result.action == "inject_context"
                 and result.ephemeral
                 and result.context_injection
             ):
+                if self._ephemeral_injection_mode == "persist":
+                    # Ephemeral-cache fix (ephemeral-cache-fix-spec.md §5.1/§5.3):
+                    # write the injection into CANONICAL context via
+                    # context.add_message(...), and ONLY when its text differs
+                    # from the last text this orchestrator persisted. When
+                    # unchanged, do nothing -- the request is then a pure
+                    # append of the new assistant/tool turn, which is what
+                    # makes request N a true prefix of request N+1 (the
+                    # property arm D's healed shape and this mode both share).
+                    #
+                    # Contract change accepted knowingly (spec §5.2): once
+                    # persisted, this message is no longer "removed next
+                    # turn" -- it is real history from here on, still marked
+                    # metadata.ephemeral=True (now meaning "machine-generated
+                    # per-turn scaffolding, not a user turn", not "guaranteed
+                    # absent next turn" -- see models.py's updated docstring).
+                    if result.context_injection != self._last_persisted_injection:
+                        await context.add_message(
+                            {
+                                "role": result.context_injection_role,
+                                "content": result.context_injection,
+                                "metadata": {"ephemeral": True, "persisted": True},
+                            }
+                        )
+                        self._last_persisted_injection = result.context_injection
+                        logger.debug(
+                            "Persisted changed ephemeral injection into canonical context"
+                        )
+                        # Re-fetch so the newly persisted message is present
+                        # and budgeted on THIS request too, not just the next
+                        # one. get_messages_for_request is pure w.r.t.
+                        # self.messages (context-simple returns a new list;
+                        # it never mutates in place), so this is an extra
+                        # call, not a reordering.
+                        message_dicts = await context.get_messages_for_request(
+                            provider=provider
+                        )
+                        message_dicts = list(message_dicts)
+                    else:
+                        logger.debug(
+                            "Ephemeral injection text unchanged -- skipping persist "
+                            "(change-gate); request is a pure append this iteration"
+                        )
                 # Check if we should append to last tool result
-                if result.append_to_last_tool_result and len(message_dicts) > 0:
+                elif result.append_to_last_tool_result and len(message_dicts) > 0:
                     last_msg = message_dicts[-1]
                     # Append to last message if it's a tool result
                     if last_msg.get("role") == "tool":
@@ -2957,21 +3019,67 @@ class StreamingOrchestrator:
 
             # Apply pending ephemeral injections from tool:post hooks
             if self._pending_ephemeral_injections:
-                for injection in self._pending_ephemeral_injections:
-                    if (
-                        injection.get("append_to_last_tool_result")
-                        and len(message_dicts) > 0
-                    ):
-                        last_msg = message_dicts[-1]
-                        if last_msg.get("role") == "tool":
-                            original_content = last_msg.get("content", "")
-                            message_dicts[-1] = {
-                                **last_msg,
-                                "content": f"{original_content}\n\n{injection['content']}",
-                            }
-                            logger.debug(
-                                "Applied pending ephemeral injection to last tool result"
+                if self._ephemeral_injection_mode == "persist":
+                    # Same change-gate as the provider:request path above,
+                    # applied per pending injection (spec §5.3).
+                    _any_persisted = False
+                    for injection in self._pending_ephemeral_injections:
+                        text = injection["content"]
+                        if text != self._last_persisted_injection:
+                            await context.add_message(
+                                {
+                                    "role": injection["role"],
+                                    "content": text,
+                                    "metadata": {"ephemeral": True, "persisted": True},
+                                }
                             )
+                            self._last_persisted_injection = text
+                            _any_persisted = True
+                            logger.debug(
+                                "Persisted changed pending ephemeral injection into "
+                                "canonical context"
+                            )
+                        else:
+                            logger.debug(
+                                "Pending ephemeral injection text unchanged -- "
+                                "skipping persist (change-gate)"
+                            )
+                    if _any_persisted:
+                        message_dicts = await context.get_messages_for_request(
+                            provider=provider
+                        )
+                        message_dicts = list(message_dicts)
+                else:
+                    for injection in self._pending_ephemeral_injections:
+                        if (
+                            injection.get("append_to_last_tool_result")
+                            and len(message_dicts) > 0
+                        ):
+                            last_msg = message_dicts[-1]
+                            if last_msg.get("role") == "tool":
+                                original_content = last_msg.get("content", "")
+                                message_dicts[-1] = {
+                                    **last_msg,
+                                    "content": f"{original_content}\n\n{injection['content']}",
+                                }
+                                logger.debug(
+                                    "Applied pending ephemeral injection to last tool result"
+                                )
+                            else:
+                                # metadata.ephemeral marks this as regenerated-per-turn
+                                # content so the provider never places a prompt-cache
+                                # breakpoint on it (see
+                                # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
+                                message_dicts.append(
+                                    {
+                                        "role": injection["role"],
+                                        "content": injection["content"],
+                                        "metadata": {"ephemeral": True},
+                                    }
+                                )
+                                logger.debug(
+                                    "Last message not a tool result, created new message for injection"
+                                )
                         else:
                             # metadata.ephemeral marks this as regenerated-per-turn
                             # content so the provider never places a prompt-cache
@@ -2985,24 +3093,9 @@ class StreamingOrchestrator:
                                 }
                             )
                             logger.debug(
-                                "Last message not a tool result, created new message for injection"
+                                "Applied pending ephemeral injection as new message"
                             )
-                    else:
-                        # metadata.ephemeral marks this as regenerated-per-turn
-                        # content so the provider never places a prompt-cache
-                        # breakpoint on it (see
-                        # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
-                        message_dicts.append(
-                            {
-                                "role": injection["role"],
-                                "content": injection["content"],
-                                "metadata": {"ephemeral": True},
-                            }
-                        )
-                        logger.debug(
-                            "Applied pending ephemeral injection as new message"
-                        )
-                # Clear pending injections after applying
+                # Clear pending injections after applying (both modes)
                 self._pending_ephemeral_injections = []
 
             # Convert dicts to ChatRequest for provider
