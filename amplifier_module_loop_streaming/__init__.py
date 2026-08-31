@@ -321,7 +321,7 @@ _REMINDER_TAIL_HEADER = (
 )
 
 
-def _wrap_reminders(body: str, *, tail: bool) -> str:
+def _wrap_reminders(body: str, *, tail: bool, header: bool = True) -> str:
     """Wrap a merged hook-injection blob in the ``<system-reminders>`` envelope.
 
     ``body`` is inserted verbatim -- individual sources that already carry
@@ -333,12 +333,32 @@ def _wrap_reminders(body: str, *, tail: bool) -> str:
     Empty/whitespace-only ``body`` returns ``""`` -- callers must not write
     a message at all in that case (no bare envelope is ever produced).
 
+    ``header`` (default ``True``) controls whether the descriptive boilerplate
+    prose (the "these are NOT from the user" paragraph) is included.
+    Canonical (persisted) history is append-only, so once a reminder envelope
+    carrying the FULL boilerplate has been persisted for the current turn,
+    every subsequent persisted envelope in that SAME turn passes
+    ``header=False`` here -- the ``<system-reminders>`` / ``</system-reminders>``
+    tags are still emitted (so the foundation ``is_real_user_message`` prefix
+    match, and per-source attribution, both still hold), but the repeated
+    prose is omitted. This is a WRITE-TIME decision (see
+    ``self._turn_header_persisted`` in ``_execute_stream``/``_execute_one_turn``)
+    -- older, already-persisted messages are NEVER retroactively edited (that
+    would change already-cached bytes and re-bust the provider's prompt
+    cache), so exactly one envelope per turn is the "current" one to carry
+    the full framing text, and it is always the OLDEST one for that turn,
+    never a later one being "promoted". See reminder-redesign-spec.md's D2
+    fix note (rr wave 20260831, envelope-accumulation finding) for the full
+    rationale.
+
     Pure and side-effect free by design, so it is directly unit-testable.
     """
     if not body or not body.strip():
         return ""
-    header = _REMINDER_TAIL_HEADER if tail else _REMINDER_PRE_USER_HEADER
-    return f"{_REMINDER_ENVELOPE_OPEN}\n{header}\n\n{body}\n{_REMINDER_ENVELOPE_CLOSE}"
+    if not header:
+        return f"{_REMINDER_ENVELOPE_OPEN}\n{body}\n{_REMINDER_ENVELOPE_CLOSE}"
+    header_text = _REMINDER_TAIL_HEADER if tail else _REMINDER_PRE_USER_HEADER
+    return f"{_REMINDER_ENVELOPE_OPEN}\n{header_text}\n\n{body}\n{_REMINDER_ENVELOPE_CLOSE}"
 
 
 def _last_real_user_index(msgs: list[dict[str, Any]]) -> int | None:
@@ -1120,6 +1140,14 @@ class StreamingOrchestrator:
             _ephemeral_injection_mode = "persist"
         self._ephemeral_injection_mode: str = _ephemeral_injection_mode
         self._last_persisted_injection: str | None = None
+        # D2 fix (rr wave 20260831 -- envelope accumulation). True once a
+        # PERSISTED reminder envelope carrying the full descriptive header
+        # has been written for the CURRENT turn; every subsequent persisted
+        # envelope in the same turn is written with header=False (see
+        # _wrap_reminders). Reset per turn in _execute_one_turn, alongside
+        # the other turn-scoped reminder state below -- each new turn gets
+        # its own fresh "current" envelope with the full framing text.
+        self._turn_header_persisted: bool = False
         # Reminder placement (reminder-redesign-spec.md, W1). "pre_user"
         # (default): the turn's reminder block is written BEFORE the user
         # prompt -- in canonical history for persist mode, in the request
@@ -1613,6 +1641,9 @@ class StreamingOrchestrator:
         # turn must never leak into this one.
         self._turn_start_view_block = None
         self._turn_start_request_spent = False
+        # D2 fix (rr wave 20260831): each new turn re-earns its own "current"
+        # envelope carrying the full descriptive header.
+        self._turn_header_persisted = False
         full_response = ""
         iteration_count = 0
         error: Exception | None = None
@@ -3020,7 +3051,11 @@ class StreamingOrchestrator:
                         await context.add_message(
                             {
                                 "role": "user",
-                                "content": _wrap_reminders(turn_start_body, tail=False),
+                                "content": _wrap_reminders(
+                                    turn_start_body,
+                                    tail=False,
+                                    header=not self._turn_header_persisted,
+                                ),
                                 "metadata": {
                                     "ephemeral": True,
                                     "persisted": True,
@@ -3029,6 +3064,7 @@ class StreamingOrchestrator:
                             }
                         )
                         self._last_persisted_injection = turn_start_body
+                        self._turn_header_persisted = True
                 else:
                     # tail injection mode: never persisted into canonical
                     # context; spliced into the request VIEW at iteration 1
@@ -3141,6 +3177,7 @@ class StreamingOrchestrator:
                             "Do not mention this budget to the user.\n"
                             "</system-reminder>",
                             tail=True,
+                            header=not self._turn_header_persisted,
                         ),
                         "metadata": {
                             "ephemeral": True,
@@ -3149,6 +3186,7 @@ class StreamingOrchestrator:
                         },
                     }
                 )
+                self._turn_header_persisted = True
 
             # Emit provider request BEFORE getting messages (allows hook
             # injections). Skipped for iteration 1 when the turn-start
@@ -3266,7 +3304,9 @@ class StreamingOrchestrator:
                             {
                                 "role": "user",
                                 "content": _wrap_reminders(
-                                    result.context_injection, tail=True
+                                    result.context_injection,
+                                    tail=True,
+                                    header=not self._turn_header_persisted,
                                 ),
                                 "metadata": {
                                     "ephemeral": True,
@@ -3276,6 +3316,7 @@ class StreamingOrchestrator:
                             }
                         )
                         self._last_persisted_injection = result.context_injection
+                        self._turn_header_persisted = True
                         logger.debug(
                             "Persisted changed ephemeral injection into canonical context"
                         )
@@ -3391,7 +3432,11 @@ class StreamingOrchestrator:
                             await context.add_message(
                                 {
                                     "role": "user",
-                                    "content": _wrap_reminders(pending_body, tail=True),
+                                    "content": _wrap_reminders(
+                                        pending_body,
+                                        tail=True,
+                                        header=not self._turn_header_persisted,
+                                    ),
                                     "metadata": {
                                         "ephemeral": True,
                                         "persisted": True,
@@ -3400,6 +3445,7 @@ class StreamingOrchestrator:
                                 }
                             )
                             self._last_persisted_injection = pending_body
+                            self._turn_header_persisted = True
                             logger.debug(
                                 "Persisted changed pending ephemeral injection(s) "
                                 "into canonical context"
