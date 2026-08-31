@@ -173,7 +173,11 @@ async def test_direct_ephemeral_injection_carries_metadata_flag() -> None:
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})
+    # Explicit "tail" mode: this test exercises the tail-append metadata
+    # stamping mechanism specifically (default flipped to "persist" --
+    # see test_ephemeral_cache_persist_mode.py -- which routes this
+    # injection through context.add_message() instead of a tail append).
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "tail"})
 
     await orch.execute(
         prompt="hello",
@@ -233,7 +237,10 @@ async def test_pending_ephemeral_injection_carries_metadata_flag() -> None:
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})
+    # Explicit "tail" mode: same rationale as test 1 above -- the pending-
+    # injection tail-append path is what this test targets, not the
+    # persist path that is now the default.
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "tail"})
 
     await orch.execute(
         prompt="hi again",
@@ -380,7 +387,11 @@ async def test_append_to_last_tool_result_still_concatenates_content() -> None:
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})
+    # Explicit "tail" mode: `append_to_last_tool_result` is only reachable
+    # when mode != "persist" (persist takes priority in the orchestrator's
+    # branch order -- see __init__.py). This test targets that tail-only
+    # concatenation behavior specifically, which is now non-default.
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "tail"})
 
     await orch.execute(
         prompt="continue",

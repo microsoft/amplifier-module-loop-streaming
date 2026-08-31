@@ -9,7 +9,7 @@ of request N+1, and the cache never advances past the static system prompt.
 
 The fix adds a config-gated third mode:
 
-    ephemeral_injection_mode: "tail" | "persist"   (default "tail")
+    ephemeral_injection_mode: "tail" | "persist"   (default "persist")
 
 In "persist" mode, an injection is written into CANONICAL context via
 `context.add_message(...)` only when its text differs from the last text
@@ -17,10 +17,18 @@ this orchestrator persisted. When unchanged, nothing is added, and the
 request is a pure append of the new assistant/tool turn -- append-only,
 i.e. request N IS a true prefix of request N+1.
 
+NOTE (default flip): #44 shipped this behind `default "tail"` because
+persist was unvalidated on Anthropic at the time. Both providers are now
+validated (OpenAI: 30+ in-vivo DTU runs; Anthropic: n=3 DTU S1 flip-gate
+runs, favorable on cache-read share, cost, wall time, and quality), so the
+default flipped to "persist" here. "tail" remains a fully supported,
+byte-identical-to-original explicit opt-out.
+
 These tests prove (per spec §6, in file order):
 
-  1. test_default_mode_is_byte_identical_to_today -- the regression guard on
-     the default: the "tail" path is untouched byte-for-byte.
+  1. test_tail_mode_is_byte_identical_to_original_behavior -- the regression
+     guard on the explicit opt-out: the "tail" path is untouched
+     byte-for-byte from the module's original pre-#44 behavior.
   2. test_persist_mode_adds_message_to_canonical_context
   3. test_persist_mode_suppresses_unchanged_injection -- the change-gate.
   4. test_persist_mode_emits_on_changed_injection
@@ -30,7 +38,10 @@ These tests prove (per spec §6, in file order):
      visible to `get_messages_for_request` (and therefore to any real
      context module's token accounting) on the very next call, not just
      "eventually".
-  7. test_unknown_mode_falls_back_to_tail_with_warning
+  7. test_unknown_mode_falls_back_to_persist_with_warning
+  8. test_default_mode_is_now_persist -- the default-flip guard: with NO
+     `ephemeral_injection_mode` key in config at all, the default is now
+     "persist", not "tail".
 """
 
 from __future__ import annotations
@@ -226,13 +237,15 @@ class NRoundToolProvider:
 
 
 # ---------------------------------------------------------------------------
-# 1. Default mode is byte-identical to today (the regression guard).
+# 1. Explicit "tail" opt-out is byte-identical to the module's original
+#    pre-#44 behavior (the regression guard on the now-non-default path).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_default_mode_is_byte_identical_to_today() -> None:
-    """With NO `ephemeral_injection_mode` key in config at all, the injected
+async def test_tail_mode_is_byte_identical_to_original_behavior() -> None:
+    """With `ephemeral_injection_mode: "tail"` EXPLICITLY configured (the
+    opt-out, now that the default has flipped to "persist"), the injected
     message must be a per-request TAIL append (metadata={"ephemeral": True},
     no `"persisted"` key) -- never routed through `context.add_message`."""
     from amplifier_core.events import PROVIDER_REQUEST
@@ -250,7 +263,7 @@ async def test_default_mode_is_byte_identical_to_today() -> None:
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})  # no ephemeral_injection_mode key at all
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "tail"})
 
     assert orch._ephemeral_injection_mode == "tail"
 
@@ -274,7 +287,7 @@ async def test_default_mode_is_byte_identical_to_today() -> None:
         if m.get("content") == "<system-reminder>static</system-reminder>"
     ]
     assert injected_via_add_message == [], (
-        "Default mode must never call context.add_message() for the "
+        "Explicit tail mode must never call context.add_message() for the "
         f"injection; got {ctx.add_message_calls!r}"
     )
 
@@ -289,6 +302,58 @@ async def test_default_mode_is_byte_identical_to_today() -> None:
         f"Expected metadata={{'ephemeral': True}} (no 'persisted' key), "
         f"got {injected[0].metadata!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_default_mode_is_now_persist() -> None:
+    """With NO `ephemeral_injection_mode` key in config at all, the default
+    is now "persist" (default flip, both providers validated) -- the
+    injection must be written into canonical context via
+    `context.add_message(...)`, not sent as a per-request tail append."""
+    from amplifier_core.events import PROVIDER_REQUEST
+
+    ctx = MockContext()
+    provider = RequestCapturingProvider()
+    hooks = ScriptedHooks(
+        {
+            PROVIDER_REQUEST: ScriptedHookResult(
+                action="inject_context",
+                ephemeral=True,
+                context_injection="<system-reminder>v1</system-reminder>",
+                context_injection_role="user",
+            ),
+        }
+    )
+    coordinator = MockCoordinator()
+    orch = StreamingOrchestrator({})  # no ephemeral_injection_mode key at all
+
+    assert orch._ephemeral_injection_mode == "persist"
+
+    await orch.execute(
+        prompt="hello",
+        context=ctx,  # type: ignore[arg-type]
+        providers={"main": provider},
+        tools={},
+        hooks=hooks,  # type: ignore[arg-type]
+        coordinator=coordinator,  # type: ignore[arg-type]
+    )
+
+    persisted = [
+        m
+        for m in ctx.add_message_calls
+        if m.get("content") == "<system-reminder>v1</system-reminder>"
+    ]
+    assert len(persisted) == 1, (
+        "Default (no config key) must now persist the injection via "
+        f"context.add_message(); got {ctx.add_message_calls!r}"
+    )
+    assert persisted[0]["metadata"] == {"ephemeral": True, "persisted": True}
+
+    sent_messages = provider.requests[0].messages
+    injected = [
+        m for m in sent_messages if m.content == "<system-reminder>v1</system-reminder>"
+    ]
+    assert len(injected) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -558,15 +623,16 @@ async def test_persist_mode_injection_is_budgeted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. Unknown mode falls back to "tail" with a logged warning.
+# 7. Unknown mode falls back to "persist" (the new default) with a logged
+#    warning.
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_mode_falls_back_to_tail_with_warning(caplog) -> None:
+def test_unknown_mode_falls_back_to_persist_with_warning(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         orch = StreamingOrchestrator({"ephemeral_injection_mode": "nonsense"})
 
-    assert orch._ephemeral_injection_mode == "tail"
+    assert orch._ephemeral_injection_mode == "persist"
     assert any(
         "nonsense" in record.message and "ephemeral_injection_mode" in record.message
         for record in caplog.records

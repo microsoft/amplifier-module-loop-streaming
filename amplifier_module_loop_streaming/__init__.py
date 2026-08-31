@@ -1009,22 +1009,31 @@ class StreamingOrchestrator:
         self._budget_warned: bool = False
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
-        # Ephemeral-cache fix (spec: ephemeral-cache-fix-spec.md §5.3). Default
-        # "tail" is byte-identical to today's behavior -- the persist path
-        # below is unreachable unless explicitly configured. An unknown value
-        # falls back to "tail" with a logged warning (mirrors
-        # amplifier_module_provider_openai's handling of an unknown
-        # reasoning_replay_scope -- same repo-family convention: fail visible
-        # and safe, never silently misbehave).
+        # Ephemeral-cache fix (spec: ephemeral-cache-fix-spec.md §5.3).
+        # Default flipped to "persist" (was "tail" in #44): live validation
+        # on both providers now supports persist-by-default -- OpenAI
+        # in-vivo across 30+ DTU runs recovered cache-read share from
+        # ~9-11% to 89-97% with cache-write down ~10x, and the Anthropic
+        # flip gate (n=3 DTU S1, persist ON) came back favorable too
+        # (cache-read share +5pts over the tail baseline, lower cost and
+        # wall time, 3/3 correct, clean wire contract) -- so "tail"'s
+        # original rationale (persist unvalidated on Anthropic) no longer
+        # holds. "tail" remains fully supported as the explicit opt-out,
+        # byte-identical to the module's original pre-#44 behavior. An
+        # unknown value falls back to "persist" (the new default) with a
+        # logged warning (mirrors amplifier_module_provider_openai's
+        # handling of an unknown reasoning_replay_scope -- same
+        # repo-family convention: fail visible and safe, never silently
+        # misbehave).
         _ephemeral_injection_mode = (config or {}).get(
-            "ephemeral_injection_mode", "tail"
+            "ephemeral_injection_mode", "persist"
         )
         if _ephemeral_injection_mode not in ("tail", "persist"):
             logger.warning(
-                "Unknown ephemeral_injection_mode %r; falling back to 'tail'.",
+                "Unknown ephemeral_injection_mode %r; falling back to 'persist'.",
                 _ephemeral_injection_mode,
             )
-            _ephemeral_injection_mode = "tail"
+            _ephemeral_injection_mode = "persist"
         self._ephemeral_injection_mode: str = _ephemeral_injection_mode
         self._last_persisted_injection: str | None = None
         # Track whether cancel:requested has been emitted for the current execution
