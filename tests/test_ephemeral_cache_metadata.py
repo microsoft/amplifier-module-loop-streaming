@@ -13,10 +13,16 @@ that flag. These tests prove:
 
   1. A direct ephemeral injection (from the `provider:request` hook, i.e. the
      `result` returned by the `PROVIDER_REQUEST` emit) is appended with
-     `metadata={"ephemeral": True}`.
+     `metadata={"ephemeral": True, "reminder_placement": "pre_user"}` --
+     turn-start (iteration 1) placement is the new default (reminder-
+     redesign-spec.md, W1), spliced into the request VIEW before the user's
+     message in `ephemeral_injection_mode="tail"`.
   2. A pending ephemeral injection (queued from `prompt:submit` or `tool:post`
      and applied on the next iteration via `_pending_ephemeral_injections`) is
-     also appended with `metadata={"ephemeral": True}`.
+     also appended with `metadata={"ephemeral": True, ...}` -- a
+     `prompt:submit` pending injection is consumed at TURN START (same
+     `reminder_placement: "pre_user"` tag as test 1); a `tool:post` pending
+     injection (test 4) is consumed MID-LOOP (`reminder_placement: "tail"`).
   3. Stored/history messages (added via `context.add_message`, e.g. the user's
      prompt) are NOT retroactively marked ephemeral -- they carry no
      `metadata` key at all.
@@ -25,6 +31,10 @@ that flag. These tests prove:
      are gated on `result.ephemeral` / `injection.get(...)` being truthy), so
      there is no way for a stored/history-bound injection to pick up the
      ephemeral flag through this path.
+
+All injected content is wrapped in the `<system-reminders>...</system-reminders>`
+envelope (reminder-redesign-spec.md sec 2.1) and the role is pinned to "user"
+regardless of what the hook requested via `context_injection_role`.
 """
 
 from __future__ import annotations
@@ -157,7 +167,14 @@ class ScriptedHooks:
 @pytest.mark.asyncio
 async def test_direct_ephemeral_injection_carries_metadata_flag() -> None:
     """A `provider:request` hook returning ephemeral inject_context must
-    produce an appended message dict with metadata={"ephemeral": True}."""
+    produce an appended message dict with
+    metadata={"ephemeral": True, "reminder_placement": "pre_user"}.
+
+    With `reminder_placement` defaulting to "pre_user" (reminder-redesign-
+    spec.md, W1), the iteration-1 provider:request emit now fires at TURN
+    START, before the user's message. In `ephemeral_injection_mode="tail"`,
+    the block is never persisted -- it is spliced into the request VIEW
+    immediately before the user's message (T-W1-05)."""
     from amplifier_core.events import PROVIDER_REQUEST
 
     ctx = MockContext()
@@ -198,17 +215,34 @@ async def test_direct_ephemeral_injection_carries_metadata_flag() -> None:
         "Stored user prompt must NOT carry a metadata dict"
     )
 
-    # The ephemeral injection must be present with the ephemeral flag set.
+    # The ephemeral injection must be present, enveloped, with the
+    # ephemeral flag and the pre_user placement tag set.
     injected = [
         m
         for m in sent_messages
-        if m.content == "<system-reminder>2026-08-09T00:00:00Z</system-reminder>"
+        if isinstance(m.content, str)
+        and "<system-reminder>2026-08-09T00:00:00Z</system-reminder>" in m.content
     ]
     assert len(injected) == 1, "Expected exactly one injected ephemeral message"
-    assert injected[0].metadata == {"ephemeral": True}, (
-        f"Expected metadata={{'ephemeral': True}}, got {injected[0].metadata!r}"
+    assert injected[0].content.startswith("<system-reminders>"), (
+        "Injected content must be wrapped in the <system-reminders> envelope"
     )
-    assert injected[0].role == "system"
+    assert injected[0].metadata == {
+        "ephemeral": True,
+        "reminder_placement": "pre_user",
+    }, f"Expected ephemeral+pre_user metadata, got {injected[0].metadata!r}"
+    # Role pinning (reminder-redesign-spec.md sec 2.2): "user", not the
+    # hook-requested "system" -- defends against the merge-order accident
+    # where a system-role reminder block gets hoisted into the provider's
+    # cached system prefix.
+    assert injected[0].role == "user"
+
+    # The block precedes the user's message in the request (T-W1-05).
+    injected_idx = sent_messages.index(injected[0])
+    user_idx = sent_messages.index(user_msgs[0])
+    assert injected_idx < user_idx, (
+        "The reminder block must precede the user's message in the request"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +253,15 @@ async def test_direct_ephemeral_injection_carries_metadata_flag() -> None:
 
 @pytest.mark.asyncio
 async def test_pending_ephemeral_injection_carries_metadata_flag() -> None:
-    """An injection queued via `_pending_ephemeral_injections` (the
-    prompt:submit / tool:post path) must also carry the ephemeral flag once
-    applied to the outgoing message_dicts."""
+    """An injection queued via `_pending_ephemeral_injections` from
+    `prompt:submit` is consumed at TURN START (reminder-redesign-spec.md,
+    W1.2 -- the prompt:submit stash is merged into the turn-start reminder
+    block, same as a direct `provider:request` result), so it carries
+    metadata={"ephemeral": True, "reminder_placement": "pre_user"} once
+    applied to the outgoing message_dicts. (A `tool:post` pending injection,
+    covered in test 4 below, is consumed MID-LOOP instead --
+    `reminder_placement: "tail"` -- because tool:post cannot fire before the
+    turn's first LLM call.)"""
     from amplifier_core.events import PROMPT_SUBMIT
 
     ctx = MockContext()
@@ -254,11 +294,29 @@ async def test_pending_ephemeral_injection_carries_metadata_flag() -> None:
     assert len(provider.requests) == 1
     sent_messages = provider.requests[0].messages
 
-    injected = [m for m in sent_messages if m.content == "pending-ephemeral-content"]
+    injected = [
+        m
+        for m in sent_messages
+        if isinstance(m.content, str) and "pending-ephemeral-content" in m.content
+    ]
     assert len(injected) == 1, "Expected the pending ephemeral injection to be applied"
-    assert injected[0].metadata == {"ephemeral": True}, (
-        f"Expected metadata={{'ephemeral': True}}, got {injected[0].metadata!r}"
+    assert injected[0].content.startswith("<system-reminders>"), (
+        "Injected content must be wrapped in the <system-reminders> envelope"
     )
+    assert injected[0].metadata == {
+        "ephemeral": True,
+        "reminder_placement": "pre_user",
+    }, f"Expected ephemeral+pre_user metadata, got {injected[0].metadata!r}"
+    assert injected[0].role == "user"
+
+    # It precedes the user's own prompt in the request (turn-start splice).
+    user_msgs = [
+        m for m in sent_messages if m.role == "user" and m.content == "hi again"
+    ]
+    assert len(user_msgs) == 1
+    injected_idx = sent_messages.index(injected[0])
+    user_idx = sent_messages.index(user_msgs[0])
+    assert injected_idx < user_idx
 
 
 # ---------------------------------------------------------------------------

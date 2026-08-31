@@ -141,6 +141,107 @@ supported and is byte-identical to the module's original, pre-this-feature
 behavior. An unknown value falls back to `"persist"` (the current default)
 with a logged warning.
 
+## System-reminder envelope and placement (reminder-redesign-spec.md, W1)
+
+```toml
+config = {
+    reminder_placement = "pre_user",  # "pre_user" | "tail" (default "pre_user")
+}
+```
+
+**Background:** a captured production session showed a model obeying a
+bare, trailing `<system-reminder>` injection instead of the user's real
+request -- the reminder landed AFTER the user's message on the wire, and
+the model treated the last thing it saw as "the task" rather than
+supporting context. Two independent fixes address this:
+
+1. **The envelope.** Every merged hook-injection blob this orchestrator
+   writes is wrapped in `<system-reminders>...</system-reminders>` with an
+   explicit instruction header telling the model these blocks are NOT from
+   the user and NOT a request, and must never be treated as the task. This
+   is **not** behind a flag -- it is the fix, and a flag would mean
+   shipping a knob whose "off" position is the known-bad behavior. The
+   envelope tag is deliberately `<system-reminders>` (not e.g.
+   `<injected-context>`) so it shares the `"<system-reminder"` prefix that
+   `amplifier-foundation`'s `is_real_user_message` matcher (and
+   `amplifier-module-provider-openai`'s FM3 repair) already use -- one
+   prefix match covers both the per-source blocks and this outer envelope.
+
+2. **Placement (`reminder_placement`).** By default (`"pre_user"`), the
+   turn's reminder block is written **before** the user's prompt -- in
+   canonical history for `ephemeral_injection_mode = "persist"` (the
+   block precedes the user message as real, append-only history), or
+   spliced into the request VIEW for `ephemeral_injection_mode = "tail"`
+   (nothing persisted; the splice happens once, at iteration 1, and is
+   never repeated). This is achieved by hoisting iteration 1's
+   `provider:request` emit to TURN START, before `context.add_message` adds
+   the user's prompt -- the event payload carries `"phase": "turn_start"`
+   so a hook that cares can discriminate; hooks that ignore the key behave
+   exactly as before. `reminder_placement = "tail"` is the **rollback
+   lever**: it skips the turn-start assembly entirely and restores the
+   pre-this-feature ordering (block after the user message) -- the
+   envelope, role pin, and metadata tag are still applied in `"tail"` mode;
+   only the ORDERING reverts. An unknown value falls back to `"pre_user"`
+   with a logged warning.
+
+**Role pinning.** Every reminder message this orchestrator writes uses the
+literal `role = "user"`, regardless of what a contributing hook requested
+via `context_injection_role`. `HookResult.context_injection_role` defaults
+to `"system"`, and a hook that never sets it explicitly contributes
+system-role content; if the one hook in a chain that *does* set `"user"`
+is ever unmounted, deprioritized, or out-registered, the kernel's
+`merge_inject_context_results` ("first result wins" for role) would let a
+system-role blob through. `amplifier-module-provider-anthropic` hoists
+every `role == "system"` message into the single cached system block, and
+`amplifier-module-provider-openai` folds system content into
+`instructions` -- a per-turn-changing blob in that position rewrites the
+system prefix on every single turn. Pinning to `"user"` defuses this.
+
+**Known, accepted contract narrowing:** a hook that requests
+`context_injection_role = "assistant"` (simulating agent self-talk) is
+now overridden to `"user"` like everything else. No hook shipped in this
+ecosystem does this today; if one needs to in the future, it needs a
+different mechanism than `provider:request` inject_context (this
+orchestrator logs at `debug` when a non-`"user"`/`"system"` role is
+overridden, so the narrowing is observable rather than invisible).
+
+**"Before", not "immediately before".** In persist mode, the change-gate
+suppresses re-persisting an unchanged reminder block. On a turn where
+nothing changed, canonical history looks like
+`[block N] [user N] [assistant] [tool] [assistant] [user N+1]` -- the
+block is several messages back, not adjacent to `user N+1`. **This is
+correct and intended**, and is the same cache-prefix property
+`ephemeral_injection_mode = "persist"` exists to guarantee (see above).
+Do not "fix" this by disabling the change-gate -- that would defeat the
+whole cache-prefix benefit this mode provides.
+
+**Change-gate comparison basis.** The change-gate always compares the RAW
+(pre-envelope) merged body against the last persisted body, never the
+enveloped string. This matters because the turn-start block uses the
+pre-user header variant and a later mid-loop block (same iteration's
+change-gate lineage) uses the tail variant -- two different headers
+wrapping potentially-identical content. Comparing enveloped strings would
+falsely detect a "change" the first time a turn transitions from its
+turn-start block to a mid-loop one, forcing a spurious extra persisted
+message on every multi-iteration turn.
+
+**Mid-loop (iterations >= 2) placement is unchanged**: new content is
+still written at the tail (tail-variant envelope), the change-gate still
+suppresses unchanged content, and the pending-injection drain (from
+`tool:post` / a stashed `prompt:submit` result with
+`append_to_last_tool_result`) still joins ALL pending injections for one
+drain into a SINGLE enveloped message (or a single concatenation) rather
+than one message per injection.
+
+**Intended successor (not implemented here):** the clean end state is a
+dedicated `turn:reminders` event that reminder-contributing hooks register
+on explicitly, replacing the current re-use of `provider:request` with a
+`phase` discriminator. That would require editing every reminder hook in
+the ecosystem; hoisting the existing `provider:request` emit (as done
+here) delivers the identical wire result today with zero hook edits. A
+future module version may introduce `turn:reminders` as the registration
+point of record.
+
 ## Delegated-session call budget (Layer 1)
 
 `max_iterations` doubles as the enforcement mechanism for a per-session-leg
@@ -183,7 +284,15 @@ At `budget_warn_ratio` (default 80%) of `max_iterations`, the loop emits
 converging. This is a single flat threshold, not an escalation ladder --
 unlike `hooks-progress-monitor` (which escalates because it is *guessing*
 the agent is stuck), the budget here is a known fact the agent can act on
-directly.
+directly. Both this message and the max-iteration wrap-up reminder above
+are wrapped in the `<system-reminders>` envelope (see above) and carry
+`metadata.ephemeral = True` -- without it, OpenAI's reasoning-replay cutoff
+(`max(idx for non-ephemeral user)`) would count either message as a REAL
+user turn and collapse the reasoning-replay window for the rest of the
+turn. The budget-warning message also carries `metadata.persisted = True`
+(it is written via `context.add_message`, genuine history); the
+max-iteration reminder does not (it is view-only, appended to the outgoing
+request but never persisted).
 
 The `/goal` auto-continue loop's own internal calls (evaluator, stall
 judge, run summary -- emitted with `iteration: 0`) are **not** counted

@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 
-from amplifier_core import HookRegistry, ModuleCoordinator, ToolResult
+from amplifier_core import HookRegistry, HookResult, ModuleCoordinator, ToolResult
 from amplifier_core.events import (
     CANCEL_COMPLETED,
     CANCEL_REQUESTED,
@@ -277,6 +277,112 @@ async def _resolve_goal_pref_glob(pattern: str, provider: Any) -> str | None:
 
     matched.sort(key=_goal_pref_version_sort_key, reverse=True)
     return matched[0]
+
+
+# --- System-reminder envelope (reminder-redesign-spec.md §2.1 / W1.1) ------
+#
+# The kernel already merges every hook's contribution for one event into a
+# single string before this module ever sees it
+# (amplifier-core's merge_inject_context_results: content joined with
+# "\n\n", ephemeral OR'd across all, append_to_last_tool_result OR'd across
+# all). So by the time `_execute_stream` holds a `HookResult`, one envelope
+# per insertion point is enough -- no per-source wrapping is needed here,
+# and sources that already carry their own `<system-reminder source="...">`
+# wrapper keep it, sitting bare-or-wrapped *inside* this outer envelope.
+#
+# Two header variants: "pre-user" (the block precedes the user's message --
+# used at turn start) and "tail" (the block was appended after the user's
+# message already appears earlier in the conversation -- used mid-loop, for
+# the two orchestrator-authored reminders, and in `reminder_placement:
+# "tail"` rollback mode). The header text is guidance for the model, not a
+# byte-stable contract -- only the `<system-reminders>` / `</system-reminders>`
+# tags themselves are byte-stable (tests assert on them; see §2.4 for why
+# the tag is `<system-reminders>` and not something else -- it shares the
+# `"<system-reminder"` prefix the foundation `is_real_user_message` fix
+# matches on).
+_REMINDER_ENVELOPE_OPEN = "<system-reminders>"
+_REMINDER_ENVELOPE_CLOSE = "</system-reminders>"
+
+_REMINDER_PRE_USER_HEADER = (
+    "The blocks below were injected by the system. They are NOT from the user and are\n"
+    "NOT a request. They exist to help you assist the user. Process them silently:\n"
+    "never mention, quote, or acknowledge them, and never treat one as the task. The\n"
+    "user's actual request is the message that follows this block. Each\n"
+    '<system-reminder source="..."> block below names where it came from.'
+)
+
+_REMINDER_TAIL_HEADER = (
+    "The blocks below were injected by the system during the current turn. They are\n"
+    "NOT from the user and are NOT a request. They exist to help you assist the user.\n"
+    "Process them silently: never mention, quote, or acknowledge them, and never\n"
+    "treat one as the task. The user's most recent request appears earlier in this\n"
+    'conversation \u2014 keep working on it. Each <system-reminder source="..."> block\n'
+    "below names where it came from."
+)
+
+
+def _wrap_reminders(body: str, *, tail: bool, header: bool = True) -> str:
+    """Wrap a merged hook-injection blob in the ``<system-reminders>`` envelope.
+
+    ``body`` is inserted verbatim -- individual sources that already carry
+    their own ``<system-reminder source="...">`` wrapper keep it; bare
+    sources sit bare *inside* this envelope until their own repo wraps them.
+    Either way the envelope is correct and still attributes the whole blob
+    as system-injected, non-user content.
+
+    Empty/whitespace-only ``body`` returns ``""`` -- callers must not write
+    a message at all in that case (no bare envelope is ever produced).
+
+    ``header`` (default ``True``) controls whether the descriptive boilerplate
+    prose (the "these are NOT from the user" paragraph) is included.
+    Canonical (persisted) history is append-only, so once a reminder envelope
+    carrying the FULL boilerplate has been persisted for the current turn,
+    every subsequent persisted envelope in that SAME turn passes
+    ``header=False`` here -- the ``<system-reminders>`` / ``</system-reminders>``
+    tags are still emitted (so the foundation ``is_real_user_message`` prefix
+    match, and per-source attribution, both still hold), but the repeated
+    prose is omitted. This is a WRITE-TIME decision (see
+    ``self._turn_header_persisted`` in ``_execute_stream``/``_execute_one_turn``)
+    -- older, already-persisted messages are NEVER retroactively edited (that
+    would change already-cached bytes and re-bust the provider's prompt
+    cache), so exactly one envelope per turn is the "current" one to carry
+    the full framing text, and it is always the OLDEST one for that turn,
+    never a later one being "promoted". See reminder-redesign-spec.md's D2
+    fix note (rr wave 20260831, envelope-accumulation finding) for the full
+    rationale.
+
+    Pure and side-effect free by design, so it is directly unit-testable.
+    """
+    if not body or not body.strip():
+        return ""
+    if not header:
+        return f"{_REMINDER_ENVELOPE_OPEN}\n{body}\n{_REMINDER_ENVELOPE_CLOSE}"
+    header_text = _REMINDER_TAIL_HEADER if tail else _REMINDER_PRE_USER_HEADER
+    return f"{_REMINDER_ENVELOPE_OPEN}\n{header_text}\n\n{body}\n{_REMINDER_ENVELOPE_CLOSE}"
+
+
+def _last_real_user_index(msgs: list[dict[str, Any]]) -> int | None:
+    """Index of the last user-role message that is not itself a reminder block.
+
+    Used only by the tail-injection-mode + ``reminder_placement="pre_user"``
+    request-VIEW splice (see ``_execute_stream``): the turn-start reminder
+    block must be inserted immediately before the trailing *real* user
+    message, skipping over any reminder block(s) that might already sit at
+    the tail from a prior mid-loop injection.
+
+    The prefix check ``"<system-reminder"`` (no closing bracket)
+    intentionally matches both ``<system-reminder source=...>`` and the
+    ``<system-reminders>`` envelope tag (spec §2.4).
+    """
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c.lstrip().startswith("<system-reminder"):
+            continue
+        return i
+    return None
 
 
 class ConversationProviderPin:
@@ -671,7 +777,7 @@ class StreamingOrchestrator:
         "(e.g. a soak period, waiting for an external event) that cannot "
         "pass within this session no matter what the assistant does.\n"
         "STRUCTURE-LOCKED -- the condition applies a universal "
-        'requirement over a set that contains a member which is '
+        "requirement over a set that contains a member which is "
         'structurally exempt or unreachable (e.g. "all N sites" when one '
         "site cannot produce the required measurement).\n"
         "HISTORY-LOCKED -- the condition constrains the transcript's own "
@@ -955,9 +1061,7 @@ class StreamingOrchestrator:
         # the full history); the summary call only needs the CURRENT
         # state, which the tail of a long run already establishes. `<= 0`
         # disables the cap (send the whole list, pre-existing behavior).
-        self.goal_summary_max_reasons = int(
-            config.get("goal_summary_max_reasons", 20)
-        )
+        self.goal_summary_max_reasons = int(config.get("goal_summary_max_reasons", 20))
         # Per-execute()-call cache for `_resolve_goal_model`'s result (see
         # that method's CRITICAL PERF note) -- reset to None at the top of
         # execute() so each run re-resolves once, not on every turn.
@@ -1036,6 +1140,39 @@ class StreamingOrchestrator:
             _ephemeral_injection_mode = "persist"
         self._ephemeral_injection_mode: str = _ephemeral_injection_mode
         self._last_persisted_injection: str | None = None
+        # D2 fix (rr wave 20260831 -- envelope accumulation). True once a
+        # PERSISTED reminder envelope carrying the full descriptive header
+        # has been written for the CURRENT turn; every subsequent persisted
+        # envelope in the same turn is written with header=False (see
+        # _wrap_reminders). Reset per turn in _execute_one_turn, alongside
+        # the other turn-scoped reminder state below -- each new turn gets
+        # its own fresh "current" envelope with the full framing text.
+        self._turn_header_persisted: bool = False
+        # Reminder placement (reminder-redesign-spec.md, W1). "pre_user"
+        # (default): the turn's reminder block is written BEFORE the user
+        # prompt -- in canonical history for persist mode, in the request
+        # VIEW for tail mode (see the turn-start reminder assembly in
+        # _execute_stream). "tail": pre-spec behavior -- the block is
+        # appended after the user prompt, at the tail -- the rollback
+        # lever. Same repo-family convention as ephemeral_injection_mode
+        # just above: unknown value warns and falls back to the default,
+        # never crashes, never silently misbehaves.
+        _reminder_placement = (config or {}).get("reminder_placement", "pre_user")
+        if _reminder_placement not in ("pre_user", "tail"):
+            logger.warning(
+                "Unknown reminder_placement %r; falling back to 'pre_user'.",
+                _reminder_placement,
+            )
+            _reminder_placement = "pre_user"
+        self._reminder_placement: str = _reminder_placement
+        # Set at turn start in tail-injection mode only: the enveloped
+        # block that must be spliced into the request VIEW before the
+        # trailing user message. Reset per turn in _execute_one_turn.
+        self._turn_start_view_block: str | None = None
+        # True once the turn-start provider:request emit has been spent, so
+        # the iteration-1 in-loop emit is skipped (never double-fired).
+        # Reset per turn in _execute_one_turn.
+        self._turn_start_request_spent: bool = False
         # Track whether cancel:requested has been emitted for the current execution
         self._cancel_requested_emitted: bool = False
         # Bounded queue for mid-turn steering messages (session.steer capability)
@@ -1329,14 +1466,16 @@ class StreamingOrchestrator:
                     # re-running a test after a fix) can look repetitive
                     # too. See TestDualConditionStallTrip.
                     try:
-                        is_stalled, stall_detail, stall_verdict = (
-                            await self._judge_stall(
-                                goal,
-                                providers,
-                                hooks,
-                                coordinator,
-                                trigger=stall_trigger,
-                            )
+                        (
+                            is_stalled,
+                            stall_detail,
+                            stall_verdict,
+                        ) = await self._judge_stall(
+                            goal,
+                            providers,
+                            hooks,
+                            coordinator,
+                            trigger=stall_trigger,
                         )
                     except Exception as e:
                         # Fail open: a flaky judge call must never itself
@@ -1496,6 +1635,15 @@ class StreamingOrchestrator:
         # _tool_calls_this_turn above (spec: 298-replacement).
         self._budget_exhausted = False
         self._budget_warned = False
+        # Reminder-placement per-turn state (reminder-redesign-spec.md,
+        # W1.0), reset alongside the budget bookkeeping above: a
+        # turn-start view-splice block or a "spent" marker from a prior
+        # turn must never leak into this one.
+        self._turn_start_view_block = None
+        self._turn_start_request_spent = False
+        # D2 fix (rr wave 20260831): each new turn re-earns its own "current"
+        # envelope carrying the full descriptive header.
+        self._turn_header_persisted = False
         full_response = ""
         iteration_count = 0
         error: Exception | None = None
@@ -1705,8 +1853,7 @@ class StreamingOrchestrator:
         explanation = self._GOAL_STALL_VERDICT_EXPLANATIONS.get(verdict or "")
         if explanation:
             verdict_clause = (
-                f" A reviewing judge classified this as {verdict}: "
-                f"{explanation}."
+                f" A reviewing judge classified this as {verdict}: {explanation}."
             )
 
         return (
@@ -2162,9 +2309,7 @@ class StreamingOrchestrator:
             )
         else:
             recent_reasons = (
-                goal["reasons"][-goal["no_tool_turns"] :]
-                if goal.get("reasons")
-                else []
+                goal["reasons"][-goal["no_tool_turns"] :] if goal.get("reasons") else []
             )
             system_prompt = self._GOAL_STALL_SYSTEM_PROMPT_IDLE
             activity_clause = "the assistant took no tool actions at all"
@@ -2354,9 +2499,7 @@ class StreamingOrchestrator:
             return "evaluator failed"
         return None
 
-    def _cap_reasons_for_summary(
-        self, reasons: list[str]
-    ) -> tuple[list[str], int]:
+    def _cap_reasons_for_summary(self, reasons: list[str]) -> tuple[list[str], int]:
         """Bound how many of ``goal["reasons"]`` are shipped to the summary
         model (see ``_summarize_goal_run``).
 
@@ -2458,9 +2601,7 @@ class StreamingOrchestrator:
             else:
                 reasons = goal.get("reasons", [])
                 kept_reasons, omitted_count = self._cap_reasons_for_summary(reasons)
-                reasons_lines = [
-                    f"{i + 1}. {r}" for i, r in enumerate(kept_reasons)
-                ]
+                reasons_lines = [f"{i + 1}. {r}" for i, r in enumerate(kept_reasons)]
                 if omitted_count:
                     reasons_lines.insert(
                         0, f"(earliest {omitted_count} reasons omitted)"
@@ -2784,12 +2925,20 @@ class StreamingOrchestrator:
         # Reset rate limit tracking for new session
         self._last_provider_call_end = None
 
-        # Add user message
-        await context.add_message({"role": "user", "content": prompt})
-
-        # Select provider
+        # Select provider. MOVED UP from after the user-message append
+        # (reminder-redesign-spec.md, W1.2, Option D): the turn-start
+        # reminder assembly below needs a resolved provider/provider_name
+        # so it can emit provider:request BEFORE the user prompt is
+        # appended. Provider selection and PROVIDER_RESOLVE are pure
+        # functions of session-static state (mounted providers, the
+        # conversation pin) -- moving them earlier changes nothing about
+        # WHAT they decide, only WHEN.
         provider = self._select_provider(providers)
         if not provider:
+            # Preserve pre-spec history semantics on this failure path: the
+            # user's prompt was recorded before the error before, and
+            # still is.
+            await context.add_message({"role": "user", "content": prompt})
             yield ("Error: No providers available", 0)
             return
 
@@ -2827,6 +2976,112 @@ class StreamingOrchestrator:
                 "scope": "conversation",
             },
         )
+
+        # --- Turn-start reminder assembly (reminder-redesign-spec.md,
+        # W1.2, Option D). Hoists iteration 1's provider:request emit to
+        # BEFORE the user prompt is appended below, so the merged
+        # reminder block lands in canonical history (persist mode) or the
+        # request VIEW (tail mode) ahead of the user's message -- fixing
+        # the "block follows the user message" defect (session
+        # 0629f373) without disturbing append-only canonical history: the
+        # in-loop iteration-1 emit is skipped (self._turn_start_request_spent)
+        # so provider:request still fires exactly once for this LLM call.
+        #
+        # Gated on reminder_placement: with "tail" (the rollback lever),
+        # this block is skipped entirely and the loop below behaves
+        # exactly as it did pre-spec -- the in-loop iteration-1
+        # provider:request emit fires normally, after the user append.
+        if self._reminder_placement == "pre_user":
+            turn_start_result = await hooks.emit(
+                PROVIDER_REQUEST,
+                {"provider": provider_name, "iteration": 1, "phase": "turn_start"},
+            )
+            if coordinator:
+                turn_start_result = await coordinator.process_hook_result(
+                    turn_start_result, "provider:request", "orchestrator"
+                )
+                if turn_start_result.action == "deny":
+                    yield (f"Operation denied: {turn_start_result.reason}", 0)
+                    return
+            self._turn_start_request_spent = True
+
+            turn_start_parts: list[str] = []
+            # prompt:submit stash FIRST -- matches emission order
+            # (prompt:submit fires before provider:request), fixing the
+            # inversion where prompt:submit content used to land LAST
+            # because the stash drained after the tail-appended
+            # provider:request block. Only non-append_to_last_tool_result
+            # entries are consumed here: an append-to-tool-result stash has
+            # no tool result to attach to at turn start (no tool round has
+            # run yet this turn), so it stays queued and drains normally
+            # in-loop.
+            turn_start_keep: list[dict[str, Any]] = []
+            for pending_inj in self._pending_ephemeral_injections:
+                if pending_inj.get("append_to_last_tool_result"):
+                    turn_start_keep.append(pending_inj)
+                elif pending_inj.get("content"):
+                    turn_start_parts.append(pending_inj["content"])
+            self._pending_ephemeral_injections = turn_start_keep
+            if (
+                turn_start_result.action == "inject_context"
+                and turn_start_result.ephemeral
+                and turn_start_result.context_injection
+            ):
+                turn_start_parts.append(turn_start_result.context_injection)
+            # A non-ephemeral inject_context result is a DIFFERENT,
+            # persistent-injection contract -- never enveloped, and left
+            # alone here exactly as the in-loop path already leaves it
+            # alone (that path only ever acts when result.ephemeral is
+            # truthy too).
+
+            turn_start_body = "\n\n".join(turn_start_parts)
+            if turn_start_body:
+                if self._ephemeral_injection_mode == "persist":
+                    # Same change-gate as the in-loop persist path, and the
+                    # SAME comparison basis: the RAW (pre-envelope) merged
+                    # body, not the enveloped string. This is what lets an
+                    # unchanged body suppress correctly even when this
+                    # turn-start (pre_user-headered) block is compared
+                    # against a LATER mid-loop (tail-headered) block wrapping
+                    # the identical text -- the two envelope strings would
+                    # never be equal (different header), which would
+                    # otherwise force a spurious extra persist on the first
+                    # mid-loop iteration of every multi-iteration turn.
+                    if turn_start_body != self._last_persisted_injection:
+                        await context.add_message(
+                            {
+                                "role": "user",
+                                "content": _wrap_reminders(
+                                    turn_start_body,
+                                    tail=False,
+                                    header=not self._turn_header_persisted,
+                                ),
+                                "metadata": {
+                                    "ephemeral": True,
+                                    "persisted": True,
+                                    "reminder_placement": "pre_user",
+                                },
+                            }
+                        )
+                        self._last_persisted_injection = turn_start_body
+                        self._turn_header_persisted = True
+                else:
+                    # tail injection mode: never persisted into canonical
+                    # context; spliced into the request VIEW at iteration 1
+                    # only (see the splice next to the in-loop
+                    # PROVIDER_REQUEST emit below). The view splice needs
+                    # the fully-wrapped content (there is no canonical
+                    # change-gate to apply in tail mode -- each turn's
+                    # regenerated content is sent fresh, same as the
+                    # existing in-loop tail path).
+                    self._turn_start_view_block = _wrap_reminders(
+                        turn_start_body, tail=False
+                    )
+
+        # Add user message. Lands HERE -- after the turn-start reminder
+        # block above -- so the block precedes the user's message in
+        # canonical history, not just in the request view.
+        await context.add_message({"role": "user", "content": prompt})
 
         iteration = 0
 
@@ -2900,10 +3155,19 @@ class StreamingOrchestrator:
                         "remaining": remaining,
                     },
                 )
+                # Enveloped (tail variant -- this message is written after
+                # the user's message already appears earlier in the
+                # conversation) and metadata-stamped (reminder-redesign-spec.md
+                # T-W1-09): without metadata.ephemeral, OpenAI's reasoning
+                # cutoff (max(idx for non-ephemeral user)) counts this as a
+                # REAL user turn and collapses the reasoning-replay window
+                # for the rest of the turn. metadata.persisted=True keeps it
+                # correctly treated as stable, frozen history (it is a
+                # genuine context.add_message, not regenerated per request).
                 await context.add_message(
                     {
                         "role": "user",
-                        "content": (
+                        "content": _wrap_reminders(
                             '<system-reminder source="orchestrator-loop-limit">\n'
                             f"You have used {iteration} of {self.max_iterations} LLM "
                             f"calls for this turn. About {remaining} remain.\n\n"
@@ -2911,46 +3175,125 @@ class StreamingOrchestrator:
                             "you have open, then summarise what you found and what "
                             "remains. Do not start new exploration branches.\n\n"
                             "Do not mention this budget to the user.\n"
-                            "</system-reminder>"
+                            "</system-reminder>",
+                            tail=True,
+                            header=not self._turn_header_persisted,
                         ),
+                        "metadata": {
+                            "ephemeral": True,
+                            "persisted": True,
+                            "reminder_placement": "tail",
+                        },
                     }
                 )
+                self._turn_header_persisted = True
 
-            # Emit provider request BEFORE getting messages (allows hook injections)
-            result = await hooks.emit(
-                PROVIDER_REQUEST, {"provider": provider_name, "iteration": iteration}
-            )
-            if coordinator:
-                result = await coordinator.process_hook_result(
-                    result, "provider:request", "orchestrator"
+            # Emit provider request BEFORE getting messages (allows hook
+            # injections). Skipped for iteration 1 when the turn-start
+            # emit already spent this request (reminder_placement ==
+            # "pre_user", Option D -- see the turn-start reminder assembly
+            # above _execute_stream's loop): re-emitting here would
+            # double-fire provider:request for a single LLM call.
+            if self._turn_start_request_spent and iteration == 1:
+                result = HookResult(action="continue")
+                self._turn_start_request_spent = False
+            else:
+                result = await hooks.emit(
+                    PROVIDER_REQUEST,
+                    {"provider": provider_name, "iteration": iteration},
                 )
-                if result.action == "deny":
-                    yield (f"Operation denied: {result.reason}", iteration)
-                    return
+                if coordinator:
+                    result = await coordinator.process_hook_result(
+                        result, "provider:request", "orchestrator"
+                    )
+                    if result.action == "deny":
+                        yield (f"Operation denied: {result.reason}", iteration)
+                        return
 
             # Get messages for LLM request (context handles compaction internally)
             # Pass provider for dynamic budget calculation based on model's context window
             message_dicts = await context.get_messages_for_request(provider=provider)
             message_dicts = list(message_dicts)  # Convert to list for modification
 
+            # Splice the turn-start reminder block into the request VIEW
+            # (reminder-redesign-spec.md, W1.2). Only reachable when
+            # ephemeral_injection_mode == "tail" AND reminder_placement ==
+            # "pre_user": persist mode already wrote the block into
+            # canonical context at turn start, so
+            # context.get_messages_for_request() above already returns it
+            # in the right place -- nothing to splice.
+            if self._turn_start_view_block is not None and iteration == 1:
+                turn_start_view_entry = {
+                    "role": "user",
+                    "content": self._turn_start_view_block,
+                    "metadata": {
+                        "ephemeral": True,
+                        "reminder_placement": "pre_user",
+                    },
+                }
+                splice_idx = _last_real_user_index(message_dicts)
+                if splice_idx is None:
+                    # Degrade to pre-spec (tail) behavior rather than lose
+                    # the reminder content entirely.
+                    message_dicts.append(turn_start_view_entry)
+                    logger.debug(
+                        "No real user message found; appended turn-start "
+                        "reminder block at the tail instead of before it"
+                    )
+                else:
+                    message_dicts.insert(splice_idx, turn_start_view_entry)
+                self._turn_start_view_block = None
+
             # Append ephemeral injection if present (temporary, not stored --
             # unless ephemeral_injection_mode == "persist", see below).
+            #
+            # Role pinning (reminder-redesign-spec.md sec 1.2/2.2): every
+            # reminder message written below uses the literal "user" role,
+            # NOT result.context_injection_role. HookResult.context_injection_role
+            # defaults to "system", and routing-matrix (a bare, unwrapped
+            # contributor) never sets it -- if hooks-status-context (which
+            # DOES set "user") is ever unmounted or out-registered, the
+            # kernel's merge_inject_context_results "first result wins" rule
+            # would let a system-role block through. amplifier-module-provider-
+            # anthropic hoists every role=="system" message into the single
+            # cached system block, and amplifier-module-provider-openai folds
+            # system content into `instructions` -- a per-turn-changing block
+            # in that position rewrites the system prefix every turn. Pinning
+            # to "user" defuses this at the one place all such content flows
+            # through. (Hooks that request context_injection_role="assistant"
+            # are the one real casualty of this narrowing -- no shipped hook
+            # does this; logged at debug when it happens so it is observable,
+            # not silently overridden.)
             if (
                 result.action == "inject_context"
                 and result.ephemeral
                 and result.context_injection
             ):
+                if result.context_injection_role not in ("user", "system"):
+                    logger.debug(
+                        "provider:request hook requested context_injection_role=%r; "
+                        "overriding to 'user' (reminder blocks are always user-role -- "
+                        "see reminder-redesign-spec.md sec 2.2)",
+                        result.context_injection_role,
+                    )
                 if self._ephemeral_injection_mode == "persist":
-                    # Ephemeral-cache fix (ephemeral-cache-fix-spec.md §5.1/§5.3):
+                    # Ephemeral-cache fix (ephemeral-cache-fix-spec.md sec 5.1/5.3):
                     # write the injection into CANONICAL context via
-                    # context.add_message(...), and ONLY when its text differs
-                    # from the last text this orchestrator persisted. When
-                    # unchanged, do nothing -- the request is then a pure
-                    # append of the new assistant/tool turn, which is what
-                    # makes request N a true prefix of request N+1 (the
-                    # property arm D's healed shape and this mode both share).
+                    # context.add_message(...), and ONLY when its RAW text
+                    # (pre-envelope) differs from the last text this
+                    # orchestrator persisted. When unchanged, do nothing --
+                    # the request is then a pure append of the new
+                    # assistant/tool turn, which is what makes request N a
+                    # true prefix of request N+1. Comparing on the raw body
+                    # (not the enveloped string) keeps the change-gate
+                    # working across the pre-user/tail header-variant
+                    # boundary -- the turn-start block and this mid-loop
+                    # block wrap the SAME body differently (different
+                    # header), so comparing enveloped strings would falsely
+                    # look "changed" the first time a turn transitions from
+                    # its turn-start block to a mid-loop one.
                     #
-                    # Contract change accepted knowingly (spec §5.2): once
+                    # Contract change accepted knowingly (spec sec 5.2): once
                     # persisted, this message is no longer "removed next
                     # turn" -- it is real history from here on, still marked
                     # metadata.ephemeral=True (now meaning "machine-generated
@@ -2959,12 +3302,21 @@ class StreamingOrchestrator:
                     if result.context_injection != self._last_persisted_injection:
                         await context.add_message(
                             {
-                                "role": result.context_injection_role,
-                                "content": result.context_injection,
-                                "metadata": {"ephemeral": True, "persisted": True},
+                                "role": "user",
+                                "content": _wrap_reminders(
+                                    result.context_injection,
+                                    tail=True,
+                                    header=not self._turn_header_persisted,
+                                ),
+                                "metadata": {
+                                    "ephemeral": True,
+                                    "persisted": True,
+                                    "reminder_placement": "tail",
+                                },
                             }
                         )
                         self._last_persisted_injection = result.context_injection
+                        self._turn_header_persisted = True
                         logger.debug(
                             "Persisted changed ephemeral injection into canonical context"
                         )
@@ -2988,11 +3340,16 @@ class StreamingOrchestrator:
                     last_msg = message_dicts[-1]
                     # Append to last message if it's a tool result
                     if last_msg.get("role") == "tool":
-                        # Append to existing content
+                        # Append to existing content. Enveloped (tail
+                        # variant) before concatenation (spec sec 2.1
+                        # "Exception preserved").
                         original_content = last_msg.get("content", "")
                         message_dicts[-1] = {
                             **last_msg,
-                            "content": f"{original_content}\n\n{result.context_injection}",
+                            "content": (
+                                f"{original_content}\n\n"
+                                f"{_wrap_reminders(result.context_injection, tail=True)}"
+                            ),
                         }
                         logger.debug(
                             "Appended ephemeral injection to last tool result message"
@@ -3001,12 +3358,17 @@ class StreamingOrchestrator:
                         # Fall back to new message if last message isn't a tool result
                         # metadata.ephemeral marks this as regenerated-per-turn content
                         # so the provider never places a prompt-cache breakpoint on it
-                        # (see amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
+                        # (see amplifier_module_provider_anthropic._unstable_suffix_length).
                         message_dicts.append(
                             {
-                                "role": result.context_injection_role,
-                                "content": result.context_injection,
-                                "metadata": {"ephemeral": True},
+                                "role": "user",
+                                "content": _wrap_reminders(
+                                    result.context_injection, tail=True
+                                ),
+                                "metadata": {
+                                    "ephemeral": True,
+                                    "reminder_placement": "tail",
+                                },
                             }
                         )
                         logger.debug(
@@ -3017,93 +3379,137 @@ class StreamingOrchestrator:
                     # Default behavior: append as new message
                     # metadata.ephemeral marks this as regenerated-per-turn content
                     # so the provider never places a prompt-cache breakpoint on it
-                    # (see amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
+                    # (see amplifier_module_provider_anthropic._unstable_suffix_length).
                     message_dicts.append(
                         {
-                            "role": result.context_injection_role,
-                            "content": result.context_injection,
-                            "metadata": {"ephemeral": True},
+                            "role": "user",
+                            "content": _wrap_reminders(
+                                result.context_injection, tail=True
+                            ),
+                            "metadata": {
+                                "ephemeral": True,
+                                "reminder_placement": "tail",
+                            },
                         }
                     )
 
-            # Apply pending ephemeral injections from tool:post hooks
+            # Apply pending ephemeral injections from tool:post hooks.
+            #
+            # One envelope per drain, not per injection (reminder-redesign-
+            # spec.md sec W1.1 Change 2): all pending injections drained
+            # THIS iteration are joined with "\n\n" and wrapped in ONE
+            # envelope per insertion point, producing at most one new
+            # message per point instead of one message per injection. Two
+            # insertion points survive, matching the direct
+            # provider:request path above: injections that request
+            # append_to_last_tool_result concatenate (jointly) into the
+            # last tool-result message; everything else becomes ONE new
+            # message.
             if self._pending_ephemeral_injections:
+                pending_to_tool_result: list[str] = []
+                pending_to_message: list[str] = []
+                for injection in self._pending_ephemeral_injections:
+                    content = injection.get("content")
+                    if not content:
+                        continue
+                    if injection.get("append_to_last_tool_result"):
+                        pending_to_tool_result.append(content)
+                    else:
+                        pending_to_message.append(content)
+
                 if self._ephemeral_injection_mode == "persist":
-                    # Same change-gate as the provider:request path above,
-                    # applied per pending injection (spec §5.3).
-                    _any_persisted = False
-                    for injection in self._pending_ephemeral_injections:
-                        text = injection["content"]
-                        if text != self._last_persisted_injection:
+                    # Persist mode has no append_to_last_tool_result concept
+                    # (that mechanism is view-only -- see the direct
+                    # provider:request path above): fold every pending
+                    # injection, regardless of its stashed flag, into the
+                    # same canonical-context message. Same raw-body
+                    # change-gate as the direct path.
+                    pending_body = "\n\n".join(
+                        pending_to_tool_result + pending_to_message
+                    )
+                    if pending_body:
+                        if pending_body != self._last_persisted_injection:
                             await context.add_message(
                                 {
-                                    "role": injection["role"],
-                                    "content": text,
-                                    "metadata": {"ephemeral": True, "persisted": True},
+                                    "role": "user",
+                                    "content": _wrap_reminders(
+                                        pending_body,
+                                        tail=True,
+                                        header=not self._turn_header_persisted,
+                                    ),
+                                    "metadata": {
+                                        "ephemeral": True,
+                                        "persisted": True,
+                                        "reminder_placement": "tail",
+                                    },
                                 }
                             )
-                            self._last_persisted_injection = text
-                            _any_persisted = True
+                            self._last_persisted_injection = pending_body
+                            self._turn_header_persisted = True
                             logger.debug(
-                                "Persisted changed pending ephemeral injection into "
-                                "canonical context"
+                                "Persisted changed pending ephemeral injection(s) "
+                                "into canonical context"
                             )
+                            message_dicts = await context.get_messages_for_request(
+                                provider=provider
+                            )
+                            message_dicts = list(message_dicts)
                         else:
                             logger.debug(
-                                "Pending ephemeral injection text unchanged -- "
+                                "Pending ephemeral injection(s) text unchanged -- "
                                 "skipping persist (change-gate)"
                             )
-                    if _any_persisted:
-                        message_dicts = await context.get_messages_for_request(
-                            provider=provider
-                        )
-                        message_dicts = list(message_dicts)
                 else:
-                    for injection in self._pending_ephemeral_injections:
-                        if (
-                            injection.get("append_to_last_tool_result")
-                            and len(message_dicts) > 0
+                    if pending_to_tool_result:
+                        tool_result_block = _wrap_reminders(
+                            "\n\n".join(pending_to_tool_result), tail=True
+                        )
+                        if len(message_dicts) > 0 and (
+                            message_dicts[-1].get("role") == "tool"
                         ):
                             last_msg = message_dicts[-1]
-                            if last_msg.get("role") == "tool":
-                                original_content = last_msg.get("content", "")
-                                message_dicts[-1] = {
-                                    **last_msg,
-                                    "content": f"{original_content}\n\n{injection['content']}",
-                                }
-                                logger.debug(
-                                    "Applied pending ephemeral injection to last tool result"
-                                )
-                            else:
-                                # metadata.ephemeral marks this as regenerated-per-turn
-                                # content so the provider never places a prompt-cache
-                                # breakpoint on it (see
-                                # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
-                                message_dicts.append(
-                                    {
-                                        "role": injection["role"],
-                                        "content": injection["content"],
-                                        "metadata": {"ephemeral": True},
-                                    }
-                                )
-                                logger.debug(
-                                    "Last message not a tool result, created new message for injection"
-                                )
+                            original_content = last_msg.get("content", "")
+                            message_dicts[-1] = {
+                                **last_msg,
+                                "content": (
+                                    f"{original_content}\n\n{tool_result_block}"
+                                ),
+                            }
+                            logger.debug(
+                                "Applied pending ephemeral injection(s) to last "
+                                "tool result"
+                            )
                         else:
-                            # metadata.ephemeral marks this as regenerated-per-turn
-                            # content so the provider never places a prompt-cache
-                            # breakpoint on it (see
-                            # amplifier_module_provider_anthropic._count_trailing_ephemeral_messages).
                             message_dicts.append(
                                 {
-                                    "role": injection["role"],
-                                    "content": injection["content"],
-                                    "metadata": {"ephemeral": True},
+                                    "role": "user",
+                                    "content": tool_result_block,
+                                    "metadata": {
+                                        "ephemeral": True,
+                                        "reminder_placement": "tail",
+                                    },
                                 }
                             )
                             logger.debug(
-                                "Applied pending ephemeral injection as new message"
+                                "Last message not a tool result, created new "
+                                "message for pending injection(s)"
                             )
+                    if pending_to_message:
+                        message_dicts.append(
+                            {
+                                "role": "user",
+                                "content": _wrap_reminders(
+                                    "\n\n".join(pending_to_message), tail=True
+                                ),
+                                "metadata": {
+                                    "ephemeral": True,
+                                    "reminder_placement": "tail",
+                                },
+                            }
+                        )
+                        logger.debug(
+                            "Applied pending ephemeral injection(s) as new message"
+                        )
                 # Clear pending injections after applying (both modes)
                 self._pending_ephemeral_injections = []
 
@@ -3568,14 +3974,27 @@ class StreamingOrchestrator:
             # Get one final response with the reminder (via _execute_stream helper)
             message_dicts = await context.get_messages_for_request(provider=provider)
             message_dicts = list(message_dicts)
+            # Enveloped (tail variant) and metadata-stamped. This message is
+            # VIEW-ONLY -- appended to message_dicts, never persisted via
+            # context.add_message -- so it carries no "persisted" key: under
+            # W5 (amplifier-module-provider-anthropic), an unstamped
+            # trailing message here would be treated as stable and could
+            # take a cache breakpoint on regenerated content.
             message_dicts.append(
                 {
                     "role": "user",
-                    "content": """<system-reminder source="orchestrator-loop-limit">
+                    "content": _wrap_reminders(
+                        """<system-reminder source="orchestrator-loop-limit">
 You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
 
 DO NOT mention this iteration limit or reminder to the user explicitly. Simply wrap up naturally.
 </system-reminder>""",
+                        tail=True,
+                    ),
+                    "metadata": {
+                        "ephemeral": True,
+                        "reminder_placement": "tail",
+                    },
                 }
             )
 

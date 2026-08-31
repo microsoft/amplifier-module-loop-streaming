@@ -244,10 +244,19 @@ class NRoundToolProvider:
 
 @pytest.mark.asyncio
 async def test_tail_mode_is_byte_identical_to_original_behavior() -> None:
-    """With `ephemeral_injection_mode: "tail"` EXPLICITLY configured (the
-    opt-out, now that the default has flipped to "persist"), the injected
-    message must be a per-request TAIL append (metadata={"ephemeral": True},
-    no `"persisted"` key) -- never routed through `context.add_message`."""
+    """With `ephemeral_injection_mode: "tail"` AND `reminder_placement:
+    "tail"` BOTH explicitly configured (the full legacy opt-out combination
+    -- reminder-redesign-spec.md sec 9's 2x2 mode table, "fully pre-spec"
+    row), the injected message must be a per-request TAIL append (never
+    routed through `context.add_message`), appearing AFTER the user's own
+    message -- the pre-spec ORDERING is exactly reproduced (T-W1-11).
+
+    The envelope, role pin, and `reminder_placement` metadata tag are NOT
+    behind a flag (sec 9: "The envelope itself is also not behind a flag
+    ... Rollback for the envelope is `reminder_placement: tail` plus a
+    revert, not a toggle") -- so those are still present here. What
+    `reminder_placement: "tail"` restores is the ORDERING only: no
+    turn-start emit, block after the user message, exactly as pre-spec."""
     from amplifier_core.events import PROVIDER_REQUEST
 
     ctx = MockContext()
@@ -263,9 +272,12 @@ async def test_tail_mode_is_byte_identical_to_original_behavior() -> None:
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({"ephemeral_injection_mode": "tail"})
+    orch = StreamingOrchestrator(
+        {"ephemeral_injection_mode": "tail", "reminder_placement": "tail"}
+    )
 
     assert orch._ephemeral_injection_mode == "tail"
+    assert orch._reminder_placement == "tail"
 
     await orch.execute(
         prompt="hello",
@@ -284,7 +296,8 @@ async def test_tail_mode_is_byte_identical_to_original_behavior() -> None:
     injected_via_add_message = [
         m
         for m in ctx.add_message_calls
-        if m.get("content") == "<system-reminder>static</system-reminder>"
+        if isinstance(m.get("content"), str)
+        and "<system-reminder>static</system-reminder>" in m["content"]
     ]
     assert injected_via_add_message == [], (
         "Explicit tail mode must never call context.add_message() for the "
@@ -295,21 +308,48 @@ async def test_tail_mode_is_byte_identical_to_original_behavior() -> None:
     injected = [
         m
         for m in sent_messages
-        if m.content == "<system-reminder>static</system-reminder>"
+        if isinstance(m.content, str)
+        and "<system-reminder>static</system-reminder>" in m.content
     ]
     assert len(injected) == 1
-    assert injected[0].metadata == {"ephemeral": True}, (
-        f"Expected metadata={{'ephemeral': True}} (no 'persisted' key), "
-        f"got {injected[0].metadata!r}"
+    assert injected[0].content.startswith("<system-reminders>"), (
+        "Injected content must be wrapped in the <system-reminders> envelope "
+        "-- the envelope is not behind reminder_placement"
+    )
+    assert injected[0].role == "user", (
+        "Role must be pinned to 'user' regardless of the hook-requested "
+        "context_injection_role='system' -- the role pin is not behind "
+        "reminder_placement either"
+    )
+    assert injected[0].metadata == {
+        "ephemeral": True,
+        "reminder_placement": "tail",
+    }, (
+        f"Expected metadata={{'ephemeral': True, 'reminder_placement': 'tail'}} "
+        f"(no 'persisted' key), got {injected[0].metadata!r}"
+    )
+
+    # ORDERING: the block appears AFTER the user's own message -- the
+    # pre-spec order, reproduced exactly (T-W1-11).
+    user_msgs = [m for m in sent_messages if m.role == "user" and m.content == "hello"]
+    assert len(user_msgs) == 1
+    injected_idx = sent_messages.index(injected[0])
+    user_idx = sent_messages.index(user_msgs[0])
+    assert injected_idx > user_idx, (
+        "reminder_placement='tail' must reproduce pre-spec ordering: block "
+        "AFTER the user's message"
     )
 
 
 @pytest.mark.asyncio
 async def test_default_mode_is_now_persist() -> None:
-    """With NO `ephemeral_injection_mode` key in config at all, the default
-    is now "persist" (default flip, both providers validated) -- the
-    injection must be written into canonical context via
-    `context.add_message(...)`, not sent as a per-request tail append."""
+    """With NO `ephemeral_injection_mode` key (and no `reminder_placement`
+    key either) in config at all, both defaults apply: "persist" (default
+    flip, both providers validated) and "pre_user" (reminder-redesign-
+    spec.md, W1) -- the injection must be written into canonical context
+    via `context.add_message(...)`, enveloped, role-pinned to "user", tagged
+    `reminder_placement: "pre_user"`, and land BEFORE the user's own message
+    (turn-start placement, not a per-request tail append)."""
     from amplifier_core.events import PROVIDER_REQUEST
 
     ctx = MockContext()
@@ -325,9 +365,10 @@ async def test_default_mode_is_now_persist() -> None:
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})  # no ephemeral_injection_mode key at all
+    orch = StreamingOrchestrator({})  # no config keys at all
 
     assert orch._ephemeral_injection_mode == "persist"
+    assert orch._reminder_placement == "pre_user"
 
     await orch.execute(
         prompt="hello",
@@ -341,19 +382,34 @@ async def test_default_mode_is_now_persist() -> None:
     persisted = [
         m
         for m in ctx.add_message_calls
-        if m.get("content") == "<system-reminder>v1</system-reminder>"
+        if isinstance(m.get("content"), str)
+        and "<system-reminder>v1</system-reminder>" in m["content"]
     ]
     assert len(persisted) == 1, (
-        "Default (no config key) must now persist the injection via "
+        "Default (no config keys) must now persist the injection via "
         f"context.add_message(); got {ctx.add_message_calls!r}"
     )
-    assert persisted[0]["metadata"] == {"ephemeral": True, "persisted": True}
+    assert persisted[0]["content"].startswith("<system-reminders>")
+    assert persisted[0]["metadata"] == {
+        "ephemeral": True,
+        "persisted": True,
+        "reminder_placement": "pre_user",
+    }
 
     sent_messages = provider.requests[0].messages
     injected = [
-        m for m in sent_messages if m.content == "<system-reminder>v1</system-reminder>"
+        m
+        for m in sent_messages
+        if isinstance(m.content, str)
+        and "<system-reminder>v1</system-reminder>" in m.content
     ]
     assert len(injected) == 1
+    assert injected[0].role == "user"
+
+    # Block precedes the user's own message (turn-start placement, T-W1-04).
+    user_msgs = [m for m in sent_messages if m.role == "user" and m.content == "hello"]
+    assert len(user_msgs) == 1
+    assert sent_messages.index(injected[0]) < sent_messages.index(user_msgs[0])
 
 
 # ---------------------------------------------------------------------------
@@ -394,18 +450,27 @@ async def test_persist_mode_adds_message_to_canonical_context() -> None:
     persisted = [
         m
         for m in ctx.add_message_calls
-        if m.get("content") == "<system-reminder>v1</system-reminder>"
+        if isinstance(m.get("content"), str)
+        and "<system-reminder>v1</system-reminder>" in m["content"]
     ]
     assert len(persisted) == 1, (
         f"Expected exactly one context.add_message() call for the injection, "
         f"got {ctx.add_message_calls!r}"
     )
-    assert persisted[0]["metadata"] == {"ephemeral": True, "persisted": True}
+    assert persisted[0]["content"].startswith("<system-reminders>")
+    assert persisted[0]["metadata"] == {
+        "ephemeral": True,
+        "persisted": True,
+        "reminder_placement": "pre_user",
+    }
 
     # And it must actually be present in what the (only) request sent.
     sent_messages = provider.requests[0].messages
     injected = [
-        m for m in sent_messages if m.content == "<system-reminder>v1</system-reminder>"
+        m
+        for m in sent_messages
+        if isinstance(m.content, str)
+        and "<system-reminder>v1</system-reminder>" in m.content
     ]
     assert len(injected) == 1
 
@@ -419,8 +484,18 @@ async def test_persist_mode_adds_message_to_canonical_context() -> None:
 @pytest.mark.asyncio
 async def test_persist_mode_suppresses_unchanged_injection() -> None:
     """Three tool-loop iterations, SAME injection text every time -> exactly
-    ONE context.add_message() call for the injection (iteration 1's), none
-    on iterations 2 or 3."""
+    ONE context.add_message() call for the injection.
+
+    Under reminder_placement="pre_user" (default), iteration 1 is now the
+    TURN-START emit (consumes the first scripted result, persists it
+    pre-user-wrapped). The in-loop iteration-1 emit is skipped entirely
+    (Option D). Iterations 2 and 3 are genuinely in-loop (mid-turn,
+    tail-wrapped) -- the change-gate compares the RAW (pre-envelope) body,
+    so "unchanging" at iteration 2/3 still matches the RAW body persisted
+    at turn start even though the two iterations wrap it in DIFFERENT
+    envelope header variants (pre_user vs tail) -- this is exactly why the
+    change-gate compares raw text, not the enveloped string (see the
+    orchestrator's own comment at the persist-mode append site)."""
     from amplifier_core.events import PROVIDER_REQUEST
 
     ctx = MockContext()
@@ -448,20 +523,27 @@ async def test_persist_mode_suppresses_unchanged_injection() -> None:
     persisted = [
         m
         for m in ctx.add_message_calls
-        if m.get("content") == "<system-reminder>unchanging</system-reminder>"
+        if isinstance(m.get("content"), str)
+        and "<system-reminder>unchanging</system-reminder>" in m["content"]
     ]
     assert len(persisted) == 1, (
-        f"Change-gate must suppress re-persisting unchanged text; expected "
-        f"1 add_message call, got {len(persisted)}: {ctx.add_message_calls!r}"
+        f"Change-gate must suppress re-persisting unchanged text (compared "
+        f"on the raw body, across the pre_user/tail header-variant "
+        f"boundary); expected 1 add_message call, got {len(persisted)}: "
+        f"{ctx.add_message_calls!r}"
+    )
+    assert persisted[0]["metadata"]["reminder_placement"] == "pre_user", (
+        "The one persist must be the TURN-START one (pre_user variant)"
     )
 
 
 @pytest.mark.asyncio
 async def test_persist_mode_emits_on_changed_injection() -> None:
     """Three tool-loop iterations, injection text changes on iteration 2 and
-    stays changed on iteration 3 -> exactly TWO context.add_message() calls
-    (iteration 1's "v1" and iteration 2's "v2"; iteration 3 repeats "v2", so
-    it is suppressed by the change-gate same as test 3)."""
+    stays changed on iteration 3 -> exactly TWO context.add_message() calls:
+    turn-start's "v1" (pre_user-wrapped) and mid-loop iteration 2's "v2"
+    (tail-wrapped); iteration 3 repeats "v2", so it is suppressed by the
+    change-gate (raw-body comparison) same as the unchanged-injection test."""
     from amplifier_core.events import PROVIDER_REQUEST
 
     ctx = MockContext()
@@ -492,15 +574,20 @@ async def test_persist_mode_emits_on_changed_injection() -> None:
     )
 
     assert provider.call_count == 3
-    persisted_contents = [
-        m["content"] for m in ctx.add_message_calls if "system-reminder" in m["content"]
+    persisted_calls = [
+        m for m in ctx.add_message_calls if "system-reminder" in m["content"]
     ]
-    assert persisted_contents == [
-        "<system-reminder>v1</system-reminder>",
-        "<system-reminder>v2</system-reminder>",
-    ], (
+    assert len(persisted_calls) == 2, (
         f"Expected exactly 2 add_message calls (v1 then v2, v2 repeat "
-        f"suppressed), got {persisted_contents!r}"
+        f"suppressed), got {len(persisted_calls)}: {persisted_calls!r}"
+    )
+    assert "<system-reminder>v1</system-reminder>" in persisted_calls[0]["content"]
+    assert persisted_calls[0]["metadata"]["reminder_placement"] == "pre_user", (
+        "First persist is the TURN-START block"
+    )
+    assert "<system-reminder>v2</system-reminder>" in persisted_calls[1]["content"]
+    assert persisted_calls[1]["metadata"]["reminder_placement"] == "tail", (
+        "Second persist is a MID-LOOP block (iteration 2)"
     )
 
 
@@ -511,8 +598,8 @@ async def test_persist_mode_emits_on_changed_injection() -> None:
 
 @pytest.mark.asyncio
 async def test_persist_mode_request_is_append_only() -> None:
-    """Across 3 iterations (injection unchanged throughout, the common
-    case), each outgoing request's message list must be a strict
+    """Across 3 iterations WITHIN one turn (injection unchanged throughout,
+    the common case), each outgoing request's message list must be a strict
     element-wise prefix of the next request's -- the actual contract this
     mode exists to guarantee (request N \u2282 request N+1), not an
     implementation detail of how it's achieved."""
@@ -561,6 +648,71 @@ async def test_persist_mode_request_is_append_only() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_persist_mode_request_is_append_only_across_turns() -> None:
+    """The append-only contract extended ACROSS TURNS (reminder-redesign-
+    spec.md, W1.2's scorecard: "cross-turn append-only" is constraint (2) in
+    the owner's hierarchy) -- request N (the LAST request of turn 1) must be
+    a strict element-wise prefix of request N+1 (the FIRST request of turn
+    2), even though turn 2 re-runs the turn-start reminder assembly. With
+    the injection text STABLE across turns, the change-gate (compared on
+    the raw body) suppresses turn 2's persist entirely, so nothing is
+    inserted between turn 1's last message and turn 2's new user message."""
+    from amplifier_core.events import PROVIDER_REQUEST
+
+    ctx = MockContext()
+    provider = RequestCapturingProvider()
+    stable = ScriptedHookResult(
+        action="inject_context",
+        ephemeral=True,
+        context_injection="<system-reminder>stable</system-reminder>",
+        context_injection_role="user",
+    )
+    hooks = ScriptedHooks({PROVIDER_REQUEST: stable})
+    coordinator = MockCoordinator()
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "persist"})
+
+    await orch.execute(
+        prompt="first",
+        context=ctx,  # type: ignore[arg-type]
+        providers={"main": provider},
+        tools={},
+        hooks=hooks,  # type: ignore[arg-type]
+        coordinator=coordinator,  # type: ignore[arg-type]
+    )
+    await orch.execute(
+        prompt="second",
+        context=ctx,  # type: ignore[arg-type]
+        providers={"main": provider},
+        tools={},
+        hooks=hooks,  # type: ignore[arg-type]
+        coordinator=coordinator,  # type: ignore[arg-type]
+    )
+
+    assert len(provider.requests) == 2, "Expected exactly one request per turn"
+
+    def sig(msg) -> tuple:
+        return (
+            msg.role,
+            msg.content if isinstance(msg.content, str) else str(msg.content),
+        )
+
+    turn1 = [sig(m) for m in provider.requests[0].messages]
+    turn2 = [sig(m) for m in provider.requests[1].messages]
+    assert len(turn1) < len(turn2), "turn 2's request must be strictly longer"
+    assert turn2[: len(turn1)] == turn1, (
+        f"turn 1's request must be an exact element-wise prefix of turn 2's "
+        f"(cross-turn append-only). turn1={turn1!r} is not a prefix of "
+        f"turn2={turn2!r}"
+    )
+    # Only ONE persisted reminder-block message across both turns (the
+    # change-gate suppresses turn 2's identical-text re-persist).
+    persisted_blocks = [
+        m for m in ctx.add_message_calls if "system-reminder" in m["content"]
+    ]
+    assert len(persisted_blocks) == 1
+
+
 # ---------------------------------------------------------------------------
 # 6. The persisted injection is visible to get_messages_for_request on the
 # very next call -- the structural prerequisite for a real context module's
@@ -603,23 +755,27 @@ async def test_persist_mode_injection_is_budgeted() -> None:
     persisted_in_canonical = [
         m
         for m in canonical
-        if m.get("content") == "<system-reminder>budget-me</system-reminder>"
+        if isinstance(m.get("content"), str)
+        and "<system-reminder>budget-me</system-reminder>" in m["content"]
     ]
     assert len(persisted_in_canonical) == 1, (
         "Persisted injection must be present in context.get_messages_for_request() "
         "(the call site any real budgeting-aware context module counts against), "
         f"got canonical messages: {canonical!r}"
     )
+    assert persisted_in_canonical[0]["content"].startswith("<system-reminders>")
+    assert persisted_in_canonical[0]["metadata"]["reminder_placement"] == "pre_user"
 
-    # And round 1's OWN request already included it (the same-iteration
-    # re-fetch in the persist path), not just round 2's.
+    # And round 1's OWN request already included it (turn-start placement
+    # writes it into canonical context BEFORE the loop's first
+    # get_messages_for_request call, so it's there from the very first
+    # request -- not just "re-fetched" mid-iteration as it was pre-spec).
     round1_messages = provider.requests[0].messages
     assert any(
-        m.content == "<system-reminder>budget-me</system-reminder>"
+        isinstance(m.content, str)
+        and "<system-reminder>budget-me</system-reminder>" in m.content
         for m in round1_messages
-    ), (
-        "The re-fetch must make the injection visible on the SAME iteration it was persisted, not just the next one"
-    )
+    ), "The injection must be visible on round 1's own request (turn-start placement)"
 
 
 # ---------------------------------------------------------------------------
