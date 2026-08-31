@@ -84,6 +84,63 @@ config = {
 }
 ```
 
+## Ephemeral injection mode (prompt-cache prefix fix)
+
+```toml
+config = {
+    ephemeral_injection_mode = "persist",  # "tail" | "persist" (default "persist")
+}
+```
+
+Per-iteration ephemeral tail messages -- `hooks-status-context`,
+`hooks-todo-reminder`, the compaction notice, and any other
+`inject_context` hook result -- are, by default (`"persist"`), written into
+canonical context via `context.add_message(...)`, and only when the text
+differs from the last text this orchestrator persisted. When unchanged,
+nothing is added, so request N is a true, append-only prefix of request
+N+1. This matters because OpenAI's (and most providers') implicit/explicit
+prompt cache reuses only the longest true prefix of a prior request: the
+original `"tail"` behavior re-generates and re-appends these messages at
+the tail of every request, positionally displacing the assistant/tool turn
+that follows and truncating the reusable prefix -- pinning cache-hit share
+near the static system-prompt boundary and re-billing the entire growing
+transcript as a fresh cache write on every call.
+
+**Evidence for the default:**
+
+- **OpenAI**: a pre-registered 9-arm live probe found only the persist
+  design (change-gated, canonical-context write) heals prefix reuse
+  (98.9%); byte-stable tails and folding into the tool result do not heal
+  it (both are still positional, not content, mismatches). In-vivo across
+  4 DTU eval waves (30+ runs), cache-read share recovered from ~9-11% to
+  89-97% on every persist run, cache-write dropped ~10x, and task quality
+  was unchanged (all runs correct/passing). A real 6-turn session with
+  `"tail"` (the old default) showed `cache_read` pinned flat at 63,060
+  tokens across every call while `cache_write` climbed monotonically --
+  77.9M cache-write vs. 24.0M cache-read (3.24:1, inverted) -- an
+  estimated $250-380 of that session's $452 total was avoidable re-write
+  spend.
+- **Anthropic** (the flip gate): n=3 DTU S1 runs with persist mode on,
+  `claude-opus-4` @ xhigh: 3/3 correct; cache-read share 90.9-92.5% (mean
+  91.9%) vs. the `"tail"` baseline's 83.1-87.8% (mean 86.2%) -- +5pts,
+  favorable; cost $1.29 vs. $1.90 mean; wall time 257s vs. 331s mean; wire
+  contract clean (append-only message list, persisted injections
+  re-emitted only on change, valid `cache_control` breakpoints, zero
+  provider errors, no thinking-block interaction issues).
+
+**The tradeoff this mode accepts (spec §5.2):** once an injection is
+persisted, it is no longer "removed next turn" -- it becomes real,
+bounded history from that point on (still marked
+`metadata.ephemeral=True`, now meaning "machine-generated per-turn
+scaffolding", not "guaranteed absent next turn"), and it is re-emitted
+(persisted again) only when its content actually changes. Operators who
+need the original single-ephemeral-tail-message contract -- e.g. a custom
+hook whose injection text must never accumulate in history -- should set
+`ephemeral_injection_mode = "tail"` explicitly; that path remains fully
+supported and is byte-identical to the module's original, pre-this-feature
+behavior. An unknown value falls back to `"persist"` (the current default)
+with a logged warning.
+
 ## Delegated-session call budget (Layer 1)
 
 `max_iterations` doubles as the enforcement mechanism for a per-session-leg
