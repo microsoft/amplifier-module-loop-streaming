@@ -3822,11 +3822,16 @@ class StreamingOrchestrator:
 
                 parallel_group_id = str(uuid.uuid4())
 
-                # Execute all tools in parallel (no context updates inside)
-                # Wrap in try/except for CancelledError to handle immediate cancellation
+                # Execute all tools in parallel (no context updates inside).
+                # Materialized as Tasks rather than bare coroutines so the
+                # cancellation handler below can ask each one INDIVIDUALLY
+                # whether it finished. A completed sibling's result must never
+                # be overwritten by another task's cancellation.
                 tool_tasks = [
-                    self._execute_tool_only(
-                        tc, tools, hooks, parallel_group_id, coordinator
+                    asyncio.ensure_future(
+                        self._execute_tool_only(
+                            tc, tools, hooks, parallel_group_id, coordinator
+                        )
                     )
                     for tc in tool_calls
                 ]
@@ -3834,20 +3839,57 @@ class StreamingOrchestrator:
                 try:
                     tool_results = await asyncio.gather(*tool_tasks)
                 except asyncio.CancelledError:
-                    # Immediate cancellation (second Ctrl+C) - synthesize cancelled results
-                    # for ALL tool_calls to maintain tool_use/tool_result pairing
-                    logger.info(
-                        "Tool execution cancelled - synthesizing cancelled results"
-                    )
-                    for tc in tool_calls:
+                    # Cancellation reached this batch. Two ways in:
+                    #   (a) the enclosing task was cancelled (second Ctrl+C) --
+                    #       gather cancels the children and re-raises;
+                    #   (b) ONE tool raised CancelledError from inside --
+                    #       tool-delegate re-raises by design when its
+                    #       sub-session is cancelled -- and gather (no
+                    #       return_exceptions) propagates it immediately.
+                    #
+                    # In BOTH cases some siblings may have already COMPLETED
+                    # SUCCESSFULLY. This used to synthesize a cancelled result
+                    # for every tool_call in the batch, which did not merely
+                    # drop those completed results -- it OVERWROTE them.
+                    #
+                    # Per-task triage instead: a task that finished contributes
+                    # its own real result; only a task that did not finish is
+                    # reported as cancelled. Every tool_call still gets exactly
+                    # one tool result, in the original order, so tool_use /
+                    # tool_result pairing is preserved (the property the
+                    # blanket overwrite was protecting).
+                    preserved = 0
+                    for tc, task in zip(tool_calls, tool_tasks):
+                        content: str | None = None
+                        if task.done() and not task.cancelled():
+                            task_exc = task.exception()
+                            if task_exc is None:
+                                # Completed -- keep ITS OWN output verbatim.
+                                _done_id, _done_name, content = task.result()
+                                preserved += 1
+                            else:
+                                # Finished by raising something that is not a
+                                # cancellation; report that, not "cancelled".
+                                content = f"Internal error executing tool: {task_exc!s}"
+                        elif not task.done():
+                            # Still in flight. Stop it rather than leaving it
+                            # running unobserved past the cancelled turn.
+                            task.cancel()
+                        if content is None:
+                            content = f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}'
                         await context.add_message(
                             {
                                 "role": "tool",
                                 "name": tc.name,
                                 "tool_call_id": tc.id,
-                                "content": f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}',
+                                "content": content,
                             }
                         )
+                    logger.info(
+                        "Tool execution cancelled - preserved %d of %d completed tool result(s)",
+                        preserved,
+                        len(tool_calls),
+                    )
                     # Emit cancel events before re-raising so hooks receive them
                     if coordinator and not self._cancel_requested_emitted:
                         self._cancel_requested_emitted = True
@@ -4247,7 +4289,23 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         """Execute a single tool in parallel without adding to context.
 
         Returns (tool_call_id, name, content) tuple.
-        Never raises - errors become error messages.
+
+        Never raises an ``Exception`` -- a hook denial, a missing tool, or a
+        tool that blows up all become an error-message tuple via the safety
+        net at the bottom of this method.
+
+        It CAN still propagate a ``BaseException``, and one of those matters:
+        ``asyncio.CancelledError`` is a BaseException (Python 3.8+), so the
+        ``except Exception`` safety net does NOT catch it and cancellation
+        escapes this task. That is deliberate -- swallowing cancellation here
+        would defeat cooperative cancellation and make ``task.cancel()``
+        ineffective. The caller (the ``asyncio.gather`` site in
+        ``_execute_one_turn``) is responsible for triaging a cancelled task
+        WITHOUT discarding the completed results of its siblings.
+
+        The unqualified claim this docstring used to make ("Never raises")
+        was false for exactly that case, and it is what made the gather site
+        look safe while it was overwriting completed work.
         """
         try:
             # Pre-tool hook
