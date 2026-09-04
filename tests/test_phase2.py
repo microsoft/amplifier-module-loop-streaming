@@ -196,6 +196,7 @@ async def test_reasoning_effort_on_max_iterations_fallback():
     assert hasattr(provider, "last_request")
     assert provider.last_request.reasoning_effort == "high"
     assert result == "Final response"
+    assert hooks.get_events(PROVIDER_ERROR) == []
 
 
 # ---------------------------------------------------------------------------
