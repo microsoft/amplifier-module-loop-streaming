@@ -1137,6 +1137,10 @@ class StreamingOrchestrator:
         # AttributeError.
         self._tool_calls_this_turn: int = 0
         self._goal_turn_evidence: dict[str, Any] | None = None
+        # Actual main-loop provider calls for the active turn. This differs
+        # from the bounded iteration count when a forced finalization call is
+        # needed after the loop has spent its budget.
+        self._llm_calls_this_turn: int = 0
         # Layer 1 call-budget bookkeeping (spec: 298-replacement). Both are
         # per-execute()-call state, reset in _execute_one_turn alongside
         # _tool_calls_this_turn. Initialized here so a fresh instance never
@@ -1709,6 +1713,7 @@ class StreamingOrchestrator:
         # "did this turn run any tools" count once this method returns.
         self._tool_calls_this_turn = 0
         self._goal_turn_evidence = {"tools": []} if goal_turn is not None else None
+        self._llm_calls_this_turn = 0
         # Layer 1 call-budget bookkeeping, reset per turn alongside
         # _tool_calls_this_turn above (spec: 298-replacement).
         self._budget_exhausted = False
@@ -1786,7 +1791,7 @@ class StreamingOrchestrator:
             # module has no visibility into whether an upstream cancellation
             # (e.g. a delegate's hard wall-clock deadline) skips the save.
             "metadata": {
-                "llm_calls": iteration_count,
+                "llm_calls": self._llm_calls_this_turn,
                 "llm_call_budget": (
                     self.max_iterations if self.max_iterations != -1 else None
                 ),
@@ -3353,10 +3358,22 @@ class StreamingOrchestrator:
         await context.add_message({"role": "user", "content": prompt})
 
         iteration = 0
+        # A bounded loop needs a finalization call only when the final
+        # budgeted response explicitly required another model turn. A normal
+        # no-tool break is already a complete answer, even when it happens on
+        # the final permitted iteration.
+        natural_completion = False
+        continuation_needed = False
 
-        while self.max_iterations == -1 or iteration < self.max_iterations:
-            # Check for cancellation at iteration start
-            if coordinator and coordinator.cancellation.is_cancelled:
+        async def close_finalization_tool_turn(message: str) -> None:
+            """Close a capped tool-result turn when finalization cannot answer."""
+            messages = await context.get_messages()
+            if messages and messages[-1].get("role") == "tool":
+                await context.add_message({"role": "assistant", "content": message})
+
+        async def exit_for_cancellation() -> None:
+            """Emit the normal cancellation lifecycle before ending this turn."""
+            if coordinator:
                 # Emit cancel:requested on first detection and trigger cleanup callbacks
                 if not self._cancel_requested_emitted:
                     self._cancel_requested_emitted = True
@@ -3370,7 +3387,7 @@ class StreamingOrchestrator:
                     )
                     try:
                         await coordinator.cancellation.trigger_callbacks()
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         logger.warning(f"Error in cancellation callbacks: {e}")
                 # Emit cancel:completed — orchestrator is exiting due to cancellation
                 await hooks.emit(
@@ -3381,11 +3398,14 @@ class StreamingOrchestrator:
                         "turn_count": iteration,
                     },
                 )
-                # Don't yield more content, just exit.
-                # Clear any pending steers so they cannot leak into the next turn
-                # (cancellation means "stop now" — stale steers have no next injection
-                # point and must not silently ride a future, unrelated turn). (spec §5.2)
-                self._steering_queue.clear()
+            # Cancellation means "stop now": queued steers cannot silently
+            # carry into a future, unrelated turn.
+            self._steering_queue.clear()
+
+        while self.max_iterations == -1 or iteration < self.max_iterations:
+            # Check for cancellation at iteration start
+            if coordinator and coordinator.cancellation.is_cancelled:
+                await exit_for_cancellation()
                 return
 
             iteration += 1
@@ -3809,6 +3829,7 @@ class StreamingOrchestrator:
             # Check if provider supports streaming
             if hasattr(provider, "stream"):
                 # Use streaming if available
+                self._llm_calls_this_turn += 1
                 async for chunk in self._stream_from_provider(
                     provider,
                     chat_request,
@@ -3835,13 +3856,16 @@ class StreamingOrchestrator:
                 if await self._has_pending_tools(context):
                     # Process tools
                     await self._process_tools(context, tools, hooks)
+                    continuation_needed = True
                     continue
                 else:
                     # Last-drain edge: if a steer arrived during the final generation,
                     # loop once more so the model acts on it this turn. The top-of-
                     # iteration drain performs the actual injection.
                     if not self._steering_queue.is_empty:
+                        continuation_needed = True
                         continue
+                    natural_completion = True
                     break
             else:
                 # Fallback to non-streaming
@@ -3850,6 +3874,7 @@ class StreamingOrchestrator:
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
                 try:
+                    self._llm_calls_this_turn += 1
                     response = await provider.complete(chat_request, **kwargs)
                 except LLMError as e:
                     await hooks.emit(
@@ -4010,8 +4035,15 @@ class StreamingOrchestrator:
                     # loop once more so the model acts on it this turn. The top-of-
                     # iteration drain performs the actual injection.
                     if not self._steering_queue.is_empty:
+                        continuation_needed = True
                         continue
+                    natural_completion = True
                     break
+
+                # A tool response needs another model turn to consume its
+                # corresponding results. This remains true even if the bounded
+                # loop cannot enter that next iteration.
+                continuation_needed = True
 
                 # Add assistant message with tool calls
                 # Store structured content blocks (preserves reasoning state, thinking blocks, etc.)
@@ -4265,8 +4297,21 @@ class StreamingOrchestrator:
                         }
                     )
 
-        # Check if we exceeded max iterations (only if not unlimited)
-        if self.max_iterations != -1 and iteration >= self.max_iterations:
+        # Add exactly one finalization call only when the bounded budget
+        # prevented a continuation. A normal no-tool break at the cap is a
+        # natural completion and must return without a duplicate provider call.
+        if (
+            self.max_iterations != -1
+            and iteration >= self.max_iterations
+            and continuation_needed
+            and not natural_completion
+        ):
+            if coordinator and coordinator.cancellation.is_cancelled:
+                await close_finalization_tool_turn(
+                    "The previous operation was cancelled. Results from completed tools have been preserved."
+                )
+                await exit_for_cancellation()
+                return
             # Layer 1 call-budget bookkeeping (spec: 298-replacement). Read by
             # _execute_one_turn's status precedence and the payload's
             # metadata bag -- this is the ONLY place it is set to True; it is
@@ -4275,7 +4320,7 @@ class StreamingOrchestrator:
             logger.warning(f"Max iterations ({self.max_iterations}) reached")
 
             # Inject system reminder to agent before returning
-            await hooks.emit(
+            finalization_result = await hooks.emit(
                 PROVIDER_REQUEST,
                 {
                     "provider": provider_name,
@@ -4283,10 +4328,45 @@ class StreamingOrchestrator:
                     "max_reached": True,
                 },
             )
+            if coordinator:
+                finalization_result = await coordinator.process_hook_result(
+                    finalization_result, "provider:request", "orchestrator"
+                )
+                if coordinator.cancellation.is_cancelled:
+                    await close_finalization_tool_turn(
+                        "The previous operation was cancelled. Results from completed tools have been preserved."
+                    )
+                    await exit_for_cancellation()
+                    return
+                if finalization_result.action == "deny":
+                    denial_text = f"Operation denied: {finalization_result.reason}"
+                    await close_finalization_tool_turn(denial_text)
+                    yield (denial_text, iteration)
+                    return
+
+            if coordinator and coordinator.cancellation.is_cancelled:
+                await close_finalization_tool_turn(
+                    "The previous operation was cancelled. Results from completed tools have been preserved."
+                )
+                await exit_for_cancellation()
+                return
+
+            # A steer that required this finalization must be part of its one
+            # allowed provider call, not discarded at the next turn boundary.
+            await self._drain_steering(context, hooks, iteration)
 
             # Get one final response with the reminder (via _execute_stream helper)
             message_dicts = await context.get_messages_for_request(provider=provider)
             message_dicts = list(message_dicts)
+            # The finalization hook and context assembly both await. Check
+            # again before contacting the provider so a concurrent
+            # cancellation cannot buy an unrequested final provider call.
+            if coordinator and coordinator.cancellation.is_cancelled:
+                await close_finalization_tool_turn(
+                    "The previous operation was cancelled. Results from completed tools have been preserved."
+                )
+                await exit_for_cancellation()
+                return
             # Enveloped (tail variant) and metadata-stamped. This message is
             # VIEW-ONLY -- appended to message_dicts, never persisted via
             # context.add_message -- so it carries no "persisted" key: under
@@ -4315,18 +4395,18 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 # Convert dicts to ChatRequest
                 messages_objects = [Message(**msg) for msg in message_dicts]
 
-                # Deliberately tool-less (spec: 298-replacement D3 -- "one
-                # final tool-less wrap-up LLM call"). Offering tools here
-                # would let the model emit a tool_calls-only response with
-                # no text; this code path never calls parse_tool_calls() or
-                # processes a tool_call, so that response's content would be
-                # empty and the wrap-up would silently produce no summary --
-                # defeating Layer 1's whole point (success criterion: "a
-                # non-empty agent-authored response"). Forcing tools=None
-                # guarantees the model must answer in text.
+                # Preserve the normal declarations, including provider-native
+                # specifications, so any assistant tool call and paired tool
+                # result in the existing transcript stay valid. The portable
+                # choice prevents new calls; this finalization path never
+                # parses or dispatches a tool response.
+                tools_list = (
+                    [_build_tool_spec(tool) for tool in tools.values()] if tools else None
+                )
                 max_iter_chat_request = ChatRequest(
                     messages=messages_objects,
-                    tools=None,
+                    tools=tools_list,
+                    tool_choice="none",
                     reasoning_effort=self.config.get("reasoning_effort"),
                 )
 
@@ -4334,19 +4414,82 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
 
+                self._llm_calls_this_turn += 1
                 response = await provider.complete(max_iter_chat_request, **kwargs)
-                content = (
-                    response.content if hasattr(response, "content") else str(response)
-                )
+                response_text = getattr(response, "text", None)
+                if not isinstance(response_text, str) or not response_text:
+                    response_text = self._extract_text_from_content(
+                        getattr(response, "content", None)
+                    )
 
-                if content:
-                    # Yield the final response
-                    async for token in self._tokenize_stream(content):
+                if response_text:
+                    async for token in self._tokenize_stream(response_text):
                         yield (token, iteration)
 
-                    # Add to context
-                    await context.add_message({"role": "assistant", "content": content})
+                    # Do not persist opaque provider state for a response that
+                    # requested tools the capped loop will not execute: it
+                    # could require unpaired tool results on replay. Otherwise
+                    # retain the normal no-tool response shape, but only the
+                    # safe text/thinking blocks.
+                    response_compliant = not provider.parse_tool_calls(response)
+                    response_content = getattr(response, "content", None)
+                    if isinstance(response_content, list):
+                        content_dicts = [
+                            block.model_dump()
+                            if hasattr(block, "model_dump")
+                            else block
+                            for block in response_content
+                        ]
+                        safe_content = [
+                            block_dict
+                            for block_dict in content_dicts
+                            if isinstance(block_dict, dict)
+                            and getattr(
+                                block_dict.get("type"), "value", block_dict.get("type")
+                            )
+                            in ("text", "thinking")
+                        ]
+                        response_compliant = response_compliant and len(
+                            safe_content
+                        ) == len(content_dicts)
+                        if not response_compliant:
+                            safe_content = []
+                    else:
+                        safe_content = []
 
+                    if safe_content:
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": safe_content,
+                        }
+                        for block_dict in safe_content:
+                            if (
+                                getattr(
+                                    block_dict["type"], "value", block_dict["type"]
+                                )
+                                == "thinking"
+                            ):
+                                assistant_msg["thinking_block"] = block_dict
+                                break
+                    else:
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": response_text,
+                        }
+
+                    if response_compliant and getattr(response, "metadata", None):
+                        assistant_msg["metadata"] = response.metadata
+                    await context.add_message(assistant_msg)
+                else:
+                    await close_finalization_tool_turn(
+                        "The final response could not be generated."
+                    )
+
+            except asyncio.CancelledError:
+                await close_finalization_tool_turn(
+                    "The previous operation was cancelled. Results from completed tools have been preserved."
+                )
+                raise
             except LLMError as e:
                 await hooks.emit(
                     PROVIDER_ERROR,
@@ -4358,6 +4501,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     },
                 )
                 logger.error(f"Error getting final response after max iterations: {e}")
+                await close_finalization_tool_turn(
+                    "The final response could not be generated."
+                )
             except Exception as e:
                 await hooks.emit(
                     PROVIDER_ERROR,
@@ -4367,6 +4513,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     },
                 )
                 logger.error(f"Error getting final response after max iterations: {e}")
+                await close_finalization_tool_turn(
+                    "The final response could not be generated."
+                )
 
         # Emit execution end
         await hooks.emit(
@@ -4479,17 +4628,21 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         # message_models.ThinkingBlock which uses .thinking). The hasattr-based
         # filter was letting thinking text leak into the response string, which
         # pollutes parse_json extraction in downstream recipe steps.
+        blocks = [content] if isinstance(content, dict) else content
         text_parts = []
-        for block in content:
+        for block in blocks:
             # Explicit type check — works for both enum (ContentBlockType.TEXT)
             # and plain-str "type" fields (e.g., message_models.TextBlock).
-            block_type = getattr(block, "type", None)
+            block_type = (
+                block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+            )
             # Handle both enum (block_type.value == "text") and raw str ("text")
             type_value = (
                 getattr(block_type, "value", block_type) if block_type else None
             )
-            if type_value == "text" and hasattr(block, "text"):
-                text_parts.append(block.text)
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if type_value == "text" and isinstance(text, str):
+                text_parts.append(text)
             # Thinking blocks, tool_use blocks, etc. are all correctly excluded.
 
         return "\n\n".join(text_parts)
