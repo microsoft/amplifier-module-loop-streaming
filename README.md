@@ -251,23 +251,31 @@ a child session -- this module has no concept of "delegation" itself; it
 only counts main-loop LLM calls against whatever `max_iterations` it was
 given, root session or child).
 
-**Exhaustion is a normal turn ending, not an error.** When `iteration`
-reaches `max_iterations`, the loop makes **one additional** tool-less
-`provider.complete()` call with an injected
-`<system-reminder source="orchestrator-loop-limit">` asking the agent to
-wrap up and summarize -- so a budget of `N` permits at most `N + 1`
-main-loop provider calls, not `N`. This wrap-up call ends the turn with a
-normal return (`execution:end` fires, no exception raised), so the caller's
-usual persistence path runs and the resulting transcript is complete and
-resumable.
+**Exhaustion is a normal turn ending, not an error.** A response that ends
+naturally (no tool call and no pending steer) returns immediately, including
+on iteration `max_iterations`; it makes no duplicate provider call and is
+not marked budget-exhausted. Only when the hard limit prevents a required
+continuation does the loop make one additional `provider.complete()` call
+with an injected `<system-reminder source="orchestrator-loop-limit">` asking
+the agent to wrap up and summarize. Thus a budget of `N` permits at most
+`N + 1` main-loop provider calls, while a natural completion uses exactly the
+calls it needed.
+
+That final request retains the ordinary generic tool declarations (including
+provider-native declarations needed to validate preceding tool history), but
+sets the portable `tool_choice="none"`. A compliant final response retains
+safe text/thinking blocks and provider metadata in the transcript while
+rendering normalized text; any unexpected tool call is neither dispatched nor
+persisted structurally, so finalization cannot extend the iteration budget or
+leave unpaired tool state.
 
 `ORCHESTRATOR_COMPLETE`'s payload always carries a `metadata` bag:
 
 ```python
 {
-    "llm_calls": 300,             # main-loop iterations actually used (not goal-loop internal calls -- see below)
+    "llm_calls": 301,             # actual main-loop provider calls, including any one finalization call (not goal-loop internal calls -- see below)
     "llm_call_budget": 300,       # the max_iterations this turn ran under, or None if unlimited
-    "budget_exhausted": True,     # whether this turn hit the budget (vs. finishing early)
+    "budget_exhausted": True,     # whether the budget prevented a needed continuation
     "resumable": True,            # whether this exit path guarantees the transcript was persisted
 }
 ```
