@@ -18,6 +18,7 @@ three share the same `provider.complete()` entry point.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -179,7 +180,9 @@ class FakeProvider:
         # First element is either a plain bool (legacy shape -- see
         # `complete()`'s "tool-less judge" branch) or an explicit taxonomy
         # verdict string.
-        self.judge_queue: list[tuple[bool | str, str]] = []
+        self.judge_queue: list[
+            tuple[bool | str, str] | tuple[bool | str, str, str]
+        ] = []
         self.summary_text = "Recap: goal pursued across several turns, then resolved."
         # Optional test hook: called right before an evaluator call is
         # answered (used to snapshot orchestrator state, e.g.
@@ -208,6 +211,8 @@ class FakeProvider:
         # response -- used to exercise _goal_summary_fallback's
         # generation-failed path.
         self.summary_should_raise: Exception | None = None
+        self.judge_should_raise: Exception | None = None
+        self.judge_response: str | None = None
         # `goal_provider_preferences` glob resolution support (see
         # `_resolve_goal_pref_glob`): the model names this provider reports
         # as available, and/or an exception to raise instead.
@@ -245,7 +250,12 @@ class FakeProvider:
             self.judge_call_models.append(kwargs.get("model"))
             self.judge_call_requests.append(chat_request)
             self.judge_call_kwargs.append(kwargs)
-            flag, detail = self.judge_queue.pop(0)
+            if self.judge_should_raise:
+                raise self.judge_should_raise
+            if self.judge_response is not None:
+                return _llm_text_response(self.judge_response)
+            judge_item = self.judge_queue.pop(0)
+            flag, detail = judge_item[:2]
             # `flag` is either a plain bool (legacy shape: True/False --
             # mapped to a default locked/resolvable verdict word below, for
             # tests that only care about the stalled/not-stalled outcome)
@@ -257,7 +267,16 @@ class FakeProvider:
                 verdict_word = flag.upper()
             else:
                 verdict_word = "HISTORY-LOCKED" if flag else "RESOLVABLE"
-            return _llm_text_response(f"{verdict_word}\n{detail}")
+            progress_word = (
+                judge_item[2]
+                if len(judge_item) == 3
+                else (
+                    "NOT_DEMONSTRATED"
+                    if flag is True or (isinstance(flag, str) and flag != "resolvable")
+                    else "DEMONSTRATED"
+                )
+            )
+            return _llm_text_response(f"{verdict_word}\n{progress_word}\n{detail}")
 
         if "single, short line for a developer" in system_text:
             # All three per-state summary prompts (stalled/cap_hit/error)
@@ -302,6 +321,561 @@ class FakeModelRoleResolver:
     async def resolve(self, model_role: str | list[str]) -> list[ProviderPreference]:
         self.resolve_calls.append(model_role)
         return list(self.preferences)
+
+
+@pytest.mark.asyncio
+class TestProgressRecovery:
+    """Scripted judge verdicts exercise state transitions, not model quality."""
+
+    async def test_resolvable_without_demonstrated_progress_gets_one_recovery_turn(
+        self,
+    ) -> None:
+        orch = _make_orchestrator()
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        goal = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        coordinator.session_state["goal"] = goal
+        provider.turn_queue.extend(
+            MockTurnResponse(text=f"unchanged answer {turn}") for turn in range(5)
+        )
+        provider.eval_queue.extend([(False, "still blocked")] * 5)
+        provider.judge_queue.extend(
+            [
+                ("resolvable", "no new material", "NOT_DEMONSTRATED"),
+                ("resolvable", "recovery repeated prior work", "NOT_DEMONSTRATED"),
+            ]
+        )
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        events = hooks.goal_progress_events()
+        assert events[-1]["state"] == "stalled"
+        assert events[-1]["turn"] == 5
+        assert events[-1]["stall_verdict"] == "resolvable"
+        assert events[-1]["progress_verdict"] == "not_demonstrated"
+        assert provider.judge_queue == []
+
+    async def test_demonstrated_recovery_resets_epoch_and_can_achieve(self) -> None:
+        orch = _make_orchestrator({"goal_stall_threshold": 1})
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        coordinator.session_state["goal"] = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        provider.turn_queue.extend(
+            [
+                MockTurnResponse(text="initial"),
+                MockTurnResponse(text="idle"),
+                MockTurnResponse(text="new substantive written proof"),
+                MockTurnResponse(text="done"),
+            ]
+        )
+        provider.eval_queue.extend(
+            [(False, "blocked"), (False, "blocked"), (False, "blocked"), (True, "done")]
+        )
+        provider.judge_queue.extend(
+            [
+                ("resolvable", "no progress yet", "NOT_DEMONSTRATED"),
+                ("resolvable", "new written proof is material", "DEMONSTRATED"),
+            ]
+        )
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert hooks.goal_progress_events()[-1]["state"] == "achieved"
+        recovery_event = next(
+            event
+            for event in hooks.goal_progress_events()
+            if event["state"] == "continuing" and event["turn"] == 3
+        )
+        assert recovery_event["progress_verdict"] == "demonstrated"
+        assert coordinator.session_state["goal"] is None
+
+    async def test_demonstrated_recovery_reaches_cap_with_its_progress_verdict(
+        self,
+    ) -> None:
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 1, "goal_busy_stall_window": 100}
+        )
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        coordinator.session_state["goal"] = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": 3,
+        }
+        provider.turn_queue.extend(
+            [
+                MockTurnResponse(text="initial"),
+                MockTurnResponse(text="idle"),
+                MockTurnResponse(text="new proof"),
+            ]
+        )
+        provider.eval_queue.extend([(False, "blocked")] * 3)
+        provider.judge_queue.extend(
+            [
+                ("resolvable", "no progress yet", "NOT_DEMONSTRATED"),
+                ("resolvable", "new proof is material", "DEMONSTRATED"),
+            ]
+        )
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        cap_hit = hooks.goal_progress_events()[-1]
+        assert cap_hit["state"] == "cap_hit"
+        assert cap_hit["progress_verdict"] == "demonstrated"
+
+    async def test_bounded_prior_anchors_survive_epoch_reset(self) -> None:
+        """The judge, not a local matcher, still decides whether a repeat progresses."""
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 3, "goal_busy_stall_window": 100}
+        )
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        goal = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": 7,
+        }
+        coordinator.session_state["goal"] = goal
+        provider.turn_queue.extend(
+            [
+                MockTurnResponse(text="TURN-ONE-PROOF"),
+                MockTurnResponse(text="unrelated turn two"),
+                MockTurnResponse(text="unrelated turn three"),
+                MockTurnResponse(text="TURN-ONE-PROOF"),
+                MockTurnResponse(text="unrelated turn five"),
+                MockTurnResponse(text="unrelated turn six"),
+                MockTurnResponse(text="unrelated turn seven"),
+            ]
+        )
+        provider.eval_queue.extend([(False, "blocked")] * 7)
+        provider.judge_queue.extend(
+            [
+                ("resolvable", "the model credits the repeated proof", "DEMONSTRATED"),
+                ("resolvable", "no later progress", "NOT_DEMONSTRATED"),
+            ]
+        )
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        first_judge_user = next(
+            message.content
+            for message in provider.judge_call_requests[0].messages
+            if message.role == "user"
+        )
+        second_judge_user = next(
+            message.content
+            for message in provider.judge_call_requests[1].messages
+            if message.role == "user"
+        )
+        assert "PRIOR MATERIAL, not CURRENT progress" in first_judge_user
+        assert first_judge_user.count("TURN-ONE-PROOF") == 2
+        assert "PRIOR MATERIAL, not CURRENT progress" in second_judge_user
+        assert second_judge_user.count("TURN-ONE-PROOF") == 2
+        assert [entry["turn"] for entry in goal["progress_evidence_anchors"]] == [
+            1,
+            2,
+            3,
+            4,
+        ]
+        assert hooks.goal_progress_events()[-1]["state"] == "stalled"
+
+    async def test_recovery_is_judged_immediately_after_tool_and_new_reason(
+        self,
+    ) -> None:
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 1, "goal_busy_stall_window": 100}
+        )
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        coordinator.session_state["goal"] = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        provider.turn_queue.extend(
+            [
+                MockTurnResponse(text="initial"),
+                MockTurnResponse(text="idle"),
+                MockTurnResponse(
+                    tool_calls=[MockToolCall(name="mock_tool")],
+                ),
+                MockTurnResponse(text="tool ran but nothing changed"),
+            ]
+        )
+        provider.eval_queue.extend(
+            [
+                (False, "first blocker"),
+                (False, "same blocker"),
+                (False, "different wording after tool"),
+            ]
+        )
+        provider.judge_queue.extend(
+            [
+                ("resolvable", "no progress", "NOT_DEMONSTRATED"),
+                ("resolvable", "tool result is unchanged", "NOT_DEMONSTRATED"),
+            ]
+        )
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {"mock_tool": MockTool()},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert hooks.goal_progress_events()[-1]["state"] == "stalled"
+        assert len(provider.judge_call_requests) == 2
+        assert coordinator.session_state["goal"] is None
+
+    async def test_judge_error_ends_goal_explicitly(self) -> None:
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 1, "goal_busy_stall_window": 100}
+        )
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        coordinator.session_state["goal"] = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        provider.turn_queue.extend(
+            [MockTurnResponse(text="initial"), MockTurnResponse(text="idle")]
+        )
+        provider.eval_queue.extend([(False, "blocked"), (False, "blocked")])
+        provider.judge_should_raise = RuntimeError("judge unavailable")
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        event = hooks.goal_progress_events()[-1]
+        assert event["state"] == "error"
+        assert "judge unavailable" in event["reason"]
+        assert event["summary"] == provider.summary_text
+        assert coordinator.session_state["goal"] is None
+
+
+class TestGoalEvidence:
+    def test_evidence_is_ordered_clipped_and_bounded(self) -> None:
+        orch = _make_orchestrator()
+        orch._goal_turn_evidence = {"tools": []}
+        calls = [
+            MockToolCall(str(index), f"tool-{index}")
+            for index in range(orch._GOAL_PROGRESS_EVIDENCE_MAX_TOOLS + 2)
+        ]
+        for call in calls:
+            call.arguments = {"text": "a" * 1000}
+        results = [(call.id, call.name, "result-" + ("b" * 1000)) for call in calls]
+        orch._capture_goal_tool_evidence(calls[:4], results[:4])
+        orch._capture_goal_tool_evidence(calls[4:], results[4:])
+        orch._goal_turn_evidence["assistant_response"] = "visible-" + ("c" * 5000)
+        goal = {"turns_used": 1, "progress_evidence": []}
+
+        orch._record_goal_evidence(goal, "reason-" + ("d" * 5000))
+
+        evidence = goal["progress_evidence"][0]
+        assert [entry["name"] for entry in evidence["tools"]] == [
+            call.name for call in calls[-orch._GOAL_PROGRESS_EVIDENCE_MAX_TOOLS :]
+        ]
+        assert evidence["tools_omitted"] == 2
+        assert "chars truncated]" in evidence["tools"][0]["arguments"]
+        assert "chars truncated]" in evidence["tools"][0]["result"]
+        assert "chars truncated]" in evidence["assistant_response"]
+        assert "chars truncated]" in evidence["reason"]
+        assert len(json.dumps(evidence, default=str, ensure_ascii=False)) <= (
+            orch._GOAL_PROGRESS_EVIDENCE_MAX_CHARS
+        )
+        orch._snapshot_goal_progress_anchors(goal)
+        assert [entry["turn"] for entry in goal["progress_evidence_anchors"]] == [1]
+        for turn in range(2, 6):
+            goal["turns_used"] = turn
+            orch._record_goal_evidence(goal, "another reason")
+        assert [entry["turn"] for entry in goal["progress_evidence"]] == [3, 4, 5]
+        orch._snapshot_goal_progress_anchors(goal)
+        assert [entry["turn"] for entry in goal["progress_evidence_anchors"]] == [
+            1,
+            3,
+            4,
+            5,
+        ]
+
+    def test_evidence_hard_bound_handles_escape_heavy_text(self) -> None:
+        orch = _make_orchestrator()
+        orch._goal_turn_evidence = {
+            "tools": [],
+            "assistant_response": '\\"' * 5000,
+        }
+        goal = {"turns_used": 1, "progress_evidence": []}
+
+        orch._record_goal_evidence(goal, '\\"' * 5000)
+
+        evidence = goal["progress_evidence"][0]
+        serialized = json.dumps(evidence, default=str, ensure_ascii=False)
+        assert len(serialized) <= orch._GOAL_PROGRESS_EVIDENCE_MAX_CHARS
+        assert json.loads(serialized) == evidence
+
+    @pytest.mark.asyncio
+    async def test_recovery_prompt_compares_snapshot_with_current_evidence(
+        self,
+    ) -> None:
+        orch = _make_orchestrator()
+        hooks, coordinator, provider = MockHooks(), MockCoordinator(), FakeProvider()
+        before = {
+            "turn": 2,
+            "tools": [],
+            "assistant_response": "old successful-looking artifact " + ("x" * 11600),
+            "reason": "old reason",
+        }
+        anchor = {
+            "turn": 1,
+            "tools": [],
+            "assistant_response": "PRIOR-PROOF: earlier retained artifact",
+            "reason": "earlier reason",
+        }
+        current = {
+            "turn": 3,
+            "tools": [],
+            "assistant_response": "CURRENT-PROOF: current unchanged artifact",
+            "reason": "new evaluator wording",
+        }
+        goal = {
+            "condition": "solved",
+            "reasons": ["old reason", "new evaluator wording"],
+            "progress_evidence": [before, current],
+            "progress_evidence_anchors": [anchor],
+            "recovery_pending": {"before": [before]},
+        }
+        provider.judge_queue.append(
+            ("resolvable", "only current work is unchanged", "NOT_DEMONSTRATED")
+        )
+
+        await orch._judge_stall(
+            goal,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+            trigger="recovery",
+        )
+
+        user_message = next(
+            message
+            for message in provider.judge_call_requests[0].messages
+            if message.role == "user"
+        )
+        assert '"before":' in user_message.content
+        assert '"current":' in user_message.content
+        assert "old successful-looking artifact" in user_message.content
+        assert "CURRENT-PROOF: current unchanged artifact" in user_message.content
+        assert "PRIOR MATERIAL, not CURRENT progress" in user_message.content
+        assert "PRIOR-PROOF: earlier retained artifact" in user_message.content
+        assert user_message.content.index('"current":') < user_message.content.index(
+            "PRIOR MATERIAL, not CURRENT progress"
+        )
+        assert (
+            len(
+                json.dumps(
+                    {
+                        "before": [orch._bound_goal_evidence_entry(before)],
+                        "current": [orch._bound_goal_evidence_entry(current)],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            > orch._GOAL_PROGRESS_EVIDENCE_MAX_CHARS
+        )
+        assert "EVALUATOR REASONS across the last 1 turns" in user_message.content
+        system_message = next(
+            message
+            for message in provider.judge_call_requests[0].messages
+            if message.role == "system"
+        )
+        assert "NO TOOL ACTIONS" not in system_message.content
+        assert "before and after one permitted recovery turn" in system_message.content
+
+    @pytest.mark.asyncio
+    async def test_two_line_judge_response_is_terminal_error(self) -> None:
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 1, "goal_busy_stall_window": 100}
+        )
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        coordinator.session_state["goal"] = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": None,
+        }
+        provider.turn_queue.extend(
+            [MockTurnResponse(text="initial"), MockTurnResponse(text="idle")]
+        )
+        provider.eval_queue.extend([(False, "blocked"), (False, "blocked")])
+        provider.judge_response = "RESOLVABLE\nlegacy detail"
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        event = hooks.goal_progress_events()[-1]
+        assert event["state"] == "error"
+        assert "exactly three nonempty lines" in event["reason"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "verdict",
+        ["TIME-LOCKED", "STRUCTURE-LOCKED", "HISTORY-LOCKED"],
+    )
+    async def test_locked_demonstrated_judge_response_is_terminal_error(
+        self, verdict: str
+    ) -> None:
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 1, "goal_busy_stall_window": 100}
+        )
+        ctx, hooks, coordinator, provider = (
+            MockContext(),
+            MockHooks(),
+            MockCoordinator(),
+            FakeProvider(),
+        )
+        coordinator.session_state["goal"] = {
+            "condition": "solved",
+            "turns_used": 0,
+            "last_reason": None,
+            "cap": 2,
+        }
+        provider.turn_queue.extend(
+            [MockTurnResponse(text="initial"), MockTurnResponse(text="idle")]
+        )
+        provider.eval_queue.extend([(False, "blocked"), (False, "blocked")])
+        provider.judge_queue.append((verdict, "contradictory response", "DEMONSTRATED"))
+
+        await orch.execute(
+            "solve it",
+            ctx,
+            {"main": provider},
+            {},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        event = hooks.goal_progress_events()[-1]
+        assert event["state"] == "error"
+        assert "locked conditions cannot demonstrate progress" in event["reason"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("verdict", "progress", "expected_stalled"),
+        [
+            ("RESOLVABLE", "DEMONSTRATED", False),
+            ("RESOLVABLE", "NOT_DEMONSTRATED", True),
+            ("TIME-LOCKED", "NOT_DEMONSTRATED", True),
+            ("STRUCTURE-LOCKED", "NOT_DEMONSTRATED", True),
+            ("HISTORY-LOCKED", "NOT_DEMONSTRATED", True),
+        ],
+    )
+    async def test_compatible_judge_verdict_pairs_parse(
+        self, verdict: str, progress: str, expected_stalled: bool
+    ) -> None:
+        orch = _make_orchestrator()
+        hooks, coordinator, provider = MockHooks(), MockCoordinator(), FakeProvider()
+        goal = {
+            "condition": "solved",
+            "reasons": ["blocked"],
+            "no_tool_turns": 1,
+            "progress_evidence": [],
+        }
+        provider.judge_queue.append((verdict, "compatible response", progress))
+
+        is_stalled, _, _, progress_verdict = await orch._judge_stall(
+            goal,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+
+        assert is_stalled is expected_stalled
+        assert progress_verdict == progress.lower()
 
 
 def _make_orchestrator(config: dict | None = None):
@@ -393,6 +967,7 @@ class TestContinuationCounting:
                 "summary",
                 "distinct_blockers",
                 "stall_verdict",
+                "progress_verdict",
                 "condition",
                 "schema_version",
             }
@@ -420,7 +995,9 @@ class TestContinuationCounting:
 @pytest.mark.asyncio
 class TestNoToolTurnsBookkeeping:
     async def test_increment_on_zero_tools_reset_on_tools(self) -> None:
-        orch = _make_orchestrator({"goal_stall_threshold": 3})
+        orch = _make_orchestrator(
+            {"goal_stall_threshold": 3, "goal_busy_stall_window": 100}
+        )
         ctx = MockContext()
         hooks = MockHooks()
         coordinator = MockCoordinator()
@@ -782,8 +1359,7 @@ class TestBusyStallTrigger:
         stalled_event = hooks.goal_progress_events()[-1]
         assert stalled_event["stall_verdict"] == "history-locked"
         assert (
-            stalled_event["stall_detail"]
-            == "still the same blocker after escalation"
+            stalled_event["stall_detail"] == "still the same blocker after escalation"
         )
 
         # The mechanical IDLE trigger genuinely never reached threshold --
@@ -1101,13 +1677,10 @@ class TestStallRearmsAfterEscalation:
         )
 
         assert isinstance(result, str)
-        # Both judge calls consumed -- the second consultation must happen
-        # even though this turn also hits the cap (DEFECT 1).
-        assert provider.judge_queue == [], (
-            "stall judge was never re-consulted after escalation -- "
-            "DEFECT 1 (cap check preempting the stall check)"
-        )
-        assert provider.eval_queue == []
+        # The first judge consumes the recovery allowance and the immediate
+        # recovery judgment consumes the second; no older activity may defer it.
+        assert provider.judge_queue == [], "recovery turn was not judged immediately"
+        assert len(provider.eval_queue) == 2
 
         states = [e["state"] for e in hooks.goal_progress_events()]
         assert states[-1] == "stalled", (
@@ -2399,7 +2972,7 @@ class TestPerStateFallbacks:
 
         error_event = hooks.goal_progress_events()[-1]
         assert error_event["state"] == "error"
-        assert error_event["summary"] == "evaluator failed"
+        assert error_event["summary"] == "goal assessment failed"
 
 
 @pytest.mark.asyncio
@@ -2676,7 +3249,7 @@ class TestInternalCallsDoNotStream:
             "no_tool_turns": 2,
         }
 
-        is_stalled, detail, verdict = await orch._judge_stall(
+        is_stalled, detail, verdict, progress_verdict = await orch._judge_stall(
             goal_dict,
             {"main": provider},
             hooks,  # type: ignore[arg-type]
@@ -2684,6 +3257,7 @@ class TestInternalCallsDoNotStream:
         )
 
         assert is_stalled is True
+        assert progress_verdict == "not_demonstrated"
         assert detail == "same blocker again"
         assert verdict == "history-locked"
         assert len(provider.judge_call_requests) == 1

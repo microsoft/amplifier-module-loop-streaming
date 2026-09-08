@@ -51,8 +51,8 @@ config = {
     budget_warn_ratio = 0.8,         # Fraction of max_iterations at which a one-shot
                                       # "start converging" system-reminder is injected
                                       # (see below). Inert when max_iterations is -1.
-    goal_stall_threshold = 3,        # /goal: consecutive no-tool continuation turns
-                                      # before the stall judge is consulted
+    goal_stall_threshold = 3,        # /goal: candidate threshold before a bounded
+                                      # evidence judge allows one recovery turn
     goal_model_role = "fast",        # /goal: routing-matrix model role requested for
                                       # the evaluator/stall-judge/summary calls, via
                                       # the model_role_resolver coordinator capability
