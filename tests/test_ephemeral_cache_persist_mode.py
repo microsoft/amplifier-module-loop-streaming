@@ -342,14 +342,12 @@ async def test_tail_mode_is_byte_identical_to_original_behavior() -> None:
 
 
 @pytest.mark.asyncio
-async def test_default_mode_is_now_persist() -> None:
-    """With NO `ephemeral_injection_mode` key (and no `reminder_placement`
-    key either) in config at all, both defaults apply: "persist" (default
-    flip, both providers validated) and "pre_user" (reminder-redesign-
-    spec.md, W1) -- the injection must be written into canonical context
-    via `context.add_message(...)`, enveloped, role-pinned to "user", tagged
-    `reminder_placement: "pre_user"`, and land BEFORE the user's own message
-    (turn-start placement, not a per-request tail append)."""
+async def test_default_mode_is_tail() -> None:
+    """With NO `ephemeral_injection_mode` key in config at all the default is
+    "tail" again (persist-by-default polluted canonical history with
+    irremovable user-role reminder blobs; see the rationale comment in
+    StreamingOrchestrator.__init__). The reminder must NOT be written into
+    canonical context; it appears only in the request view."""
     from amplifier_core.events import PROVIDER_REQUEST
 
     ctx = MockContext()
@@ -367,7 +365,7 @@ async def test_default_mode_is_now_persist() -> None:
     coordinator = MockCoordinator()
     orch = StreamingOrchestrator({})  # no config keys at all
 
-    assert orch._ephemeral_injection_mode == "persist"
+    assert orch._ephemeral_injection_mode == "tail"
     assert orch._reminder_placement == "pre_user"
 
     await orch.execute(
@@ -385,17 +383,13 @@ async def test_default_mode_is_now_persist() -> None:
         if isinstance(m.get("content"), str)
         and "<system-reminder>v1</system-reminder>" in m["content"]
     ]
-    assert len(persisted) == 1, (
-        "Default (no config keys) must now persist the injection via "
-        f"context.add_message(); got {ctx.add_message_calls!r}"
+    assert persisted == [], (
+        "Default (no config keys) must NOT write the injection into canonical "
+        f"context; got {ctx.add_message_calls!r}"
     )
-    assert persisted[0]["content"].startswith("<system-reminders>")
-    assert persisted[0]["metadata"] == {
-        "ephemeral": True,
-        "persisted": True,
-        "reminder_placement": "pre_user",
-    }
 
+    # The reminder still reaches the model in the request view, enveloped,
+    # user-role, and placed before the user's own message (pre_user).
     sent_messages = provider.requests[0].messages
     injected = [
         m
@@ -405,8 +399,7 @@ async def test_default_mode_is_now_persist() -> None:
     ]
     assert len(injected) == 1
     assert injected[0].role == "user"
-
-    # Block precedes the user's own message (turn-start placement, T-W1-04).
+    assert injected[0].content.startswith("<system-reminders>")
     user_msgs = [m for m in sent_messages if m.role == "user" and m.content == "hello"]
     assert len(user_msgs) == 1
     assert sent_messages.index(injected[0]) < sent_messages.index(user_msgs[0])
@@ -779,16 +772,15 @@ async def test_persist_mode_injection_is_budgeted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. Unknown mode falls back to "persist" (the new default) with a logged
-#    warning.
+# 7. Unknown mode falls back to "tail" (the default) with a logged warning.
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_mode_falls_back_to_persist_with_warning(caplog) -> None:
+def test_unknown_mode_falls_back_to_tail_with_warning(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         orch = StreamingOrchestrator({"ephemeral_injection_mode": "nonsense"})
 
-    assert orch._ephemeral_injection_mode == "persist"
+    assert orch._ephemeral_injection_mode == "tail"
     assert any(
         "nonsense" in record.message and "ephemeral_injection_mode" in record.message
         for record in caplog.records

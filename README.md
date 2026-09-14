@@ -88,13 +88,28 @@ config = {
 
 ```toml
 config = {
-    ephemeral_injection_mode = "persist",  # "tail" | "persist" (default "persist")
+    ephemeral_injection_mode = "tail",  # "tail" | "persist" (default "tail")
 }
 ```
 
+**Default is `"tail"` (2026-09-14).** `"persist"` was the default from
+2026-08-31 to 2026-09-14 and was reverted because it broke long sessions:
+every changed merged hook blob became an irremovable `role="user"` message
+in canonical history (context-simple's compactor never removes user
+messages and protects the last one as the human's current intent), while
+`hooks-mode` re-injects the full mode body (16-52K chars) on every request
+and `hooks-todo-reminder` changes text every <=3 tool calls. Measured across
+1,399 root sessions: 21,816 persisted reminder messages (149M chars) vs
+6,710 real user messages (32M chars); the worst session carried 619 blobs /
+27.7M chars and sat at compaction level 8 on every request with ~half of
+the post-compaction view being stale reminder text. Re-enable `"persist"`
+only for OpenAI-primary configs that accept that growth, or once the
+compactor treats persisted reminders as removable and producers stop
+re-injecting large stable bodies per request.
+
 Per-iteration ephemeral tail messages -- `hooks-status-context`,
 `hooks-todo-reminder`, the compaction notice, and any other
-`inject_context` hook result -- are, by default (`"persist"`), written into
+`inject_context` hook result -- are, in `"persist"` mode, written into
 canonical context via `context.add_message(...)`, and only when the text
 differs from the last text this orchestrator persisted. When unchanged,
 nothing is added, so request N is a true, append-only prefix of request
@@ -106,7 +121,8 @@ that follows and truncating the reusable prefix -- pinning cache-hit share
 near the static system-prompt boundary and re-billing the entire growing
 transcript as a fresh cache write on every call.
 
-**Evidence for the default:**
+**Evidence gathered for `"persist"` (cache-side only; long-session history
+growth was not measured at the time):**
 
 - **OpenAI**: a pre-registered 9-arm live probe found only the persist
   design (change-gated, canonical-context write) heals prefix reuse
@@ -138,8 +154,8 @@ need the original single-ephemeral-tail-message contract -- e.g. a custom
 hook whose injection text must never accumulate in history -- should set
 `ephemeral_injection_mode = "tail"` explicitly; that path remains fully
 supported and is byte-identical to the module's original, pre-this-feature
-behavior. An unknown value falls back to `"persist"` (the current default)
-with a logged warning.
+behavior. An unknown value falls back to `"tail"` (the default) with a
+logged warning.
 
 ## System-reminder envelope and placement (reminder-redesign-spec.md, W1)
 

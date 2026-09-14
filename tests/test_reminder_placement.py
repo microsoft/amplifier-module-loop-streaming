@@ -229,7 +229,7 @@ async def test_t_w1_04_block_precedes_user_message_in_persist_mode() -> None:
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})  # defaults: persist + pre_user
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "persist"})  # persist-mode behavior under test; default is tail
 
     await orch.execute(
         prompt="what does auth.py do?",
@@ -606,7 +606,7 @@ async def test_t_w1_10_role_pinned_to_user_despite_all_system_requests() -> None
         }
     )
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "persist"})  # persist-mode behavior under test; default is tail
 
     await orch.execute(
         prompt="hello",
@@ -772,7 +772,7 @@ async def test_t_w1_14_prompt_submit_content_precedes_provider_request_content()
 
     hooks = _MultiEventHooks()
     coordinator = MockCoordinator()
-    orch = StreamingOrchestrator({})
+    orch = StreamingOrchestrator({"ephemeral_injection_mode": "persist"})  # persist-mode behavior under test; default is tail
 
     await orch.execute(
         prompt="hello",

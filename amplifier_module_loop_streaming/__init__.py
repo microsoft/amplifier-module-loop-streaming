@@ -1150,30 +1150,30 @@ class StreamingOrchestrator:
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
         # Ephemeral-cache fix (spec: ephemeral-cache-fix-spec.md §5.3).
-        # Default flipped to "persist" (was "tail" in #44): live validation
-        # on both providers now supports persist-by-default -- OpenAI
-        # in-vivo across 30+ DTU runs recovered cache-read share from
-        # ~9-11% to 89-97% with cache-write down ~10x, and the Anthropic
-        # flip gate (n=3 DTU S1, persist ON) came back favorable too
-        # (cache-read share +5pts over the tail baseline, lower cost and
-        # wall time, 3/3 correct, clean wire contract) -- so "tail"'s
-        # original rationale (persist unvalidated on Anthropic) no longer
-        # holds. "tail" remains fully supported as the explicit opt-out,
-        # byte-identical to the module's original pre-#44 behavior. An
-        # unknown value falls back to "persist" (the new default) with a
-        # logged warning (mirrors amplifier_module_provider_openai's
-        # handling of an unknown reasoning_replay_scope -- same
-        # repo-family convention: fail visible and safe, never silently
-        # misbehave).
+        # Default is "tail" (the pre-#44 behavior). "persist" was the default
+        # from #45 (2026-08-31) until it was found to break long sessions:
+        # every CHANGED merged hook blob was appended to canonical history as
+        # a role="user" message, and context-simple's compactor treats every
+        # user message as a human turn it must never remove. hooks-mode
+        # re-injects the full mode body (16-52K chars) on every request and
+        # hooks-todo-reminder flips text every <=3 tool calls, so the blob
+        # changed on nearly every LLM call. Measured 2026-09-14 across 1,399
+        # root sessions: 21,816 persisted reminder messages (149M chars) vs
+        # 6,710 real user messages (32M chars); worst session 619 blobs /
+        # 27.7M chars. Replayed through the compactor those sessions sit at
+        # level 8 on every request with ~half the view being stale reminder
+        # text. "persist" remains available as an explicit opt-in for
+        # OpenAI-primary configs that accept that history growth; an unknown
+        # value falls back to "tail" with a logged warning.
         _ephemeral_injection_mode = (config or {}).get(
-            "ephemeral_injection_mode", "persist"
+            "ephemeral_injection_mode", "tail"
         )
         if _ephemeral_injection_mode not in ("tail", "persist"):
             logger.warning(
-                "Unknown ephemeral_injection_mode %r; falling back to 'persist'.",
+                "Unknown ephemeral_injection_mode %r; falling back to 'tail'.",
                 _ephemeral_injection_mode,
             )
-            _ephemeral_injection_mode = "persist"
+            _ephemeral_injection_mode = "tail"
         self._ephemeral_injection_mode: str = _ephemeral_injection_mode
         self._last_persisted_injection: str | None = None
         # D2 fix (rr wave 20260831 -- envelope accumulation). True once a
