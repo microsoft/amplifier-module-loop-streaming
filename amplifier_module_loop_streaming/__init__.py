@@ -1176,6 +1176,7 @@ class StreamingOrchestrator:
             _ephemeral_injection_mode = "persist"
         self._ephemeral_injection_mode: str = _ephemeral_injection_mode
         self._last_persisted_injection: str | None = None
+        self._retention_capability_warned: bool = False
         # The exact enveloped message admitted to canonical context. Keeping
         # both the raw producer body and this wire representation lets a
         # resumed orchestrator recognize an already-admitted reminder without
@@ -1321,6 +1322,7 @@ class StreamingOrchestrator:
         # turn.
         self._goal_model_cache = None
         self._goal_model_basis = None
+        self._retention_capability_warned = False
 
         # Peek at goal state *before* the first turn. Goal state can only be
         # set (by the app layer's /goal command) before execute() is called,
@@ -3240,12 +3242,17 @@ class StreamingOrchestrator:
             candidate = get_capability("context.request_retention")
             if callable(candidate):
                 retaining_getter = candidate
-        if self._ephemeral_injection_mode == "persist" and retaining_getter is None:
+        if (
+            self._ephemeral_injection_mode == "persist"
+            and retaining_getter is None
+            and not self._retention_capability_warned
+        ):
             logger.warning(
                 "Persisted reminder retention guarantee unavailable: "
                 "context.request_retention is not callable; using legacy "
                 "context request fallback."
             )
+            self._retention_capability_warned = True
 
         async def request_messages(retain_contents: list[str]):
             if retaining_getter is not None:
