@@ -141,6 +141,30 @@ supported and is byte-identical to the module's original, pre-this-feature
 behavior. An unknown value falls back to `"persist"` (the current default)
 with a logged warning.
 
+### Retention across compaction
+
+In persist mode, the orchestrator discovers the optional
+`context.request_retention` capability. When present, each request names the
+exact admitted envelopes for its current hook results, including unchanged
+provider reminders and pending tool-hook injections. They are budgeted before
+compaction. The change gate still avoids duplicate writes; an unchanged
+reminder keeps its original position and bytes while it remains admitted.
+After a canonical clear, the reminder is admitted again before retention.
+
+With a context manager that does not advertise this capability, request
+assembly follows the existing path. Core, provider, and hook interfaces do not
+change. The explicit `tail` mode remains view-only and does not use retention.
+
+This protects currently emitted content, not every historical injection. The
+orchestrator receives merged hook results and cannot infer separate source
+lifetimes. A producer that stops emitting a requirement stops retaining it.
+Historical corrections and one-shot instructions need a separate policy.
+
+Validate with unchanged, changed, and withdrawn hooks, actual compaction, and
+session resume. Inspect the final provider request, not only transcript writes.
+Stable requests preserve the append-only prefix; a compaction boundary or a
+newly restored requirement can change it.
+
 ## System-reminder envelope and placement (reminder-redesign-spec.md, W1)
 
 ```toml
