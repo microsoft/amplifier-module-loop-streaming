@@ -4329,9 +4329,22 @@ class StreamingOrchestrator:
             # allowed provider call, not discarded at the next turn boundary.
             await self._drain_steering(context, hooks, iteration)
 
-            # Get one final response with the reminder (via _execute_stream helper)
-            message_dicts = await context.get_messages_for_request(provider=provider)
-            message_dicts = list(message_dicts)
+            # Current provider-hook requirements also apply to the final call.
+            final_retained_contents: list[str] = []
+            if (
+                retaining_getter is not None
+                and finalization_result.action == "inject_context"
+                and finalization_result.ephemeral
+                and finalization_result.context_injection
+            ):
+                content, _ = await self._persist_reminder(
+                    context,
+                    finalization_result.context_injection,
+                    tail=True,
+                    verify_admitted=True,
+                )
+                final_retained_contents.append(content)
+            message_dicts = list(await request_messages(final_retained_contents))
             # The finalization hook and context assembly both await. Check
             # again before contacting the provider so a concurrent
             # cancellation cannot buy an unrequested final provider call.

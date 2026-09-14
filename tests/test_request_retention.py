@@ -175,3 +175,17 @@ async def test_tail_mode_does_not_require_the_retaining_capability():
     )
     assert not context.requirements
     assert any("ACTIVE_FACT" in str(m.content) for m in provider.requests[-1].messages)
+
+
+@pytest.mark.asyncio
+async def test_iteration_cap_finalization_retains_current_hook():
+    context = ReducingContext()
+    provider = NRoundToolProvider(n_tool_rounds=1)
+    hooks = ScriptedHooks({"provider:request": injection("FINAL_FACT")})
+    await StreamingOrchestrator({"max_iterations": 1}).execute(
+        "work", context, {"main": provider}, {"mock_tool": OneShotTool()},
+        hooks, coordinator_for(context),
+    )
+    assert len(provider.requests) == 2
+    assert any("FINAL_FACT" in str(m.content) for m in provider.requests[-1].messages)
+    assert len(context.requirements[-1]) == 1
