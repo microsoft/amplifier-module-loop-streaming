@@ -11,13 +11,12 @@ import copy
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from amplifier_core import HookRegistry, HookResult, ToolResult
 
 from amplifier_module_loop_streaming import StreamingOrchestrator
-
 
 _context_source = os.environ.get("AMPLIFIER_CONTEXT_SIMPLE_TEST_SOURCE")
 if not _context_source:
@@ -32,7 +31,7 @@ if not _CONTEXT_SIMPLE_TEST_SOURCE.is_dir():
         allow_module_level=True,
     )
 sys.path.insert(0, str(_CONTEXT_SIMPLE_TEST_SOURCE))
-from amplifier_module_context_simple import mount as mount_context  # noqa: E402
+from amplifier_module_context_simple import mount as mount_context
 
 
 class _Cancellation:
@@ -101,6 +100,7 @@ class _Response:
 
 class _V1Provider:
     instruction_layout_version = 1
+    instruction_layout_authority_v1 = True
     priority = 1
 
     def __init__(self) -> None:
@@ -123,6 +123,11 @@ class _V1Provider:
 
 class _LegacyProvider(_V1Provider):
     instruction_layout_version = 0
+    instruction_layout_authority_v1 = False
+
+
+class _VersionOnlyProvider(_V1Provider):
+    instruction_layout_authority_v1 = False
 
 
 class _GoalText:
@@ -182,7 +187,7 @@ class _SuccessfulToolProvider(_V1Provider):
 class _SuccessfulTool:
     name = "tool"
     description = "test tool"
-    input_schema: dict[str, Any] = {"type": "object", "properties": {}}
+    input_schema: ClassVar[dict[str, Any]] = {"type": "object", "properties": {}}
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         return ToolResult(success=True, output="tool result")
@@ -268,10 +273,48 @@ class _FinalizationInjectionHooks:
         return HookResult(action="continue")
 
 
+class _RolePreservingInjectionHooks:
+    """Exercise each legacy carrier role across prompt, request, and tool hooks."""
+
+    async def emit(self, event: str, data: dict[str, Any] | None = None) -> HookResult:
+        injected = {
+            "prompt:submit": ("legacy-user", "user"),
+            "provider:request": ("legacy-system", "system"),
+            "tool:pre": ("legacy-assistant", "assistant"),
+            "tool:post": ("legacy-post-user", "user"),
+        }.get(event)
+        if injected is None:
+            return HookResult(action="continue")
+        content, role = injected
+        return HookResult(
+            action="inject_context",
+            ephemeral=True,
+            context_injection=content,
+            context_injection_role=role,
+            append_to_last_tool_result=event == "tool:post",
+        )
+
+
+class _PerTurnInjectionHooks:
+    async def emit(self, event: str, data: dict[str, Any] | None = None) -> HookResult:
+        if event == "prompt:submit":
+            return HookResult(
+                action="inject_context",
+                ephemeral=True,
+                context_injection=f"turn-only:{data['prompt']}",
+                context_injection_role="user",
+            )
+        return HookResult(action="continue")
+
+
 async def _new_context(checkpoint: list[dict[str, Any]] | None = None):
     coordinator = _Coordinator()
     await mount_context(coordinator, {"instruction_session_id": "logical-session"})
     context = coordinator.get("context")
+    # The proposal context sibling advertises this capability. The pinned
+    # source used by these seam tests predates it, so model the negotiated
+    # capability explicitly except in authority-unaware compatibility tests.
+    coordinator.get_capability("context.instructions.v1").instruction_layout_authority_v1 = True
     if checkpoint is not None:
         await context.restore_host_checkpoint(copy.deepcopy(checkpoint))
     return coordinator, context
@@ -588,8 +631,8 @@ async def test_completed_tool_batches_do_not_reach_later_requests() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v1_finalization_keeps_the_prepared_system_view_and_accepts_response() -> None:
-    """The bounded final call does not append a legacy user-role reminder in v1."""
+async def test_v1_finalization_stages_an_advisory_reminder_and_accepts_response() -> None:
+    """The bounded final call keeps its wrap-up reminder request-local in v1."""
     coordinator, context = await _new_context()
     assembly = coordinator.get_capability("context.instructions.v1")
     assembly.register(
@@ -606,9 +649,25 @@ async def test_v1_finalization_keeps_the_prepared_system_view_and_accepts_respon
     assert result == "answer-2"
     assert len(provider.requests) == 2
     assert _request_contents(provider, 1)[0] == "live-system"
-    assert not any(
-        isinstance(message.content, str) and "orchestrator-loop-limit" in message.content
+    warning = next(
+        message
+        for message in provider.requests[0].messages
+        if isinstance(message.content, str) and "You have used 1 of 1" in message.content
+    )
+    reminder = next(
+        message
         for message in provider.requests[1].messages
+        if isinstance(message.content, str) and "orchestrator-loop-limit" in message.content
+    )
+    warning_descriptor = warning.metadata["amplifier:instruction"]
+    descriptor = reminder.metadata["amplifier:instruction"]
+    assert warning_descriptor["authority"] == "advisory"
+    assert descriptor["authority"] == "advisory"
+    assert warning_descriptor["source"] == descriptor["source"]
+    assert descriptor["source"].startswith("loop-streaming:")
+    assert not any(
+        "orchestrator-loop-limit" in str(message.get("content"))
+        for message in await context.get_messages()
     )
     assert (await context.get_messages())[-1]["content"] == "answer-2"
 
@@ -632,11 +691,12 @@ async def test_v1_finalization_admits_legacy_hook_feedback_before_its_view() -> 
         if isinstance(message.content, str) and "legacy-finalization" in message.content
     )
     assert legacy.role == "system"
+    assert legacy.metadata["amplifier:instruction"]["authority"] == "authoritative"
 
 
 @pytest.mark.asyncio
-async def test_unmigrated_hook_injections_remain_available_as_system_context_in_v1() -> None:
-    """V1 snapshots do not discard ordinary prompt/request/post hook output."""
+async def test_unmigrated_hook_injections_are_request_local_in_v1() -> None:
+    """V1 snapshots retain hook output without persisting it into conversation history."""
     coordinator, context = await _new_context()
     provider = _SuccessfulToolProvider()
     _provide_execution_input(coordinator, "human-H1")
@@ -662,6 +722,85 @@ async def test_unmigrated_hook_injections_remain_available_as_system_context_in_
         for message in request.messages
         if isinstance(message.content, str) and "legacy-" in message.content
     )
+    assert not any(
+        "legacy-" in str(message.get("content")) for message in await context.get_messages()
+    )
+
+
+@pytest.mark.asyncio
+async def test_v1_staging_preserves_legacy_role_as_instruction_authority(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Legacy user/system/assistant carriers map to advisory/authoritative/advisory."""
+    coordinator, context = await _new_context()
+    provider = _SuccessfulToolProvider()
+    _provide_execution_input(coordinator, "human-H1")
+
+    with caplog.at_level("WARNING"):
+        assert await StreamingOrchestrator({}).execute(
+            "H1",
+            context,
+            {"v1": provider},
+            {"tool": _SuccessfulTool()},
+            _RolePreservingInjectionHooks(),
+            coordinator,
+        ) == "answer-2"
+
+    authority_by_content = {
+        message.content: message.metadata["amplifier:instruction"]["authority"]
+        for request in provider.requests
+        for message in request.messages
+        if isinstance(message.content, str) and "legacy-" in message.content
+    }
+    assert authority_by_content[next(
+        content for content in authority_by_content if "legacy-user" in content
+    )] == "advisory"
+    assert authority_by_content[next(
+        content for content in authority_by_content if "legacy-system" in content
+    )] == "authoritative"
+    assert authority_by_content[next(
+        content for content in authority_by_content if "legacy-assistant" in content
+    )] == "advisory"
+    assert "assistant-role context injection is staged as an advisory" in caplog.text
+    post_message = next(
+        message
+        for message in provider.requests[1].messages
+        if isinstance(message.content, str) and "legacy-post-user" in message.content
+    )
+    assert post_message.metadata["amplifier:instruction"]["target"] == {
+        "after_message_id": (await context.get_messages())[-2]["metadata"]["message_id"]
+    }
+    assert not any(
+        "legacy-" in str(message.get("content")) for message in await context.get_messages()
+    )
+
+
+@pytest.mark.asyncio
+async def test_v1_staged_injections_do_not_accumulate_across_three_outer_turns() -> None:
+    """Each outer request gets only its own staged injection and closes its source."""
+    coordinator, context = await _new_context()
+    orchestrator = StreamingOrchestrator({})
+    provider = _V1Provider()
+
+    for prompt in ("H1", "H2", "H3"):
+        _provide_execution_input(coordinator, f"human-{prompt}")
+        assert await orchestrator.execute(
+            prompt, context, {"v1": provider}, {}, _PerTurnInjectionHooks(), coordinator
+        ) == f"answer-{len(provider.requests)}"
+
+    for index, prompt in enumerate(("H1", "H2", "H3")):
+        contents = _request_contents(provider, index)
+        assert f"turn-only:{prompt}" in "\n".join(contents)
+        assert all(
+            f"turn-only:{other}" not in "\n".join(contents)
+            for other in ("H1", "H2", "H3")
+            if other != prompt
+        )
+    assert not any(
+        "turn-only:" in str(message.get("content")) for message in await context.get_messages()
+    )
+    assembly = coordinator.get_capability("context.instructions.v1")
+    assert not any(source.startswith("loop-streaming:") for source in assembly._sources)
 
 
 @pytest.mark.asyncio
@@ -725,6 +864,63 @@ async def test_v1_stream_failure_abandons_the_request_and_next_turn_can_run() ->
     assert await StreamingOrchestrator({}).execute(
         "H2", context, {"v1": _V1Provider()}, {}, HookRegistry(), coordinator
     ) == "answer-1"
+
+
+@pytest.mark.asyncio
+async def test_v1_failure_discards_staged_injections_before_the_next_execution() -> None:
+    """A failed request cannot replay its legacy staging into a later execution."""
+    coordinator, context = await _new_context()
+    orchestrator = StreamingOrchestrator({})
+    _provide_execution_input(coordinator, "human-H1")
+
+    with pytest.raises(RuntimeError, match="stream transport failed"):
+        await orchestrator.execute(
+            "H1",
+            context,
+            {"v1": _FailingStreamProvider()},
+            {},
+            _PerTurnInjectionHooks(),
+            coordinator,
+        )
+
+    _provide_execution_input(coordinator, "human-H2")
+    provider = _V1Provider()
+    assert await orchestrator.execute(
+        "H2", context, {"v1": provider}, {}, HookRegistry(), coordinator
+    ) == "answer-1"
+    assert not any(
+        "turn-only:H1" in content for content in _request_contents(provider, 0)
+    )
+    assembly = coordinator.get_capability("context.instructions.v1")
+    assert not any(source.startswith("loop-streaming:") for source in assembly._sources)
+
+
+@pytest.mark.asyncio
+async def test_v1_cancelled_stream_discards_staged_injections_before_the_next_execution() -> None:
+    """A cancelled request closes its local source instead of replaying stale staging."""
+    coordinator, context = await _new_context()
+    orchestrator = StreamingOrchestrator({})
+    _provide_execution_input(coordinator, "human-H1")
+
+    assert await orchestrator.execute(
+        "H1",
+        context,
+        {"v1": _CancellingStreamProvider(coordinator.cancellation)},
+        {},
+        _PerTurnInjectionHooks(),
+        coordinator,
+    ) == "partial"
+
+    _provide_execution_input(coordinator, "human-H2")
+    provider = _V1Provider()
+    assert await orchestrator.execute(
+        "H2", context, {"v1": provider}, {}, HookRegistry(), coordinator
+    ) == "answer-1"
+    assert not any(
+        "turn-only:H1" in content for content in _request_contents(provider, 0)
+    )
+    assembly = coordinator.get_capability("context.instructions.v1")
+    assert not any(source.startswith("loop-streaming:") for source in assembly._sources)
 
 
 @pytest.mark.asyncio
@@ -841,7 +1037,7 @@ async def test_old_context_or_provider_uses_unchanged_legacy_path() -> None:
     ]
 
     coordinator, context = await _new_context()
-    legacy_provider = _LegacyProvider()
+    legacy_provider = _VersionOnlyProvider()
     _provide_execution_input(coordinator, "human-H1")
     assert await StreamingOrchestrator({}).execute(
         "legacy-provider", context, {"legacy": legacy_provider}, {}, HookRegistry(), coordinator
@@ -852,7 +1048,7 @@ async def test_old_context_or_provider_uses_unchanged_legacy_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_incompatible_provider_refuses_marked_v1_history() -> None:
+async def test_authority_incompatible_provider_refuses_marked_v1_history() -> None:
     """A selected provider may not silently lower retained v1 system records."""
     coordinator, context = await _new_context()
     assembly = coordinator.get_capability("context.instructions.v1")
@@ -863,12 +1059,81 @@ async def test_incompatible_provider_refuses_marked_v1_history() -> None:
         target={"session_id": "logical-session", "kind": "conversation_head"},
         retain_history=True,
     )
-    provider = _LegacyProvider()
+    provider = _VersionOnlyProvider()
 
     _provide_execution_input(coordinator, "human-H1")
-    with pytest.raises(RuntimeError, match="does not declare instruction_layout_version"):
+    with pytest.raises(RuntimeError, match="instruction_layout_authority_v1 is True"):
         await StreamingOrchestrator({}).execute(
             "H1", context, {"legacy": provider}, {}, HookRegistry(), coordinator
+        )
+
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_authority_incompatible_provider_refuses_pending_v1_fixed_state() -> None:
+    """A non-retained fixed lease is still unsafe to dispatch on an authority downgrade."""
+    coordinator, context = await _new_context()
+    assembly = coordinator.get_capability("context.instructions.v1")
+    lease = assembly.register("test-pending-fixed")
+    lease.publish(
+        "pending",
+        "must remain authoritative",
+        target={"kind": "first_eligible_turn", "placement": "head"},
+        retain_history=False,
+    )
+    provider = _VersionOnlyProvider()
+
+    _provide_execution_input(coordinator, "human-H1")
+    with pytest.raises(RuntimeError, match="instruction_layout_authority_v1 is True"):
+        await StreamingOrchestrator({}).execute(
+            "H1", context, {"version-only": provider}, {}, HookRegistry(), coordinator
+        )
+
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_authority_unaware_context_uses_legacy_for_unmarked_history() -> None:
+    """A new provider cannot activate v1 against a pre-authority context assembly."""
+    coordinator, context = await _new_context()
+    assembly = coordinator.get_capability("context.instructions.v1")
+    assembly.instruction_layout_authority_v1 = False
+    assert getattr(assembly, "instruction_layout_authority_v1", None) is not True
+    provider = _V1Provider()
+    _provide_execution_input(coordinator, "human-H1")
+
+    assert await StreamingOrchestrator({}).execute(
+        "H1", context, {"v1": provider}, {}, HookRegistry(), coordinator
+    ) == "answer-1"
+
+    assert provider.requests
+    assert all(
+        "amplifier:input" not in message.get("metadata", {})
+        for message in await context.get_messages()
+    )
+
+
+@pytest.mark.asyncio
+async def test_authority_unaware_context_refuses_retained_marked_history() -> None:
+    """Transcript fallback still protects retained records on an old assembly."""
+    coordinator, context = await _new_context()
+    assembly = coordinator.get_capability("context.instructions.v1")
+    assembly.instruction_layout_authority_v1 = False
+    assert getattr(assembly, "instruction_layout_authority_v1", None) is not True
+    lease = assembly.register("test-fixed")
+    lease.publish(
+        "fixed",
+        "must remain authoritative",
+        target={"session_id": "logical-session", "kind": "conversation_head"},
+        retain_history=True,
+    )
+    provider = _V1Provider()
+    _provide_execution_input(coordinator, "human-H1")
+
+    with pytest.raises(RuntimeError, match="instruction_layout_authority_v1 is True"):
+        await StreamingOrchestrator({}).execute(
+            "H1", context, {"v1": provider}, {}, HookRegistry(), coordinator
         )
 
     assert provider.requests == []

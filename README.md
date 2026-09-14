@@ -84,62 +84,32 @@ config = {
 }
 ```
 
-## Ephemeral injection mode (prompt-cache prefix fix)
+## Ephemeral hook injections
 
 ```toml
 config = {
-    ephemeral_injection_mode = "persist",  # "tail" | "persist" (default "persist")
+    ephemeral_injection_mode = "persist",  # legacy-provider compatibility setting
 }
 ```
 
-Per-iteration ephemeral tail messages -- `hooks-status-context`,
-`hooks-todo-reminder`, the compaction notice, and any other
-`inject_context` hook result -- are, by default (`"persist"`), written into
-canonical context via `context.add_message(...)`, and only when the text
-differs from the last text this orchestrator persisted. When unchanged,
-nothing is added, so request N is a true, append-only prefix of request
-N+1. This matters because OpenAI's (and most providers') implicit/explicit
-prompt cache reuses only the longest true prefix of a prior request: the
-original `"tail"` behavior re-generates and re-appends these messages at
-the tail of every request, positionally displacing the assistant/tool turn
-that follows and truncating the reusable prefix -- pinning cache-hit share
-near the static system-prompt boundary and re-billing the entire growing
-transcript as a fresh cache write on every call.
+When `context.instructions.v1` is available, its assembly advertises
+`instruction_layout_authority_v1 = true`, and the selected provider opts into
+both `instruction_layout_version = 1` and
+`instruction_layout_authority_v1 = true`, ephemeral hook output is staged in
+an execution-local instruction source. This authority extension is negotiated
+at both the context and provider boundaries. It is included in exactly one
+prepared request and is discarded when that response is accepted or abandoned;
+it is never added to canonical conversation history.
 
-**Evidence for the default:**
+The hook's original `context_injection_role` is preserved as instruction
+authority: `system` is authoritative, while `user` and `assistant` are
+advisory. Assistant-role output also logs a migration warning. All staged
+records remain canonical system instructions, so a provider can preserve the
+declared authority without mistaking advisory hook output for user input.
 
-- **OpenAI**: a pre-registered 9-arm live probe found only the persist
-  design (change-gated, canonical-context write) heals prefix reuse
-  (98.9%); byte-stable tails and folding into the tool result do not heal
-  it (both are still positional, not content, mismatches). In-vivo across
-  4 DTU eval waves (30+ runs), cache-read share recovered from ~9-11% to
-  89-97% on every persist run, cache-write dropped ~10x, and task quality
-  was unchanged (all runs correct/passing). A real 6-turn session with
-  `"tail"` (the old default) showed `cache_read` pinned flat at 63,060
-  tokens across every call while `cache_write` climbed monotonically --
-  77.9M cache-write vs. 24.0M cache-read (3.24:1, inverted) -- an
-  estimated $250-380 of that session's $452 total was avoidable re-write
-  spend.
-- **Anthropic** (the flip gate): n=3 DTU S1 runs with persist mode on,
-  `claude-opus-4` @ xhigh: 3/3 correct; cache-read share 90.9-92.5% (mean
-  91.9%) vs. the `"tail"` baseline's 83.1-87.8% (mean 86.2%) -- +5pts,
-  favorable; cost $1.29 vs. $1.90 mean; wall time 257s vs. 331s mean; wire
-  contract clean (append-only message list, persisted injections
-  re-emitted only on change, valid `cache_control` breakpoints, zero
-  provider errors, no thinking-block interaction issues).
-
-**The tradeoff this mode accepts (spec §5.2):** once an injection is
-persisted, it is no longer "removed next turn" -- it becomes real,
-bounded history from that point on (still marked
-`metadata.ephemeral=True`, now meaning "machine-generated per-turn
-scaffolding", not "guaranteed absent next turn"), and it is re-emitted
-(persisted again) only when its content actually changes. Operators who
-need the original single-ephemeral-tail-message contract -- e.g. a custom
-hook whose injection text must never accumulate in history -- should set
-`ephemeral_injection_mode = "tail"` explicitly; that path remains fully
-supported and is byte-identical to the module's original, pre-this-feature
-behavior. An unknown value falls back to `"persist"` (the current default)
-with a logged warning.
+Legacy providers, or providers without the authority opt-in, retain the
+existing request-view behavior. A context with marked v1 instruction history
+refuses that downgrade rather than silently lowering authority.
 
 ## System-reminder envelope and placement (reminder-redesign-spec.md, W1)
 
@@ -167,13 +137,15 @@ supporting context. Two independent fixes address this:
    `amplifier-module-provider-openai`'s FM3 repair) already use -- one
    prefix match covers both the per-source blocks and this outer envelope.
 
-2. **Placement (`reminder_placement`).** By default (`"pre_user"`), the
-   turn's reminder block is written **before** the user's prompt -- in
-   canonical history for `ephemeral_injection_mode = "persist"` (the
-   block precedes the user message as real, append-only history), or
-   spliced into the request VIEW for `ephemeral_injection_mode = "tail"`
-   (nothing persisted; the splice happens once, at iteration 1, and is
-   never repeated). This is achieved by hoisting iteration 1's
+2. **Placement (`reminder_placement`).** On the legacy route, by default
+   (`"pre_user"`), the turn's reminder block is written **before** the
+   user's prompt -- in canonical history for
+   `ephemeral_injection_mode = "persist"` (the block precedes the user
+   message as real, append-only history), or spliced into the request VIEW
+   for `ephemeral_injection_mode = "tail"` (nothing persisted; the splice
+   happens once, at iteration 1, and is never repeated). The v1 route
+   stages reminders as request-local tail instructions instead. Legacy
+   placement is achieved by hoisting iteration 1's
    `provider:request` emit to TURN START, before `context.add_message` adds
    the user's prompt -- the event payload carries `"phase": "turn_start"`
    so a hook that cares can discriminate; hooks that ignore the key behave
@@ -184,28 +156,14 @@ supporting context. Two independent fixes address this:
    only the ORDERING reverts. An unknown value falls back to `"pre_user"`
    with a logged warning.
 
-**Role pinning.** Every reminder message this orchestrator writes uses the
-literal `role = "user"`, regardless of what a contributing hook requested
-via `context_injection_role`. `HookResult.context_injection_role` defaults
-to `"system"`, and a hook that never sets it explicitly contributes
-system-role content; if the one hook in a chain that *does* set `"user"`
-is ever unmounted, deprioritized, or out-registered, the kernel's
-`merge_inject_context_results` ("first result wins" for role) would let a
-system-role blob through. `amplifier-module-provider-anthropic` hoists
-every `role == "system"` message into the single cached system block, and
-`amplifier-module-provider-openai` folds system content into
-`instructions` -- a per-turn-changing blob in that position rewrites the
-system prefix on every single turn. Pinning to `"user"` defuses this.
+**Role preservation.** On the v1 route, the original
+`context_injection_role` is explicit authority metadata: `system` remains
+authoritative; `user` and `assistant` are advisory. The source records are
+canonical system instructions, and never persisted. The assistant mapping
+emits a migration warning. The legacy route retains its existing
+user-carrier behavior for compatibility.
 
-**Known, accepted contract narrowing:** a hook that requests
-`context_injection_role = "assistant"` (simulating agent self-talk) is
-now overridden to `"user"` like everything else. No hook shipped in this
-ecosystem does this today; if one needs to in the future, it needs a
-different mechanism than `provider:request` inject_context (this
-orchestrator logs at `debug` when a non-`"user"`/`"system"` role is
-overridden, so the narrowing is observable rather than invisible).
-
-**"Before", not "immediately before".** In persist mode, the change-gate
+**"Before", not "immediately before".** On the legacy persist route, the change-gate
 suppresses re-persisting an unchanged reminder block. On a turn where
 nothing changed, canonical history looks like
 `[block N] [user N] [assistant] [tool] [assistant] [user N+1]` -- the
@@ -215,7 +173,7 @@ correct and intended**, and is the same cache-prefix property
 Do not "fix" this by disabling the change-gate -- that would defeat the
 whole cache-prefix benefit this mode provides.
 
-**Change-gate comparison basis.** The change-gate always compares the RAW
+**Change-gate comparison basis.** On the legacy persist route, the change-gate always compares the RAW
 (pre-envelope) merged body against the last persisted body, never the
 enveloped string. This matters because the turn-start block uses the
 pre-user header variant and a later mid-loop block (same iteration's
@@ -225,7 +183,7 @@ falsely detect a "change" the first time a turn transitions from its
 turn-start block to a mid-loop one, forcing a spurious extra persisted
 message on every multi-iteration turn.
 
-**Mid-loop (iterations >= 2) placement is unchanged**: new content is
+**Legacy mid-loop (iterations >= 2) placement is unchanged**: new content is
 still written at the tail (tail-variant envelope), the change-gate still
 suppresses unchanged content, and the pending-injection drain (from
 `tool:post` / a stashed `prompt:submit` result with

@@ -8,14 +8,22 @@ surface.  It neither imports context-simple nor keeps state beyond one
 from __future__ import annotations
 
 import copy
+import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
-
+from typing import Any
 
 _CAPABILITY = "context.instructions.v1"
 _EXECUTION_INPUT_CAPABILITY = "execution.input.v1"
-_REQUIRED_ASSEMBLY_METHODS = ("input_scope", "turn", "request", "accept_response")
+_REQUIRED_ASSEMBLY_METHODS = (
+    "input_scope",
+    "turn",
+    "request",
+    "accept_response",
+    "register",
+)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,7 @@ class InstructionRequest:
     manager: Any
     request_id: str
     on_response_accepted: Callable[[], None] | None = None
+    on_close: Callable[[str], None] | None = None
     closed: bool = False
 
     async def accept_response(self, response_message: dict[str, Any]) -> None:
@@ -91,7 +100,7 @@ class InstructionRequest:
         try:
             try:
                 await self.assembly.accept_response(self.request_id, response_message)
-            except Exception:
+            except Exception:  # noqa: BLE001 - public capability has no shared exception type.
                 await self.assembly.accept_response(self.request_id, response_message)
             if self.on_response_accepted is not None:
                 self.on_response_accepted()
@@ -105,7 +114,11 @@ class InstructionRequest:
     async def close(self) -> None:
         if not self.closed:
             self.closed = True
-            await self.manager.__aexit__(None, None, None)
+            try:
+                await self.manager.__aexit__(None, None, None)
+            finally:
+                if self.on_close is not None:
+                    self.on_close(self.request_id)
 
 
 @dataclass
@@ -119,6 +132,11 @@ class InstructionBinding:
     input_anchor: dict[str, str] | None = None
     completed_batches: list[dict[str, Any]] = field(default_factory=list)
     tail_anchor: dict[str, Any] | None = None
+    staging_lease: Any | None = None
+    staged_requests: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    pending_staged: list[dict[str, Any]] = field(default_factory=list)
+    _staging_index: int = 0
+    _assistant_role_warning_emitted: bool = False
 
     @classmethod
     def context_supported(cls, coordinator: Any, context: Any) -> Any | None:
@@ -147,36 +165,53 @@ class InstructionBinding:
     ) -> InstructionBinding | None:
         """Return a binding only when every optional v1 boundary is usable.
 
-        The capability is intentionally structural: old coordinators, contexts,
-        and providers remain on their unchanged path.  Required filter readiness
-        is checked by the context while preparing its v1 view; failure there
-        fails that request rather than silently lowering it to legacy.
+        Activation requires the authority extension on both the context
+        assembly and selected provider. Old coordinators, contexts, and
+        providers remain on their unchanged path. Required filter readiness is
+        checked by the context while preparing its v1 view; failure there fails
+        that request rather than silently lowering it to legacy.
         """
         assembly = cls.context_supported(coordinator, context)
         if assembly is None:
             return None
-        if getattr(selected_provider, "instruction_layout_version", None) != 1:
+        if getattr(assembly, "instruction_layout_authority_v1", None) is not True:
             return None
-        return cls(
+        if (
+            getattr(selected_provider, "instruction_layout_version", None) != 1
+            or getattr(selected_provider, "instruction_layout_authority_v1", None) is not True
+        ):
+            return None
+        binding = cls(
             assembly=assembly,
             selected_provider=selected_provider,
             execution_input=execution_input,
             input_anchor=execution_input.anchor(),
         )
+        binding.staging_lease = assembly.register(
+            f"loop-streaming:{binding.turn_id}",
+            binding._snapshot_staged_instructions,
+        )
+        return binding
 
     def ensure_selected_provider(self, provider: Any) -> None:
         """Reject a provider switch that cannot lower the active v1 route."""
-        if getattr(provider, "instruction_layout_version", None) != 1:
+        if (
+            getattr(provider, "instruction_layout_version", None) != 1
+            or getattr(provider, "instruction_layout_authority_v1", None) is not True
+        ):
             raise RuntimeError(
                 "the selected provider changed after v1 activation but does not declare "
-                "instruction_layout_version == 1; refusing to silently lower v1 "
-                "instructions to the legacy path"
+                "instruction_layout_version == 1 and instruction_layout_authority_v1 "
+                "is True; refusing to silently lower v1 instructions to the legacy path"
             )
         self.selected_provider = provider
 
     @staticmethod
-    async def has_marked_history(context: Any) -> bool:
-        """Whether public history contains fixed v1 records unsafe for legacy."""
+    async def has_marked_fixed_state(context: Any, assembly: Any | None = None) -> bool:
+        """Whether retained or pending fixed v1 state is unsafe for legacy."""
+        pending_state = getattr(assembly, "has_marked_fixed_state", None)
+        if callable(pending_state) and pending_state():
+            return True
         get_messages = getattr(context, "get_messages", None)
         if not callable(get_messages):
             return False
@@ -217,6 +252,84 @@ class InstructionBinding:
         response["metadata"] = metadata
         return response
 
+    def stage_legacy_injection(
+        self,
+        *,
+        content: str,
+        role: Any,
+        request: InstructionRequest | None = None,
+    ) -> None:
+        """Stage one legacy ephemeral injection for exactly one v1 request.
+
+        Canonical instruction records remain system-role.  The legacy carrier
+        role is retained as explicit authority: system remains authoritative;
+        user and assistant are advisory.  Assistant carriers were never a
+        supported instruction surface, so retain them as advisory while making
+        the migration visible once per execution.
+        """
+        if role == "system":
+            authority = "authoritative"
+        elif role == "user":
+            authority = "advisory"
+        elif role == "assistant":
+            authority = "advisory"
+            if not self._assistant_role_warning_emitted:
+                self._assistant_role_warning_emitted = True
+                logger.warning(
+                    "Legacy ephemeral assistant-role context injection is staged as "
+                    "an advisory v1 instruction; migrate the producer to an "
+                    "explicit instruction source."
+                )
+        else:
+            raise RuntimeError(
+                "legacy context_injection_role must be 'system', 'user', or 'assistant'"
+            )
+
+        self._staging_index += 1
+        entry = {
+            "key": f"legacy-{self._staging_index}",
+            "content": content,
+            "placement": "tail",
+            "authority": authority,
+        }
+        if request is None:
+            self.pending_staged.append(entry)
+        else:
+            self.staged_requests.setdefault(request.request_id, []).append(entry)
+
+    def stage_advisory_reminder(
+        self, content: str, *, request: InstructionRequest | None = None
+    ) -> None:
+        """Stage one orchestrator-authored advisory tail reminder."""
+        self.stage_legacy_injection(content=content, role="user", request=request)
+
+    def _snapshot_staged_instructions(self, scope: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return a detached request-local source snapshot."""
+        request_id = scope.get("request_id")
+        if not isinstance(request_id, str):
+            return []
+        staged = copy.deepcopy(self.staged_requests.get(request_id, []))
+        tail_anchor = scope.get("tail_anchor")
+        after_message_id = (
+            tail_anchor.get("after_message_id") if isinstance(tail_anchor, dict) else None
+        )
+        if not isinstance(after_message_id, str) or not after_message_id:
+            raise RuntimeError("staged legacy instruction has no validated tail anchor")
+        for entry in staged:
+            entry["after"] = {"after_message_id": after_message_id}
+        return staged
+
+    def _clear_staged_request(self, request_id: str) -> None:
+        self.staged_requests.pop(request_id, None)
+
+    def close(self) -> None:
+        """Discard unsent request staging and unregister the local source."""
+        self.pending_staged.clear()
+        self.staged_requests.clear()
+        if self.staging_lease is not None:
+            self.staging_lease.close()
+            self.staging_lease = None
+
     def tool_message(
         self, *, name: str, tool_call_id: str, content: str
     ) -> tuple[dict[str, Any], str]:
@@ -237,21 +350,27 @@ class InstructionBinding:
         """Open one request before its ordinary request hooks are emitted."""
         request_id = self.new_message_id()
         completed_batches = copy.deepcopy(self.completed_batches)
+        tail_anchor = copy.deepcopy(self.tail_anchor)
+        if tail_anchor is None and self.input_anchor is not None:
+            tail_anchor = {"after_message_id": self.input_anchor["message_id"]}
         request_scope = {
             "turn_id": self.turn_id,
             "request_id": request_id,
             "llm_step_id": self.new_message_id(),
             "input_anchor": copy.deepcopy(self.input_anchor),
             "completed_batches": completed_batches,
-            "tail_anchor": copy.deepcopy(self.tail_anchor),
+            "tail_anchor": tail_anchor,
         }
         manager = self.assembly.request(request_scope, provider)
         await manager.__aenter__()
+        self.staged_requests[request_id] = self.pending_staged
+        self.pending_staged = []
         return InstructionRequest(
             self.assembly,
             manager,
             request_id,
             on_response_accepted=self.completed_batches.clear if completed_batches else None,
+            on_close=self._clear_staged_request,
         )
 
     async def prepare_request(

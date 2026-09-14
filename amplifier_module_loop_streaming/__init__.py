@@ -1298,19 +1298,37 @@ class StreamingOrchestrator:
             )
         return total
 
-    async def _drain_legacy_injections_into_v1_context(self, context) -> None:
-        """Retain unmigrated hook output without making it a v1 descriptor."""
-        pending = self._pending_ephemeral_injections
-        self._pending_ephemeral_injections = []
-        content = [entry["content"] for entry in pending if entry.get("content")]
-        if content:
-            await context.add_message(
-                {
-                    "role": "system",
-                    "content": _wrap_reminders("\n\n".join(content), tail=True),
-                    "metadata": {"ephemeral": True, "legacy_injection": True},
-                }
+    def _queue_ephemeral_injection(
+        self,
+        result: HookResult,
+        instruction_binding: InstructionBinding | None,
+        *,
+        request: InstructionRequest | None = None,
+    ) -> None:
+        """Route one ephemeral hook result without changing its declared role."""
+        if not (
+            result.action == "inject_context"
+            and result.ephemeral
+            and result.context_injection
+        ):
+            return
+        if instruction_binding is not None:
+            # A v1 record stays a request-only tail instruction even when the
+            # legacy producer requested append_to_last_tool_result.  Mutating
+            # a canonical tool result would persist transient hook text.
+            instruction_binding.stage_legacy_injection(
+                content=_wrap_reminders(result.context_injection, tail=True),
+                role=result.context_injection_role,
+                request=request,
             )
+            return
+        self._pending_ephemeral_injections.append(
+            {
+                "role": result.context_injection_role,
+                "content": result.context_injection,
+                "append_to_last_tool_result": result.append_to_last_tool_result,
+            }
+        )
 
     async def execute(
         self,
@@ -1325,7 +1343,9 @@ class StreamingOrchestrator:
         execution_input = ExecutionInput.consume(coordinator)
         assembly = InstructionBinding.context_supported(coordinator, context)
         if execution_input is None:
-            if assembly is not None and await InstructionBinding.has_marked_history(context):
+            if assembly is not None and await InstructionBinding.has_marked_fixed_state(
+                context, assembly
+            ):
                 raise RuntimeError(
                     "context contains v1 instruction records, but execution.input.v1 is "
                     "absent; refusing to silently lower marked instructions to the "
@@ -1345,20 +1365,24 @@ class StreamingOrchestrator:
         if binding is None:
             if (
                 selected_provider is not None
-                and await InstructionBinding.has_marked_history(context)
+                and await InstructionBinding.has_marked_fixed_state(context, assembly)
             ):
                 raise RuntimeError(
                     "context contains v1 instruction records, but the selected provider "
-                    "does not declare instruction_layout_version == 1; refusing to "
-                    "silently lower marked instructions to the legacy path"
+                    "does not declare instruction_layout_version == 1 and "
+                    "instruction_layout_authority_v1 is True; refusing to silently "
+                    "lower marked instructions to the legacy path"
                 )
             return await self._execute_outer(
                 prompt, context, providers, tools, hooks, coordinator, instruction_binding=None
             )
-        async with binding.assembly.turn(binding.turn_id, binding.input_anchor):
-            return await self._execute_outer(
-                prompt, context, providers, tools, hooks, coordinator, instruction_binding=binding
-            )
+        try:
+            async with binding.assembly.turn(binding.turn_id, binding.input_anchor):
+                return await self._execute_outer(
+                    prompt, context, providers, tools, hooks, coordinator, instruction_binding=binding
+                )
+        finally:
+            binding.close()
 
     async def _execute_outer(
         self,
@@ -3286,13 +3310,7 @@ class StreamingOrchestrator:
             and prompt_submit_result.ephemeral
             and prompt_submit_result.context_injection
         ):
-            self._pending_ephemeral_injections.append(
-                {
-                    "role": prompt_submit_result.context_injection_role,
-                    "content": prompt_submit_result.context_injection,
-                    "append_to_last_tool_result": prompt_submit_result.append_to_last_tool_result,
-                }
-            )
+            self._queue_ephemeral_injection(prompt_submit_result, instruction_binding)
             logger.debug(
                 "Stored ephemeral injection from prompt:submit for first iteration"
             )
@@ -3526,9 +3544,6 @@ class StreamingOrchestrator:
             # "before the first LLM call"; at iteration N>1 this is "after the prior tool
             # round, before the next provider call" — the single natural boundary.
             await self._drain_steering(context, hooks, iteration, instruction_binding)
-            if instruction_binding is not None:
-                await self._drain_legacy_injections_into_v1_context(context)
-
             # Layer 1 call-budget warning (spec: 298-replacement). One-shot per
             # turn: once iteration reaches budget_warn_ratio (default 80%) of
             # max_iterations, nudge the agent to start converging while it
@@ -3566,19 +3581,22 @@ class StreamingOrchestrator:
                 # for the rest of the turn. metadata.persisted=True keeps it
                 # correctly treated as stable, frozen history (it is a
                 # genuine context.add_message, not regenerated per request).
+                budget_reminder = (
+                    '<system-reminder source="orchestrator-loop-limit">\n'
+                    f"You have used {iteration} of {self.max_iterations} LLM "
+                    f"calls for this turn. About {remaining} remain.\n\n"
+                    "Start converging now. Finish the highest-value thread "
+                    "you have open, then summarise what you found and what "
+                    "remains. Do not start new exploration branches.\n\n"
+                    "Do not mention this budget to the user.\n"
+                    "</system-reminder>"
+                )
                 if instruction_binding is None:
                     await context.add_message(
                         {
                             "role": "user",
                             "content": _wrap_reminders(
-                                '<system-reminder source="orchestrator-loop-limit">\n'
-                                f"You have used {iteration} of {self.max_iterations} LLM "
-                                f"calls for this turn. About {remaining} remain.\n\n"
-                                "Start converging now. Finish the highest-value thread "
-                                "you have open, then summarise what you found and what "
-                                "remains. Do not start new exploration branches.\n\n"
-                                "Do not mention this budget to the user.\n"
-                                "</system-reminder>",
+                                budget_reminder,
                                 tail=True,
                                 header=not self._turn_header_persisted,
                             ),
@@ -3590,6 +3608,10 @@ class StreamingOrchestrator:
                         }
                     )
                     self._turn_header_persisted = True
+                else:
+                    instruction_binding.stage_advisory_reminder(
+                        _wrap_reminders(budget_reminder, tail=True)
+                    )
 
             instruction_request: InstructionRequest | None = None
             if instruction_binding is not None:
@@ -3618,19 +3640,10 @@ class StreamingOrchestrator:
                             await instruction_request.abandon()
                         yield (f"Operation denied: {result.reason}", iteration)
                         return
-            if (
-                instruction_request is not None
-                and result.action == "inject_context"
-                and result.ephemeral
-                and result.context_injection
-            ):
-                self._pending_ephemeral_injections.append(
-                    {
-                        "content": result.context_injection,
-                        "append_to_last_tool_result": result.append_to_last_tool_result,
-                    }
+            if instruction_request is not None:
+                self._queue_ephemeral_injection(
+                    result, instruction_binding, request=instruction_request
                 )
-                await self._drain_legacy_injections_into_v1_context(context)
 
             # Get messages for LLM request (context handles compaction internally)
             # Pass provider for dynamic budget calculation based on model's context window
@@ -4305,7 +4318,12 @@ class StreamingOrchestrator:
                 tool_tasks = [
                     asyncio.ensure_future(
                         self._execute_tool_only(
-                            tc, tools, hooks, parallel_group_id, coordinator
+                            tc,
+                            tools,
+                            hooks,
+                            parallel_group_id,
+                            coordinator,
+                            instruction_binding=instruction_binding,
                         )
                     )
                     for tc in tool_calls
@@ -4515,7 +4533,6 @@ class StreamingOrchestrator:
                 # Steering is a genuine input boundary and must be bound
                 # before this final request scope snapshots it.
                 await self._drain_steering(context, hooks, iteration, instruction_binding)
-                await self._drain_legacy_injections_into_v1_context(context)
                 final_instruction_request = await instruction_binding.begin_request(provider)
 
             # Inject system reminder to agent before returning
@@ -4546,19 +4563,12 @@ class StreamingOrchestrator:
                     await close_finalization_tool_turn(denial_text)
                     yield (denial_text, iteration)
                     return
-            if (
-                final_instruction_request is not None
-                and finalization_result.action == "inject_context"
-                and finalization_result.ephemeral
-                and finalization_result.context_injection
-            ):
-                self._pending_ephemeral_injections.append(
-                    {
-                        "content": finalization_result.context_injection,
-                        "append_to_last_tool_result": finalization_result.append_to_last_tool_result,
-                    }
+            if final_instruction_request is not None:
+                self._queue_ephemeral_injection(
+                    finalization_result,
+                    instruction_binding,
+                    request=final_instruction_request,
                 )
-                await self._drain_legacy_injections_into_v1_context(context)
 
             if coordinator and coordinator.cancellation.is_cancelled:
                 if final_instruction_request is not None:
@@ -4573,6 +4583,18 @@ class StreamingOrchestrator:
             # allowed provider call, not discarded at the next turn boundary.
             if instruction_binding is None:
                 await self._drain_steering(context, hooks, iteration)
+            else:
+                instruction_binding.stage_advisory_reminder(
+                    _wrap_reminders(
+                        """<system-reminder source="orchestrator-loop-limit">
+You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
+
+DO NOT mention this iteration limit or reminder to the user explicitly. Simply wrap up naturally.
+</system-reminder>""",
+                        tail=True,
+                    ),
+                    request=final_instruction_request,
+                )
 
             # Get one final response with the reminder (via _execute_stream helper)
             if final_instruction_request is None:
@@ -4617,7 +4639,6 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         },
                     }
                 )
-
             try:
                 # Convert dicts to ChatRequest
                 messages_objects = [Message(**msg) for msg in message_dicts]
@@ -4968,6 +4989,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         hooks: HookRegistry,
         parallel_group_id: str,
         coordinator: ModuleCoordinator | None = None,
+        *,
+        instruction_binding: InstructionBinding | None = None,
     ) -> tuple[str, str, str]:
         """Execute a single tool in parallel without adding to context.
 
@@ -5016,13 +5039,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 and pre_result.ephemeral
                 and pre_result.context_injection
             ):
-                self._pending_ephemeral_injections.append(
-                    {
-                        "role": pre_result.context_injection_role,
-                        "content": pre_result.context_injection,
-                        "append_to_last_tool_result": pre_result.append_to_last_tool_result,
-                    }
-                )
+                self._queue_ephemeral_injection(pre_result, instruction_binding)
                 logger.debug(
                     "Stored ephemeral injection from tool:pre (%s) for next iteration",
                     tool_call.name,
@@ -5120,13 +5137,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 and post_result.ephemeral
                 and post_result.context_injection
             ):
-                self._pending_ephemeral_injections.append(
-                    {
-                        "role": post_result.context_injection_role,
-                        "content": post_result.context_injection,
-                        "append_to_last_tool_result": post_result.append_to_last_tool_result,
-                    }
-                )
+                self._queue_ephemeral_injection(post_result, instruction_binding)
                 logger.debug(
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
@@ -5173,6 +5184,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         context,
         hooks: HookRegistry,
         coordinator: ModuleCoordinator | None = None,
+        *,
+        instruction_binding: InstructionBinding | None = None,
     ) -> dict:
         """Execute a single tool call and return result info.
 
@@ -5212,13 +5225,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 and pre_result.ephemeral
                 and pre_result.context_injection
             ):
-                self._pending_ephemeral_injections.append(
-                    {
-                        "role": pre_result.context_injection_role,
-                        "content": pre_result.context_injection,
-                        "append_to_last_tool_result": pre_result.append_to_last_tool_result,
-                    }
-                )
+                self._queue_ephemeral_injection(pre_result, instruction_binding)
                 logger.debug(
                     "Stored ephemeral injection from tool:pre (%s) for next iteration",
                     tool_call.name,
@@ -5293,13 +5300,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 and post_result.ephemeral
                 and post_result.context_injection
             ):
-                self._pending_ephemeral_injections.append(
-                    {
-                        "role": post_result.context_injection_role,
-                        "content": post_result.context_injection,
-                        "append_to_last_tool_result": post_result.append_to_last_tool_result,
-                    }
-                )
+                self._queue_ephemeral_injection(post_result, instruction_binding)
                 logger.debug(
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
