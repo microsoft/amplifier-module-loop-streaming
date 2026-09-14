@@ -4344,6 +4344,18 @@ class StreamingOrchestrator:
                     verify_admitted=True,
                 )
                 final_retained_contents.append(content)
+            if retaining_getter is not None and self._pending_ephemeral_injections:
+                pending_body = "\n\n".join(
+                    injection["content"]
+                    for injection in self._pending_ephemeral_injections
+                    if injection.get("content")
+                )
+                if pending_body:
+                    content, _ = await self._persist_reminder(
+                        context, pending_body, tail=True, verify_admitted=True
+                    )
+                    final_retained_contents.append(content)
+                self._pending_ephemeral_injections.clear()
             message_dicts = list(await request_messages(final_retained_contents))
             # The finalization hook and context assembly both await. Check
             # again before contacting the provider so a concurrent
