@@ -40,21 +40,29 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 
 When a provider exposes the optional synchronous `request_budget` capability,
 the loop checks the fully assembled request before dispatch. An oversized
-request gets exactly one smaller, retention-aware context view; required
+request gets up to two smaller, retention-aware context views; required
 reminders and request-only injections are replayed without running hooks or
 draining pending state again. If that view still cannot fit, the loop raises
 locally and makes no SDK request. Providers without the capability retain the
 existing request and dispatch behavior.
 
 When `context.request_retention` advertises its optional `hard_fit` keyword,
-that one provider-forced rebuild forwards `hard_fit=True`, allowing the context
-to target the provider's requested budget directly. Older retention
+each provider-forced rebuild forwards `hard_fit=True`, allowing the context to
+target the provider's requested budget directly. The second rebuild runs only
+when the provider requests a strictly smaller budget. Older retention
 capabilities, uninspectable dynamic callables, and the generic context fallback
 keep their existing `provider`/`retain_contents`/`token_budget` assembly; the
-second preflight and provider's final payload guard remain the safety boundary.
+final preflight and provider's final payload guard remain the safety boundary.
 The existing `orchestrator:provider_budget` event exposes each preflight's
 attempt, result, estimate, allowance, and requested context budget to mounted
 observability consumers.
+
+When a provider reports its effective output cap, an oversized compacted view
+is also preflighted with progressively smaller response reserves: 50%, 40%,
+30%, 20%, and 10% of the original cap, then 1,000 tokens. These are local
+preflights: they do not resend a provider request or omit input. At caps below
+10,000 tokens, a view-only system reminder asks the model to tell the user that
+the session is degraded and to recommend a new session for substantial work.
 
 ## Configuration
 

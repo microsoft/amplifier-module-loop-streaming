@@ -30,6 +30,15 @@ def _decision(estimated: int, limit: int, target: int) -> dict[str, int]:
     }
 
 
+def _output_decision(
+    estimated: int, limit: int, target: int, output_cap: int
+) -> dict[str, int]:
+    return {
+        **_decision(estimated, limit, target),
+        "max_output_tokens": output_cap,
+    }
+
+
 class BudgetProvider(RequestCapturingProvider):
     def __init__(self, decisions: list[dict[str, int]]) -> None:
         super().__init__()
@@ -472,11 +481,107 @@ async def test_irreducible_budget_makes_no_sdk_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_second_oversize_after_one_rebuild_makes_no_sdk_call() -> None:
+async def test_second_oversize_rebuilds_again_and_dispatches_once() -> None:
     context = BudgetContext()
-    provider = BudgetProvider([_decision(100, 10, 7), _decision(50, 10, 1)])
+    provider = BudgetProvider(
+        [_decision(100, 10, 7), _decision(50, 10, 1), _decision(9, 10, 0)]
+    )
 
-    with pytest.raises(ContextLengthError, match="remains over budget"):
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.budget_calls) == 3
+    assert [budget for _, budget in context.request_calls] == [None, 7, 1]
+    assert context.request_calls[0][0] == context.request_calls[1][0] == context.request_calls[2][0]
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_output_cap_ladder_preserves_input_and_warns_model_at_one_thousand() -> None:
+    context = BudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider(
+        [
+            _output_decision(100, 10, 7, 128_000),
+            _output_decision(50, 10, 0, 128_000),
+            _output_decision(50, 10, 1, 64_000),
+            _output_decision(50, 10, 1, 51_200),
+            _output_decision(50, 10, 1, 38_400),
+            _output_decision(50, 10, 1, 25_600),
+            _output_decision(50, 10, 1, 12_800),
+            _output_decision(9, 10, 0, 1_000),
+        ]
+    )
+    body = "<system-reminder>REQUIRED</system-reminder>"
+    hooks = ScriptedHooks({"provider:request": _injection(body)})
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        hooks,
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    request = provider.requests[0]
+    assert request.max_output_tokens == 1_000
+    request_bodies = "\n".join(message.content for message in request.messages)
+    assert body in request_bodies
+    assert "history" not in request_bodies
+    assert "orchestrator-context-degraded" in request_bodies
+    assert "recommend starting a new session" in request_bodies
+    assert [request.max_output_tokens for request, _ in provider.budget_calls] == [
+        None,
+        None,
+        64_000,
+        51_200,
+        38_400,
+        25_600,
+        12_800,
+        1_000,
+    ]
+    assert [name for name, _ in hooks.emitted].count("provider:request") == 1
+    assert [name for name, _ in hooks.emitted].count(
+        "orchestrator:context_degradation"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_third_oversize_after_two_rebuilds_makes_no_sdk_call() -> None:
+    context = BudgetContext()
+    provider = BudgetProvider(
+        [_decision(100, 10, 7), _decision(50, 10, 1), _decision(20, 10, 1)]
+    )
+
+    with pytest.raises(ContextLengthError, match="after two context rebuilds"):
+        await StreamingOrchestrator({}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {},
+            ScriptedHooks({}),
+            _retaining_coordinator(context),
+        )
+
+    assert len(provider.budget_calls) == 3
+    assert [budget for _, budget in context.request_calls] == [None, 7, 1]
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_non_decreasing_second_budget_makes_no_extra_rebuild_or_sdk_call() -> None:
+    context = BudgetContext()
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(50, 10, 7)])
+
+    with pytest.raises(ContextLengthError, match="would not reduce"):
         await StreamingOrchestrator({}).execute(
             "work",
             context,
@@ -488,7 +593,6 @@ async def test_second_oversize_after_one_rebuild_makes_no_sdk_call() -> None:
 
     assert len(provider.budget_calls) == 2
     assert [budget for _, budget in context.request_calls] == [None, 7]
-    assert context.request_calls[0][0] == context.request_calls[1][0]
     assert provider.requests == []
 
 
@@ -525,7 +629,9 @@ async def test_malformed_budget_result_fails_before_dispatch(decision) -> None:
 async def test_budget_replay_keeps_tail_overlay_once_without_rerunning_hooks() -> None:
     context = BudgetContext()
     context._messages.append({"role": "assistant", "content": "history" * 200})
-    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+    provider = BudgetProvider(
+        [_decision(100, 10, 7), _decision(50, 10, 1), _decision(9, 10, 0)]
+    )
     body = "<system-reminder>ONCE</system-reminder>"
     hooks = ScriptedHooks({"provider:request": _injection(body)})
 
@@ -545,7 +651,7 @@ async def test_budget_replay_keeps_tail_overlay_once_without_rerunning_hooks() -
     provider_requests = [name for name, _ in hooks.emitted if name == "provider:request"]
     assert provider_requests == ["provider:request"]
     assert context.legacy_calls == []
-    assert [budget for _, budget in context.request_calls] == [None, 7]
+    assert [budget for _, budget in context.request_calls] == [None, 7, 1]
 
 
 @pytest.mark.asyncio
@@ -685,6 +791,70 @@ async def test_forced_finalization_rebuild_forwards_hard_fit_only_at_rebuild() -
     assert context.hard_fit_calls == [False, False, True]
 
 
+@pytest.mark.asyncio
+async def test_finalization_rebuilds_again_before_its_single_sdk_dispatch() -> None:
+    context = HardFitBudgetContext()
+    provider = FinalizingBudgetProvider(
+        [
+            _decision(1, 10, 0),
+            _decision(100, 10, 7),
+            _decision(50, 10, 1),
+            _decision(1, 10, 0),
+        ]
+    )
+
+    await StreamingOrchestrator({"max_iterations": 1}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {"mock_tool": OneShotTool()},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 2
+    assert len(provider.budget_calls) == 4
+    assert context.hard_fit_calls == [False, False, True, True]
+    assert provider.requests[-1].tool_choice == "none"
+
+
+@pytest.mark.asyncio
+async def test_finalization_uses_output_cap_ladder_before_another_context_rebuild() -> None:
+    context = HardFitBudgetContext()
+    provider = FinalizingBudgetProvider(
+        [
+            _output_decision(1, 10, 0, 128_000),
+            _output_decision(100, 10, 7, 128_000),
+            _output_decision(50, 10, 0, 128_000),
+            _output_decision(50, 10, 0, 64_000),
+            _output_decision(50, 10, 0, 51_200),
+            _output_decision(50, 10, 0, 38_400),
+            _output_decision(50, 10, 0, 25_600),
+            _output_decision(50, 10, 0, 12_800),
+            _output_decision(9, 10, 0, 1_000),
+        ]
+    )
+
+    await StreamingOrchestrator({"max_iterations": 1}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {"mock_tool": OneShotTool()},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 2
+    assert len(provider.budget_calls) == 9
+    assert context.hard_fit_calls == [False, False, True]
+    final_request = provider.requests[-1]
+    assert final_request.tool_choice == "none"
+    assert final_request.max_output_tokens == 1_000
+    assert "orchestrator-context-degraded" in "\n".join(
+        message.content for message in final_request.messages
+    )
+
+
 class AnthropicStyleAssemblyProvider(RequestCapturingProvider):
     """Non-budget control: preserve ordinary assembled requests for other providers."""
 
@@ -769,13 +939,60 @@ async def test_finalization_irreducible_budget_skips_its_sdk_dispatch() -> None:
 
     assert len(provider.requests) == 1
     assert len(provider.budget_calls) == 2
+    messages = await context.get_messages()
+    assert messages[-2]["role"] == "tool"
+    assert messages[-1] == {
+        "role": "assistant",
+        "content": "The final response could not be generated because the context is too long.",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_target", [0, 1])
+async def test_finalization_rejection_after_two_rebuilds_closes_tool_turn(
+    final_target: int,
+) -> None:
+    context = HardFitBudgetContext()
+    provider = FinalizingBudgetProvider(
+        [
+            _decision(1, 10, 0),
+            _decision(100, 10, 7),
+            _decision(50, 10, 1),
+            _decision(20, 10, final_target),
+        ]
+    )
+
+    with pytest.raises(ContextLengthError):
+        await StreamingOrchestrator({"max_iterations": 1}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {"mock_tool": OneShotTool()},
+            ScriptedHooks({}),
+            _retaining_coordinator(context),
+        )
+
+    assert len(provider.requests) == 1
+    assert len(provider.budget_calls) == 4
+    assert context.hard_fit_calls == [False, False, True, True]
+    messages = await context.get_messages()
+    assert messages[-2]["role"] == "tool"
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == (
+        "The final response could not be generated because the context is too long."
+    )
 
 
 @pytest.mark.asyncio
 async def test_finalization_replays_current_and_pending_tail_overlays_once() -> None:
     context = BudgetContext()
     provider = FinalizingBudgetProvider(
-        [_decision(1, 10, 0), _decision(100, 10, 7), _decision(1, 10, 0)]
+        [
+            _decision(1, 10, 0),
+            _decision(100, 10, 7),
+            _decision(50, 10, 1),
+            _decision(1, 10, 0),
+        ]
     )
     direct = ScriptedHookResult(
         action="inject_context",

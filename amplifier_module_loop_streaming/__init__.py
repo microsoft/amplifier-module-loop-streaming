@@ -3462,7 +3462,10 @@ class StreamingOrchestrator:
         )
 
         def build_chat_request(
-            message_dicts: list[dict[str, Any]], *, tool_choice: str | None = None
+            message_dicts: list[dict[str, Any]],
+            *,
+            tool_choice: str | None = None,
+            max_output_tokens: int | None = None,
         ) -> ChatRequest:
             tools_list = [_build_tool_spec(tool) for tool in tools.values()] if tools else None
             kwargs: dict[str, Any] = {
@@ -3472,6 +3475,8 @@ class StreamingOrchestrator:
             }
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
+            if max_output_tokens is not None:
+                kwargs["max_output_tokens"] = max_output_tokens
             return ChatRequest(
                 **kwargs
             )
@@ -3481,11 +3486,11 @@ class StreamingOrchestrator:
             base_messages: list[dict[str, Any]],
             *,
             attempt: int,
-        ) -> int | None:
-            """Return one requested smaller context budget, or ``None`` when it fits."""
+        ) -> tuple[int | None, int | None]:
+            """Return a smaller context budget and effective output cap when available."""
             request_budget = getattr(provider, "request_budget", None)
             if not budget_capable or not callable(request_budget):
-                return None
+                return None, None
             context_estimate = sum(len(str(message)) // 4 for message in base_messages)
             decision = request_budget(request, context_estimate=context_estimate)
             required = (
@@ -3506,6 +3511,15 @@ class StreamingOrchestrator:
             estimated = decision["estimated_input_tokens"]
             allowance = decision["input_limit_tokens"]
             target = decision["context_token_budget"]
+            output_cap = decision.get("max_output_tokens")
+            if output_cap is not None and (
+                isinstance(output_cap, bool)
+                or not isinstance(output_cap, int)
+                or output_cap <= 0
+            ):
+                raise ContextLengthError(
+                    "Provider request_budget returned an invalid max_output_tokens"
+                )
             fits = estimated <= allowance
             await hooks.emit(
                 "orchestrator:provider_budget",
@@ -3519,12 +3533,70 @@ class StreamingOrchestrator:
                 },
             )
             if fits:
-                return None
-            if target <= 0:
-                raise ContextLengthError(
-                    "Provider request exceeds its input budget and cannot retain a smaller context"
+                return None, output_cap
+            return target, output_cap
+
+        def output_cap_candidates(original: int | None) -> list[int]:
+            """Return the bounded lossless output-reserve ladder."""
+            if original is None or original <= 1_000:
+                return []
+            candidates: list[int] = []
+            for fraction in (0.50, 0.40, 0.30, 0.20, 0.10):
+                cap = max(1_000, int(original * fraction))
+                if cap < original and (not candidates or cap < candidates[-1]):
+                    candidates.append(cap)
+            if candidates[-1:] != [1_000]:
+                candidates.append(1_000)
+            return candidates
+
+        def degraded_output_warning(cap: int) -> list[dict[str, Any]]:
+            """Add a view-only warning only at the severe output-cap tier."""
+            if cap >= 10_000:
+                return []
+            return [
+                {
+                    "role": "system",
+                    "content": (
+                        "<system-reminder source=\"orchestrator-context-degraded\">\n"
+                        "This request is running with a severely reduced response budget "
+                        "because the conversation is near the provider context limit. "
+                        "Give the user a concise answer, explain that the session is in "
+                        "a degraded state, and recommend starting a new session for "
+                        "substantial further work.\n"
+                        "</system-reminder>"
+                    ),
+                    "metadata": {"ephemeral": True},
+                }
+            ]
+
+        async def try_reduced_output(
+            message_dicts: list[dict[str, Any]],
+            base_messages: list[dict[str, Any]],
+            *,
+            original_output_cap: int | None,
+            tool_choice: str | None = None,
+        ) -> ChatRequest | None:
+            """Preflight unchanged input at bounded lower output reserves."""
+            for cap in output_cap_candidates(original_output_cap):
+                candidate_request = build_chat_request(
+                    message_dicts + degraded_output_warning(cap),
+                    tool_choice=tool_choice,
+                    max_output_tokens=cap,
                 )
-            return target
+                smaller_budget, _ = await check_request_budget(
+                    candidate_request, base_messages, attempt=1
+                )
+                if smaller_budget is None:
+                    if cap < 10_000:
+                        await hooks.emit(
+                            "orchestrator:context_degradation",
+                            {
+                                "mode": "reduced_output",
+                                "max_output_tokens": cap,
+                            },
+                        )
+                    return candidate_request
+            return None
 
         # --- Turn-start reminder assembly (reminder-redesign-spec.md,
         # W1.2, Option D). Hoists iteration 1's provider:request emit to
@@ -4038,10 +4110,14 @@ class StreamingOrchestrator:
                     f"[ORCHESTRATOR] Tool names: {[t.name for t in tools.values()]}"
                 )
 
-            smaller_context_budget = await check_request_budget(
+            smaller_context_budget, original_output_cap = await check_request_budget(
                 chat_request, base_message_dicts, attempt=0
             )
             if smaller_context_budget is not None:
+                if smaller_context_budget <= 0:
+                    raise ContextLengthError(
+                        "Provider request exceeds its input budget and cannot retain a smaller context"
+                    )
                 rebuilt_base_messages = list(
                     await request_messages(
                         retained_contents,
@@ -4060,15 +4136,57 @@ class StreamingOrchestrator:
                     else rebuilt_base_messages
                 )
                 rebuilt_request = build_chat_request(rebuilt_messages)
-                if (
-                    await check_request_budget(
-                        rebuilt_request, rebuilt_base_messages, attempt=1
+                next_context_budget, _ = await check_request_budget(
+                    rebuilt_request, rebuilt_base_messages, attempt=1
+                )
+                if next_context_budget is not None:
+                    reduced_output_request = await try_reduced_output(
+                        rebuilt_messages,
+                        rebuilt_base_messages,
+                        original_output_cap=original_output_cap,
                     )
-                ) is not None:
-                    raise ContextLengthError(
-                        "Provider request remains over budget after one context rebuild"
-                    )
-                chat_request = rebuilt_request
+                    if reduced_output_request is not None:
+                        chat_request = reduced_output_request
+                    else:
+                        if next_context_budget <= 0:
+                            raise ContextLengthError(
+                                "Provider request exceeds its input budget and cannot retain "
+                                "a smaller context"
+                            )
+                        if next_context_budget >= smaller_context_budget:
+                            raise ContextLengthError(
+                                "Provider request remains over budget and a second "
+                                "context budget would not reduce it"
+                            )
+                        rebuilt_base_messages = list(
+                            await request_messages(
+                                retained_contents,
+                                token_budget=next_context_budget,
+                                hard_fit=True,
+                            )
+                        )
+                        rebuilt_messages = (
+                            _replay_request_overlays(
+                                rebuilt_base_messages,
+                                turn_start_view_block=replay_turn_start_block,
+                                request_injection=replay_request_injection,
+                                pending_injections=replay_pending_injections,
+                            )
+                            if self._ephemeral_injection_mode == "tail"
+                            else rebuilt_base_messages
+                        )
+                        rebuilt_request = build_chat_request(rebuilt_messages)
+                        if (
+                            await check_request_budget(
+                                rebuilt_request, rebuilt_base_messages, attempt=2
+                            )
+                        )[0] is not None:
+                            raise ContextLengthError(
+                                "Provider request remains over budget after two context rebuilds"
+                            )
+                        chat_request = rebuilt_request
+                else:
+                    chat_request = rebuilt_request
 
             # Apply rate limit delay before provider call
             await self._apply_rate_limit_delay(hooks, iteration)
@@ -4723,10 +4841,15 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 max_iter_chat_request = build_chat_request(
                     message_dicts, tool_choice="none"
                 )
-                smaller_context_budget = await check_request_budget(
+                smaller_context_budget, original_output_cap = await check_request_budget(
                     max_iter_chat_request, base_message_dicts, attempt=0
                 )
                 if smaller_context_budget is not None:
+                    if smaller_context_budget <= 0:
+                        raise ContextLengthError(
+                            "Provider request exceeds its input budget and cannot retain "
+                            "a smaller context"
+                        )
                     rebuilt_base_messages = list(
                         await request_messages(
                             final_retained_contents,
@@ -4748,16 +4871,62 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     rebuilt_request = build_chat_request(
                         rebuilt_messages, tool_choice="none"
                     )
-                    if (
-                        await check_request_budget(
-                            rebuilt_request, rebuilt_base_messages, attempt=1
+                    next_context_budget, _ = await check_request_budget(
+                        rebuilt_request, rebuilt_base_messages, attempt=1
+                    )
+                    if next_context_budget is not None:
+                        reduced_output_request = await try_reduced_output(
+                            rebuilt_messages,
+                            rebuilt_base_messages,
+                            original_output_cap=original_output_cap,
+                            tool_choice="none",
                         )
-                    ) is not None:
-                        raise ContextLengthError(
-                            "Provider finalization request remains over budget "
-                            "after one context rebuild"
-                        )
-                    max_iter_chat_request = rebuilt_request
+                        if reduced_output_request is not None:
+                            max_iter_chat_request = reduced_output_request
+                        else:
+                            if next_context_budget <= 0:
+                                raise ContextLengthError(
+                                    "Provider request exceeds its input budget and cannot retain "
+                                    "a smaller context"
+                                )
+                            if next_context_budget >= smaller_context_budget:
+                                raise ContextLengthError(
+                                    "Provider finalization request remains over budget and a "
+                                    "second context budget would not reduce it"
+                                )
+                            rebuilt_base_messages = list(
+                                await request_messages(
+                                    final_retained_contents,
+                                    token_budget=next_context_budget,
+                                    hard_fit=True,
+                                )
+                            )
+                            rebuilt_messages = (
+                                _replay_request_overlays(
+                                    rebuilt_base_messages,
+                                    turn_start_view_block=None,
+                                    request_injection=final_replay_request_injection,
+                                    pending_injections=final_replay_pending_injections,
+                                )
+                                if self._ephemeral_injection_mode == "tail"
+                                else list(rebuilt_base_messages)
+                            )
+                            rebuilt_messages.append(finalization_overlay)
+                            rebuilt_request = build_chat_request(
+                                rebuilt_messages, tool_choice="none"
+                            )
+                            if (
+                                await check_request_budget(
+                                    rebuilt_request, rebuilt_base_messages, attempt=2
+                                )
+                            )[0] is not None:
+                                raise ContextLengthError(
+                                    "Provider finalization request remains over budget "
+                                    "after two context rebuilds"
+                                )
+                            max_iter_chat_request = rebuilt_request
+                    else:
+                        max_iter_chat_request = rebuilt_request
 
                 kwargs = {}
                 if self.extended_thinking:
@@ -4840,6 +5009,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 )
                 raise
             except ContextLengthError:
+                await close_finalization_tool_turn(
+                    "The final response could not be generated because the context is too long."
+                )
                 raise
             except LLMError as e:
                 await hooks.emit(
