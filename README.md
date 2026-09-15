@@ -64,6 +64,26 @@ The existing `orchestrator:provider_budget` event exposes each preflight's
 attempt, result, estimate, allowance, and requested context budget to mounted
 observability consumers.
 
+### Provider-reported overflow recovery
+
+A provider may optionally expose synchronous `recover_context_overflow` to
+turn its own `ContextLengthError` into one smaller context target. The loop
+uses it only before a normal or finalization request has yielded an SDK chunk
+or returned a response, only when retention explicitly supports `hard_fit`,
+and only once for that outbound generation. The recovered view replays the
+already-resolved retention and request overlays without rerunning hooks or
+tools; a finalization retry keeps `tool_choice="none"`.
+
+Recovery feedback must be a strict budget dictionary: non-boolean integer
+fields, an observed input above its allowance, and a positive target smaller
+than the failed context estimate. A retry is preflighted with the same complete
+options and the same or lower wire output cap. A fitting preflight retries;
+`None` is an explicitly unproven retry authorized by the server rejection; an
+over-budget, malformed, cancelled, or second-overflow path propagates without
+another send. The generic loop neither parses provider error messages nor
+knows provider-private feedback formats. `orchestrator:provider_overflow_recovery`
+records only the scalar recovery result.
+
 When a provider reports its effective output cap, an oversized compacted view
 is also preflighted with progressively smaller response reserves: 50%, 40%,
 30%, 20%, and 10% of the original cap, then 1,000 tokens. These are local

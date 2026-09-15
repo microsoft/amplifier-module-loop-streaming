@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
 from amplifier_core import ContextLengthError, HookRegistry, HookResult, ModuleCoordinator, ToolResult
 from amplifier_core.events import (
@@ -748,6 +748,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "orchestrator:goal_progress",  # /goal auto-continue loop progress (see docs/designs/goal-command.md)
             "orchestrator:budget_warning",  # Layer 1 call budget at budget_warn_ratio (see _execute_stream)
             "orchestrator:provider_budget",  # Provider request-budget preflight result (see _execute_stream)
+            "orchestrator:provider_overflow_recovery",  # Bounded provider-authorized input-overflow retry
         ],
     )
 
@@ -3345,6 +3346,35 @@ class StreamingOrchestrator:
                 for parameter in parameters
             )
 
+        def accepts_named_request_options(method: Any) -> bool:
+            """Whether an optional provider method explicitly accepts options.
+
+            A provider with only ``**kwargs`` keeps its pre-existing call
+            shape.  As with ``hard_fit`` above, inspect separately from the
+            invocation: an implementation ``TypeError`` is never a cue to
+            retry the call without the keyword.
+            """
+            try:
+                parameter = inspect.signature(method).parameters.get("request_options")
+            except (TypeError, ValueError):
+                return False
+            return parameter is not None and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+
+        def get_context_overflow_recovery() -> Any | None:
+            """Return the provider recovery method when this request can use it."""
+            recovery = getattr(provider, "recover_context_overflow", None)
+            if (
+                not callable(recovery)
+                or retaining_getter is None
+                or not retention_accepts_hard_fit()
+                or (coordinator and coordinator.cancellation.is_cancelled)
+            ):
+                return None
+            return recovery
+
         async def request_messages(
             retain_contents: list[str],
             *,
@@ -3486,6 +3516,8 @@ class StreamingOrchestrator:
             base_messages: list[dict[str, Any]],
             *,
             attempt: int,
+            request_options: Mapping[str, Any] | None = None,
+            allow_unproven: bool = False,
         ) -> tuple[int | None, int | None]:
             """Return a smaller context budget and effective output cap when available.
 
@@ -3499,16 +3531,19 @@ class StreamingOrchestrator:
             """
             request_budget = getattr(provider, "request_budget", None)
             if not budget_capable or not callable(request_budget):
-                if attempt:
+                if attempt and not allow_unproven:
                     raise ContextLengthError(
                         "Provider request_budget capability was unavailable after "
                         "reporting a concrete budget"
                     )
                 return None, None
             context_estimate = sum(len(str(message)) // 4 for message in base_messages)
-            decision = request_budget(request, context_estimate=context_estimate)
+            budget_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
+            if accepts_named_request_options(request_budget):
+                budget_kwargs["request_options"] = request_options
+            decision = request_budget(request, **budget_kwargs)
             if decision is None:
-                if attempt:
+                if attempt and not allow_unproven:
                     raise ContextLengthError(
                         "Provider request_budget capability was unavailable after "
                         "reporting a concrete budget"
@@ -3596,6 +3631,7 @@ class StreamingOrchestrator:
             *,
             original_output_cap: int | None,
             tool_choice: str | None = None,
+            request_options: Mapping[str, Any] | None = None,
         ) -> ChatRequest | None:
             """Preflight unchanged input at bounded lower output reserves."""
             for cap in output_cap_candidates(original_output_cap):
@@ -3605,7 +3641,10 @@ class StreamingOrchestrator:
                     max_output_tokens=cap,
                 )
                 smaller_budget, _ = await check_request_budget(
-                    candidate_request, base_messages, attempt=1
+                    candidate_request,
+                    base_messages,
+                    attempt=1,
+                    request_options=request_options,
                 )
                 if smaller_budget is None:
                     if cap < 10_000:
@@ -3618,6 +3657,143 @@ class StreamingOrchestrator:
                         )
                     return candidate_request
             return None
+
+        async def recover_context_overflow(
+            failed_request: ChatRequest,
+            error: ContextLengthError,
+            base_messages: list[dict[str, Any]],
+            *,
+            retain_contents: list[str],
+            turn_start_view_block: str | None,
+            request_injection: tuple[str, bool] | None,
+            pending_injections: list[dict[str, Any]],
+            tool_choice: str | None,
+            finalization_overlay: dict[str, Any] | None,
+            request_options: Mapping[str, Any] | None,
+            effective_output_cap: int | None,
+        ) -> ChatRequest | None:
+            """Build one provider-authorized hard-fit retry, or decline safely.
+
+            The provider owns overflow classification.  This generic layer
+            only validates its public decision and replays the already-resolved
+            request view; it never invokes hooks, tools, or provider-specific
+            error parsing.
+            """
+            recovery = get_context_overflow_recovery()
+            if recovery is None:
+                return None
+
+            failed_call_end = time.monotonic()
+            context_estimate = sum(len(str(message)) // 4 for message in base_messages)
+            recovery_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
+            if accepts_named_request_options(recovery):
+                recovery_kwargs["request_options"] = request_options
+            decision = recovery(failed_request, error, **recovery_kwargs)
+            required = (
+                "estimated_input_tokens",
+                "input_limit_tokens",
+                "context_token_budget",
+            )
+            valid = isinstance(decision, dict) and all(
+                isinstance(decision.get(key), int)
+                and not isinstance(decision.get(key), bool)
+                and decision[key] >= 0
+                for key in required
+            )
+            if not valid:
+                logger.warning("Provider overflow recovery declined invalid feedback")
+                await hooks.emit(
+                    "orchestrator:provider_overflow_recovery",
+                    {"result": "invalid"},
+                )
+                return None
+
+            observed = decision["estimated_input_tokens"]
+            allowance = decision["input_limit_tokens"]
+            target = decision["context_token_budget"]
+            decision_cap = decision.get("max_output_tokens")
+            valid_cap = decision_cap is None or (
+                isinstance(decision_cap, int)
+                and not isinstance(decision_cap, bool)
+                and decision_cap > 0
+                and (
+                    effective_output_cap is None
+                    or decision_cap <= effective_output_cap
+                )
+            )
+            if (
+                observed <= allowance
+                or allowance <= 0
+                or target <= 0
+                or target >= context_estimate
+                or not valid_cap
+            ):
+                logger.warning("Provider overflow recovery declined unsafe feedback")
+                await hooks.emit(
+                    "orchestrator:provider_overflow_recovery",
+                    {"result": "invalid"},
+                )
+                return None
+
+            if coordinator and coordinator.cancellation.is_cancelled:
+                return None
+            rebuilt_base_messages = list(
+                await request_messages(
+                    retain_contents, token_budget=target, hard_fit=True
+                )
+            )
+            rebuilt_messages = (
+                _replay_request_overlays(
+                    rebuilt_base_messages,
+                    turn_start_view_block=turn_start_view_block,
+                    request_injection=request_injection,
+                    pending_injections=pending_injections,
+                )
+                if self._ephemeral_injection_mode == "tail"
+                else list(rebuilt_base_messages)
+            )
+            if finalization_overlay is not None:
+                rebuilt_messages.append(finalization_overlay)
+            if effective_output_cap is None:
+                retry_output_cap = decision_cap
+            elif decision_cap is None:
+                retry_output_cap = effective_output_cap
+            else:
+                retry_output_cap = min(effective_output_cap, decision_cap)
+            rebuilt_request = build_chat_request(
+                rebuilt_messages,
+                tool_choice=tool_choice,
+                max_output_tokens=retry_output_cap,
+            )
+            smaller_budget, _ = await check_request_budget(
+                rebuilt_request,
+                rebuilt_base_messages,
+                attempt=1,
+                request_options=request_options,
+                # Valid server rejection authorizes one unknown preflight retry.
+                allow_unproven=True,
+            )
+            if smaller_budget is not None:
+                logger.warning("Provider overflow recovery rebuilt request remains oversized")
+                await hooks.emit(
+                    "orchestrator:provider_overflow_recovery",
+                    {"result": "oversized"},
+                )
+                return None
+            if coordinator and coordinator.cancellation.is_cancelled:
+                return None
+            logger.warning("Retrying provider generation after input-overflow recovery")
+            await hooks.emit(
+                "orchestrator:provider_overflow_recovery",
+                {"result": "retry"},
+            )
+            # A rejected request is still a provider call. Preserve the normal
+            # minimum spacing before issuing the one authorized retry.
+            self._last_provider_call_end = failed_call_end
+            await self._apply_rate_limit_delay(hooks, iteration)
+            if coordinator and coordinator.cancellation.is_cancelled:
+                return None
+            return rebuilt_request
 
         # --- Turn-start reminder assembly (reminder-redesign-spec.md,
         # W1.2, Option D). Hoists iteration 1's provider:request emit to
@@ -4122,6 +4298,14 @@ class StreamingOrchestrator:
                 # Clear pending injections after applying (both modes)
                 self._pending_ephemeral_injections = []
 
+            stream_provider = callable(getattr(provider, "stream", None))
+            # `provider.stream` has no option-kwargs contract. Preflight only
+            # with options the selected dispatch path will actually receive.
+            request_options: dict[str, Any] = (
+                {"extended_thinking": True}
+                if self.extended_thinking and not stream_provider
+                else {}
+            )
             chat_request = build_chat_request(message_dicts)
             logger.info(
                 f"[ORCHESTRATOR] ChatRequest created with {len(tools) if tools else 0} tools"
@@ -4132,8 +4316,12 @@ class StreamingOrchestrator:
                 )
 
             smaller_context_budget, original_output_cap = await check_request_budget(
-                chat_request, base_message_dicts, attempt=0
+                chat_request,
+                base_message_dicts,
+                attempt=0,
+                request_options=request_options,
             )
+            dispatch_base_messages = base_message_dicts
             if smaller_context_budget is not None:
                 if smaller_context_budget <= 0:
                     raise ContextLengthError(
@@ -4146,6 +4334,7 @@ class StreamingOrchestrator:
                         hard_fit=True,
                     )
                 )
+                dispatch_base_messages = rebuilt_base_messages
                 rebuilt_messages = (
                     _replay_request_overlays(
                         rebuilt_base_messages,
@@ -4158,13 +4347,17 @@ class StreamingOrchestrator:
                 )
                 rebuilt_request = build_chat_request(rebuilt_messages)
                 next_context_budget, _ = await check_request_budget(
-                    rebuilt_request, rebuilt_base_messages, attempt=1
+                    rebuilt_request,
+                    rebuilt_base_messages,
+                    attempt=1,
+                    request_options=request_options,
                 )
                 if next_context_budget is not None:
                     reduced_output_request = await try_reduced_output(
                         rebuilt_messages,
                         rebuilt_base_messages,
                         original_output_cap=original_output_cap,
+                        request_options=request_options,
                     )
                     if reduced_output_request is not None:
                         chat_request = reduced_output_request
@@ -4186,6 +4379,7 @@ class StreamingOrchestrator:
                                 hard_fit=True,
                             )
                         )
+                        dispatch_base_messages = rebuilt_base_messages
                         rebuilt_messages = (
                             _replay_request_overlays(
                                 rebuilt_base_messages,
@@ -4199,7 +4393,10 @@ class StreamingOrchestrator:
                         rebuilt_request = build_chat_request(rebuilt_messages)
                         if (
                             await check_request_budget(
-                                rebuilt_request, rebuilt_base_messages, attempt=2
+                                rebuilt_request,
+                                rebuilt_base_messages,
+                                attempt=2,
+                                request_options=request_options,
                             )
                         )[0] is not None:
                             raise ContextLengthError(
@@ -4213,18 +4410,45 @@ class StreamingOrchestrator:
             await self._apply_rate_limit_delay(hooks, iteration)
 
             # Check if provider supports streaming
-            if hasattr(provider, "stream"):
+            if stream_provider:
                 # Use streaming if available
                 self._llm_calls_this_turn += 1
-                async for chunk in self._stream_from_provider(
-                    provider,
-                    chat_request,
-                    context,
-                    tools,
-                    hooks,
-                    coordinator,
-                    provider_name=provider_name,
-                ):
+                if get_context_overflow_recovery() is not None:
+                    response_stream = self._stream_with_overflow_recovery(
+                        provider,
+                        chat_request,
+                        context,
+                        tools,
+                        hooks,
+                        coordinator,
+                        provider_name=provider_name,
+                        recover_overflow=lambda error: recover_context_overflow(
+                            chat_request,
+                            error,
+                            dispatch_base_messages,
+                            retain_contents=retained_contents,
+                            turn_start_view_block=replay_turn_start_block,
+                            request_injection=replay_request_injection,
+                            pending_injections=replay_pending_injections,
+                            tool_choice=None,
+                            finalization_overlay=None,
+                            request_options=request_options,
+                            effective_output_cap=(
+                                chat_request.max_output_tokens or original_output_cap
+                            ),
+                        ),
+                    )
+                else:
+                    response_stream = self._stream_from_provider(
+                        provider,
+                        chat_request,
+                        context,
+                        tools,
+                        hooks,
+                        coordinator,
+                        provider_name=provider_name,
+                    )
+                async for chunk in response_stream:
                     # Check for immediate cancellation between chunks
                     if coordinator and coordinator.cancellation.is_immediate:
                         # Clear pending steers: immediate cancellation ends the turn,
@@ -4255,13 +4479,43 @@ class StreamingOrchestrator:
                     break
             else:
                 # Fallback to non-streaming
-                # Build kwargs for provider
-                kwargs = {}
-                if self.extended_thinking:
-                    kwargs["extended_thinking"] = True
                 try:
                     self._llm_calls_this_turn += 1
-                    response = await provider.complete(chat_request, **kwargs)
+                    response = await provider.complete(chat_request, **request_options)
+                except ContextLengthError as error:
+                    recovered_request = await recover_context_overflow(
+                        chat_request,
+                        error,
+                        dispatch_base_messages,
+                        retain_contents=retained_contents,
+                        turn_start_view_block=replay_turn_start_block,
+                        request_injection=replay_request_injection,
+                        pending_injections=replay_pending_injections,
+                        tool_choice=None,
+                        finalization_overlay=None,
+                        request_options=request_options,
+                        effective_output_cap=(
+                            chat_request.max_output_tokens or original_output_cap
+                        ),
+                    )
+                    if recovered_request is None:
+                        await hooks.emit(
+                            PROVIDER_ERROR,
+                            {
+                                "provider": provider_name,
+                                "error": {
+                                    "type": type(error).__name__,
+                                    "msg": str(error),
+                                },
+                                "retryable": error.retryable,
+                                "status_code": error.status_code,
+                            },
+                        )
+                        raise
+                    self._llm_calls_this_turn += 1
+                    response = await provider.complete(
+                        recovered_request, **request_options
+                    )
                 except LLMError as e:
                     await hooks.emit(
                         PROVIDER_ERROR,
@@ -4859,12 +5113,19 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 # result in the existing transcript stay valid. The portable
                 # choice prevents new calls; this finalization path never
                 # parses or dispatches a tool response.
+                request_options: dict[str, Any] = {}
+                if self.extended_thinking:
+                    request_options["extended_thinking"] = True
                 max_iter_chat_request = build_chat_request(
                     message_dicts, tool_choice="none"
                 )
                 smaller_context_budget, original_output_cap = await check_request_budget(
-                    max_iter_chat_request, base_message_dicts, attempt=0
+                    max_iter_chat_request,
+                    base_message_dicts,
+                    attempt=0,
+                    request_options=request_options,
                 )
+                dispatch_base_messages = base_message_dicts
                 if smaller_context_budget is not None:
                     if smaller_context_budget <= 0:
                         raise ContextLengthError(
@@ -4878,6 +5139,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             hard_fit=True,
                         )
                     )
+                    dispatch_base_messages = rebuilt_base_messages
                     rebuilt_messages = (
                         _replay_request_overlays(
                             rebuilt_base_messages,
@@ -4893,7 +5155,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         rebuilt_messages, tool_choice="none"
                     )
                     next_context_budget, _ = await check_request_budget(
-                        rebuilt_request, rebuilt_base_messages, attempt=1
+                        rebuilt_request,
+                        rebuilt_base_messages,
+                        attempt=1,
+                        request_options=request_options,
                     )
                     if next_context_budget is not None:
                         reduced_output_request = await try_reduced_output(
@@ -4901,6 +5166,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             rebuilt_base_messages,
                             original_output_cap=original_output_cap,
                             tool_choice="none",
+                            request_options=request_options,
                         )
                         if reduced_output_request is not None:
                             max_iter_chat_request = reduced_output_request
@@ -4922,6 +5188,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                                     hard_fit=True,
                                 )
                             )
+                            dispatch_base_messages = rebuilt_base_messages
                             rebuilt_messages = (
                                 _replay_request_overlays(
                                     rebuilt_base_messages,
@@ -4938,7 +5205,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             )
                             if (
                                 await check_request_budget(
-                                    rebuilt_request, rebuilt_base_messages, attempt=2
+                                    rebuilt_request,
+                                    rebuilt_base_messages,
+                                    attempt=2,
+                                    request_options=request_options,
                                 )
                             )[0] is not None:
                                 raise ContextLengthError(
@@ -4949,12 +5219,34 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     else:
                         max_iter_chat_request = rebuilt_request
 
-                kwargs = {}
-                if self.extended_thinking:
-                    kwargs["extended_thinking"] = True
-
                 self._llm_calls_this_turn += 1
-                response = await provider.complete(max_iter_chat_request, **kwargs)
+                try:
+                    response = await provider.complete(
+                        max_iter_chat_request, **request_options
+                    )
+                except ContextLengthError as error:
+                    recovered_request = await recover_context_overflow(
+                        max_iter_chat_request,
+                        error,
+                        dispatch_base_messages,
+                        retain_contents=final_retained_contents,
+                        turn_start_view_block=None,
+                        request_injection=final_replay_request_injection,
+                        pending_injections=final_replay_pending_injections,
+                        tool_choice="none",
+                        finalization_overlay=finalization_overlay,
+                        request_options=request_options,
+                        effective_output_cap=(
+                            max_iter_chat_request.max_output_tokens
+                            or original_output_cap
+                        ),
+                    )
+                    if recovered_request is None:
+                        raise
+                    self._llm_calls_this_turn += 1
+                    response = await provider.complete(
+                        recovered_request, **request_options
+                    )
                 response_text = getattr(response, "text", None)
                 if not isinstance(response_text, str) or not response_text:
                     response_text = self._extract_text_from_content(
@@ -5070,6 +5362,63 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             },
         )
 
+    async def _close_async_iterator(self, iterator: Any, *, description: str) -> None:
+        """Close a provider iterator when it offers asynchronous cleanup."""
+        closer = getattr(iterator, "aclose", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:
+                logger.debug("Unable to close %s", description, exc_info=True)
+
+    async def _stream_with_overflow_recovery(
+        self,
+        provider,
+        chat_request,
+        context,
+        tools,
+        hooks,
+        coordinator=None,
+        provider_name=None,
+        recover_overflow=None,
+    ) -> AsyncIterator[str]:
+        """Forward a stream, retrying exactly once before its first SDK chunk."""
+        while True:
+            saw_provider_chunk = False
+
+            def mark_provider_chunk() -> None:
+                nonlocal saw_provider_chunk
+                saw_provider_chunk = True
+
+            stream = self._stream_from_provider(
+                provider,
+                chat_request,
+                context,
+                tools,
+                hooks,
+                coordinator,
+                provider_name=provider_name,
+                on_provider_chunk=mark_provider_chunk,
+            )
+            try:
+                async for chunk in stream:
+                    yield chunk
+                return
+            except ContextLengthError as error:
+                if saw_provider_chunk or recover_overflow is None:
+                    raise
+                recovered_request = await recover_overflow(error)
+                if recovered_request is None:
+                    raise
+                self._llm_calls_this_turn += 1
+                chat_request = recovered_request
+                # A prospective outbound generation has one recovery allowance.
+                recover_overflow = None
+            finally:
+                await self._close_async_iterator(
+                    stream, description="provider stream wrapper"
+                )
+
     async def _stream_from_provider(
         self,
         provider,
@@ -5079,6 +5428,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         hooks,
         coordinator=None,
         provider_name=None,
+        on_provider_chunk=None,
     ) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming.
 
@@ -5121,31 +5471,38 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             )
             raise
 
-        async for chunk in stream_iter:
-            # Check for immediate cancellation between chunks
-            if coordinator and coordinator.cancellation.is_immediate:
-                # Add partial response to context before exiting
-                if full_response:
-                    await context.add_message(
-                        {"role": "assistant", "content": full_response}
-                    )
-                return
+        try:
+            async for chunk in stream_iter:
+                if on_provider_chunk is not None:
+                    on_provider_chunk()
+                # Check for immediate cancellation between chunks
+                if coordinator and coordinator.cancellation.is_immediate:
+                    # Add partial response to context before exiting
+                    if full_response:
+                        await context.add_message(
+                            {"role": "assistant", "content": full_response}
+                        )
+                    return
 
-            # Skip non-text block deltas (e.g. thinking block streaming chunks).
-            # Providers that stream extended-thinking models include a block_type
-            # field so callers can distinguish thinking deltas from text deltas.
-            # Without this guard, thinking content leaks into full_response and
-            # ultimately into parse_json extraction downstream.
-            chunk_block_type = chunk.get("block_type")
-            if chunk_block_type and chunk_block_type != "text":
-                continue
+                # Skip non-text block deltas (e.g. thinking block streaming chunks).
+                # Providers that stream extended-thinking models include a block_type
+                # field so callers can distinguish thinking deltas from text deltas.
+                # Without this guard, thinking content leaks into full_response and
+                # ultimately into parse_json extraction downstream.
+                chunk_block_type = chunk.get("block_type")
+                if chunk_block_type and chunk_block_type != "text":
+                    continue
 
-            token = chunk.get("content", "")
-            if token:
-                yield token
-                full_response += token
-                if self.stream_delay:
-                    await asyncio.sleep(self.stream_delay)
+                token = chunk.get("content", "")
+                if token:
+                    yield token
+                    full_response += token
+                    if self.stream_delay:
+                        await asyncio.sleep(self.stream_delay)
+        finally:
+            await self._close_async_iterator(
+                stream_iter, description="provider stream iterator"
+            )
 
         # Add complete message to context
         if full_response:
