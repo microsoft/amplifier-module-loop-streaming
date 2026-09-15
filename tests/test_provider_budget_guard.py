@@ -50,6 +50,12 @@ class BudgetProvider(RequestCapturingProvider):
         return self.decisions.pop(0)
 
 
+class AsyncBudgetProvider(BudgetProvider):
+    async def request_budget(self, request, *, context_estimate: int) -> object:
+        self.budget_calls.append((request, context_estimate))
+        return self.decisions.pop(0)
+
+
 class BudgetContext(MockContext):
     """Context double that records ordinary and retention-budget requests."""
 
@@ -258,6 +264,25 @@ async def test_fitting_budget_dispatches_the_original_request_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_awaitable_fitting_budget_dispatches_the_original_request_once() -> None:
+    context = BudgetContext()
+    provider = AsyncBudgetProvider([_decision(5, 5, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    assert len(provider.budget_calls) == 1
+    assert context.request_calls == [([], None)]
+
+
+@pytest.mark.asyncio
 async def test_initial_unavailable_budget_keeps_normal_dispatch_without_budget_event() -> None:
     context = BudgetContext()
     provider = BudgetProvider([None])
@@ -319,6 +344,26 @@ async def test_forced_normal_rebuild_forwards_hard_fit_only_to_modern_retention(
 
     # The first ordinary request remains legacy/default behavior; exactly the
     # forced provider-directed rebuild opts into hard fitting.
+    assert context.hard_fit_calls == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_awaitable_oversize_budget_rebuilds_with_hard_fit_then_dispatches() -> None:
+    context = HardFitBudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = AsyncBudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    assert len(provider.budget_calls) == 2
     assert context.hard_fit_calls == [False, True]
 
 
@@ -635,6 +680,32 @@ async def test_unavailable_budget_after_rebuild_fails_without_sdk_dispatch() -> 
     assert len(provider.budget_calls) == 2
     assert [budget for _, budget in context.request_calls] == [None, 7]
     assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_awaitable_unavailable_budget_after_rebuild_fails_without_sdk_dispatch() -> None:
+    context = HardFitBudgetContext()
+    provider = AsyncBudgetProvider([_decision(100, 10, 7), None])
+    hooks = ScriptedHooks({})
+
+    with pytest.raises(ContextLengthError, match="unavailable after reporting a concrete budget"):
+        await StreamingOrchestrator({}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {},
+            hooks,
+            _retaining_coordinator(context),
+        )
+
+    assert len(provider.budget_calls) == 2
+    assert context.hard_fit_calls == [False, True]
+    assert provider.requests == []
+    assert [
+        payload["result"]
+        for event, payload in hooks.emitted
+        if event == "orchestrator:provider_budget"
+    ] == ["oversized"]
 
 
 @pytest.mark.asyncio

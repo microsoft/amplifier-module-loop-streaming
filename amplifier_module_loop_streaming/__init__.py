@@ -3549,6 +3549,8 @@ class StreamingOrchestrator:
             if accepts_named_request_options(request_budget):
                 budget_kwargs["request_options"] = request_options
             decision = request_budget(request, **budget_kwargs)
+            if inspect.isawaitable(decision):
+                decision = await decision
             if decision is None:
                 if attempt and not allow_unproven:
                     raise ContextLengthError(
