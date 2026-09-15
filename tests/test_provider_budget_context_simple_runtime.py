@@ -20,6 +20,7 @@ pytest.importorskip("amplifier_module_provider_openai")
 from amplifier_module_context_simple import SimpleContextManager
 from amplifier_module_loop_streaming import StreamingOrchestrator
 from amplifier_module_provider_openai import OpenAIProvider
+from tests.test_ephemeral_cache_persist_mode import RequestCapturingProvider
 
 
 class _Cancellation:
@@ -134,8 +135,74 @@ class _InMemoryClient:
         self.responses = _InMemoryResponses(hard_fit_calls)
 
 
+class _TwoRebuildProvider(RequestCapturingProvider):
+    """Budget double that forces two local rebuilds before accepting a request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.budget_calls: list[tuple[ChatRequest, int]] = []
+        self._decisions = [
+            {
+                "estimated_input_tokens": 100,
+                "input_limit_tokens": 10,
+                "context_token_budget": 5_000,
+            },
+            {
+                "estimated_input_tokens": 50,
+                "input_limit_tokens": 10,
+                "context_token_budget": 1_000,
+            },
+            {
+                "estimated_input_tokens": 9,
+                "input_limit_tokens": 10,
+                "context_token_budget": 0,
+            },
+        ]
+
+    def request_budget(
+        self, request: ChatRequest, *, context_estimate: int
+    ) -> dict[str, int]:
+        self.budget_calls.append((request, context_estimate))
+        return self._decisions.pop(0)
+
+
 def _payload_text(params: dict) -> str:
     return json.dumps(params, ensure_ascii=False, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_two_hard_fits_keep_real_context_requirements() -> None:
+    hooks = _StableReminderHooks()
+    coordinator = _Coordinator(hooks)
+    context = _RecordingContext(
+        max_tokens=100_000,
+        compact_threshold=0.99,
+        target_usage=0.50,
+        protected_recent=0.10,
+        protected_tool_results=1,
+        truncate_chars=64,
+        compaction_notice_enabled=True,
+    )
+    coordinator.register_capability(
+        "context.request_retention", context.get_messages_for_request_retaining
+    )
+    provider = _TwoRebuildProvider()
+    bulk = "TWO-HARD-FIT-BULK:" + ("history" * 10_000)
+    await context.add_message({"role": "assistant", "content": bulk})
+
+    await StreamingOrchestrator({}).execute(
+        "CURRENT-HUMAN", context, {"budget": provider}, {}, hooks, coordinator
+    )
+
+    assert len(provider.requests) == 1
+    assert len(provider.budget_calls) == 3
+    assert context.hard_fit_calls == [False, True, True]
+    request_bodies = "\n".join(message.content for message in provider.requests[0].messages)
+    assert "TWO-HARD-FIT-BULK" not in request_bodies
+    assert "CURRENT-HUMAN" in request_bodies
+    assert "REQUIRED-REMINDER" in request_bodies
+    canonical = await context.get_messages()
+    assert any(message.get("content") == bulk for message in canonical)
 
 
 @pytest.mark.asyncio
