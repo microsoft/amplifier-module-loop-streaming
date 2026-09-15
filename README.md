@@ -97,8 +97,9 @@ Per-iteration ephemeral tail messages -- `hooks-status-context`,
 `inject_context` hook result -- are, by default (`"persist"`), written into
 canonical context via `context.add_message(...)`, and only when the text
 differs from the last text this orchestrator persisted. When unchanged,
-nothing is added, so request N is a true, append-only prefix of request
-N+1. This matters because OpenAI's (and most providers') implicit/explicit
+no duplicate is added; between compactions and other request rewrites, this
+preserves the opportunity for an append-only request prefix. This matters
+because OpenAI's (and most providers') implicit/explicit
 prompt cache reuses only the longest true prefix of a prior request: the
 original `"tail"` behavior re-generates and re-appends these messages at
 the tail of every request, positionally displacing the assistant/tool turn
@@ -107,6 +108,10 @@ near the static system-prompt boundary and re-billing the entire growing
 transcript as a fresh cache write on every call.
 
 **Evidence for the default:**
+
+The historical observations below are not a guarantee of current long-history
+cache reuse. Request retention protects instruction delivery, not cache
+performance; measure reuse from the provider's raw total/read/write counters.
 
 - **OpenAI**: a pre-registered 9-arm live probe found only the persist
   design (change-gated, canonical-context write) heals prefix reuse
@@ -140,6 +145,20 @@ hook whose injection text must never accumulate in history -- should set
 supported and is byte-identical to the module's original, pre-this-feature
 behavior. An unknown value falls back to `"persist"` (the current default)
 with a logged warning.
+
+**Retention capability:** when the active context exposes the callable
+`context.request_retention` capability, persist mode requires the current
+complete reminder envelope in every request view, including unchanged-body
+suppression, pending tool feedback, and bounded finalization. A fresh
+orchestrator also reuses an exact matching admitted persisted envelope after
+resume instead of adding a duplicate. Required content that cannot fit fails
+visibly before a provider request.
+
+If the capability is unavailable, persist mode keeps legacy assembly and logs
+one warning per `execute()` that complete reminder retention is unavailable.
+Explicit `tail` mode is unchanged and does not receive this retention
+guarantee. None of these changes gives user-carried reminders native
+system/developer authority.
 
 ## System-reminder envelope and placement (reminder-redesign-spec.md, W1)
 

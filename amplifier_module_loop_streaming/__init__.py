@@ -1176,6 +1176,12 @@ class StreamingOrchestrator:
             _ephemeral_injection_mode = "persist"
         self._ephemeral_injection_mode: str = _ephemeral_injection_mode
         self._last_persisted_injection: str | None = None
+        self._retention_capability_warned: bool = False
+        # The exact enveloped message admitted to canonical context. Keeping
+        # both the raw producer body and this wire representation lets a
+        # resumed orchestrator recognize an already-admitted reminder without
+        # confusing a user message that happens to quote the same XML.
+        self._last_persisted_injection_content: str | None = None
         # D2 fix (rr wave 20260831 -- envelope accumulation). True once a
         # PERSISTED reminder envelope carrying the full descriptive header
         # has been written for the CURRENT turn; every subsequent persisted
@@ -1316,6 +1322,7 @@ class StreamingOrchestrator:
         # turn.
         self._goal_model_cache = None
         self._goal_model_basis = None
+        self._retention_capability_warned = False
 
         # Peek at goal state *before* the first turn. Goal state can only be
         # set (by the app layer's /goal command) before execute() is called,
@@ -3152,6 +3159,70 @@ class StreamingOrchestrator:
         reason = lines[1] if len(lines) > 1 else "(evaluator gave no reason)"
         return verdict == "YES", reason
 
+    async def _persist_reminder(
+        self, context, body: str, *, tail: bool, verify_admitted: bool = False
+    ) -> tuple[str, bool]:
+        """Return the current admitted envelope without duplicating it."""
+        content = _wrap_reminders(
+            body, tail=tail, header=not self._turn_header_persisted
+        )
+
+        def is_admitted(message: dict[str, Any], expected_content: str) -> bool:
+            return (
+                message.get("role") == "user"
+                and message.get("content") == expected_content
+                and (message.get("metadata") or {}).get("ephemeral") is True
+                and (message.get("metadata") or {}).get("persisted") is True
+            )
+
+        # The raw-body gate intentionally spans the pre-user and tail envelope
+        # variants within one turn. Reuse the admitted pre-user variant instead
+        # of making a second, tail-wrapped copy just because its header differs.
+        if (
+            body == self._last_persisted_injection
+            and self._last_persisted_injection_content is not None
+        ):
+            if not verify_admitted:
+                return self._last_persisted_injection_content, False
+            canonical = await context.get_messages()
+            if any(
+                is_admitted(message, self._last_persisted_injection_content)
+                for message in canonical
+            ):
+                return self._last_persisted_injection_content, False
+
+        if verify_admitted:
+            # Retention-aware contexts may compact their request view. Search
+            # canonical history for the exact *current* envelope instead: a
+            # fresh/resumed orchestrator has no local body cache, and content
+            # equality alone would incorrectly reuse a real user quote.
+            canonical = await context.get_messages()
+            admitted = any(
+                is_admitted(message, content)
+                for message in canonical
+            )
+            if admitted:
+                self._last_persisted_injection = body
+                self._last_persisted_injection_content = content
+                self._turn_header_persisted = True
+                return content, False
+
+        await context.add_message(
+            {
+                "role": "user",
+                "content": content,
+                "metadata": {
+                    "ephemeral": True,
+                    "persisted": True,
+                    "reminder_placement": "tail" if tail else "pre_user",
+                },
+            }
+        )
+        self._last_persisted_injection = body
+        self._last_persisted_injection_content = content
+        self._turn_header_persisted = True
+        return content, True
+
     async def _execute_stream(
         self,
         prompt: str,
@@ -3165,6 +3236,32 @@ class StreamingOrchestrator:
         Internal streaming execution.
         Yields tuples of (token, iteration) as they're generated.
         """
+        retaining_getter = None
+        get_capability = getattr(coordinator, "get_capability", None)
+        if self._ephemeral_injection_mode == "persist" and callable(get_capability):
+            candidate = get_capability("context.request_retention")
+            if callable(candidate):
+                retaining_getter = candidate
+        if (
+            self._ephemeral_injection_mode == "persist"
+            and retaining_getter is None
+            and not self._retention_capability_warned
+        ):
+            logger.warning(
+                "Persisted reminder retention guarantee unavailable: "
+                "context.request_retention is not callable; using legacy "
+                "context request fallback."
+            )
+            self._retention_capability_warned = True
+
+        async def request_messages(retain_contents: list[str]):
+            if retaining_getter is not None:
+                return await retaining_getter(
+                    provider=provider, retain_contents=retain_contents
+                )
+            return await context.get_messages_for_request(provider=provider)
+
+        turn_start_retained_contents: list[str] = []
         # Emit and process prompt submit (allows hooks to inject context before processing)
         prompt_submit_result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
         if coordinator:
@@ -3311,34 +3408,13 @@ class StreamingOrchestrator:
             turn_start_body = "\n\n".join(turn_start_parts)
             if turn_start_body:
                 if self._ephemeral_injection_mode == "persist":
-                    # Same change-gate as the in-loop persist path, and the
-                    # SAME comparison basis: the RAW (pre-envelope) merged
-                    # body, not the enveloped string. This is what lets an
-                    # unchanged body suppress correctly even when this
-                    # turn-start (pre_user-headered) block is compared
-                    # against a LATER mid-loop (tail-headered) block wrapping
-                    # the identical text -- the two envelope strings would
-                    # never be equal (different header), which would
-                    # otherwise force a spurious extra persist on the first
-                    # mid-loop iteration of every multi-iteration turn.
-                    if turn_start_body != self._last_persisted_injection:
-                        await context.add_message(
-                            {
-                                "role": "user",
-                                "content": _wrap_reminders(
-                                    turn_start_body,
-                                    tail=False,
-                                    header=not self._turn_header_persisted,
-                                ),
-                                "metadata": {
-                                    "ephemeral": True,
-                                    "persisted": True,
-                                    "reminder_placement": "pre_user",
-                                },
-                            }
-                        )
-                        self._last_persisted_injection = turn_start_body
-                        self._turn_header_persisted = True
+                    content, _ = await self._persist_reminder(
+                        context,
+                        turn_start_body,
+                        tail=False,
+                        verify_admitted=retaining_getter is not None,
+                    )
+                    turn_start_retained_contents.append(content)
                 else:
                     # tail injection mode: never persisted into canonical
                     # context; spliced into the request VIEW at iteration 1
@@ -3499,9 +3575,28 @@ class StreamingOrchestrator:
                         yield (f"Operation denied: {result.reason}", iteration)
                         return
 
+            # Keep the current producer's admitted reminder through compaction
+            # on every request. A changed body is admitted below before the
+            # request is assembled.
+            retained_contents = (
+                list(turn_start_retained_contents) if iteration == 1 else []
+            )
+            if (
+                result.action == "inject_context"
+                and result.ephemeral
+                and result.context_injection
+                and retaining_getter is not None
+            ):
+                content, _ = await self._persist_reminder(
+                    context,
+                    result.context_injection,
+                    tail=True,
+                    verify_admitted=True,
+                )
+                retained_contents.append(content)
             # Get messages for LLM request (context handles compaction internally)
             # Pass provider for dynamic budget calculation based on model's context window
-            message_dicts = await context.get_messages_for_request(provider=provider)
+            message_dicts = await request_messages(retained_contents)
             message_dicts = list(message_dicts)  # Convert to list for modification
 
             # Splice the turn-start reminder block into the request VIEW
@@ -3566,64 +3661,12 @@ class StreamingOrchestrator:
                         result.context_injection_role,
                     )
                 if self._ephemeral_injection_mode == "persist":
-                    # Ephemeral-cache fix (ephemeral-cache-fix-spec.md sec 5.1/5.3):
-                    # write the injection into CANONICAL context via
-                    # context.add_message(...), and ONLY when its RAW text
-                    # (pre-envelope) differs from the last text this
-                    # orchestrator persisted. When unchanged, do nothing --
-                    # the request is then a pure append of the new
-                    # assistant/tool turn, which is what makes request N a
-                    # true prefix of request N+1. Comparing on the raw body
-                    # (not the enveloped string) keeps the change-gate
-                    # working across the pre-user/tail header-variant
-                    # boundary -- the turn-start block and this mid-loop
-                    # block wrap the SAME body differently (different
-                    # header), so comparing enveloped strings would falsely
-                    # look "changed" the first time a turn transitions from
-                    # its turn-start block to a mid-loop one.
-                    #
-                    # Contract change accepted knowingly (spec sec 5.2): once
-                    # persisted, this message is no longer "removed next
-                    # turn" -- it is real history from here on, still marked
-                    # metadata.ephemeral=True (now meaning "machine-generated
-                    # per-turn scaffolding, not a user turn", not "guaranteed
-                    # absent next turn" -- see models.py's updated docstring).
-                    if result.context_injection != self._last_persisted_injection:
-                        await context.add_message(
-                            {
-                                "role": "user",
-                                "content": _wrap_reminders(
-                                    result.context_injection,
-                                    tail=True,
-                                    header=not self._turn_header_persisted,
-                                ),
-                                "metadata": {
-                                    "ephemeral": True,
-                                    "persisted": True,
-                                    "reminder_placement": "tail",
-                                },
-                            }
+                    if retaining_getter is None:
+                        _, changed = await self._persist_reminder(
+                            context, result.context_injection, tail=True
                         )
-                        self._last_persisted_injection = result.context_injection
-                        self._turn_header_persisted = True
-                        logger.debug(
-                            "Persisted changed ephemeral injection into canonical context"
-                        )
-                        # Re-fetch so the newly persisted message is present
-                        # and budgeted on THIS request too, not just the next
-                        # one. get_messages_for_request is pure w.r.t.
-                        # self.messages (context-simple returns a new list;
-                        # it never mutates in place), so this is an extra
-                        # call, not a reordering.
-                        message_dicts = await context.get_messages_for_request(
-                            provider=provider
-                        )
-                        message_dicts = list(message_dicts)
-                    else:
-                        logger.debug(
-                            "Ephemeral injection text unchanged -- skipping persist "
-                            "(change-gate); request is a pure append this iteration"
-                        )
+                        if changed:
+                            message_dicts = list(await request_messages([]))
                 # Check if we should append to last tool result
                 elif result.append_to_last_tool_result and len(message_dicts) > 0:
                     last_msg = message_dicts[-1]
@@ -3717,36 +3760,16 @@ class StreamingOrchestrator:
                         pending_to_tool_result + pending_to_message
                     )
                     if pending_body:
-                        if pending_body != self._last_persisted_injection:
-                            await context.add_message(
-                                {
-                                    "role": "user",
-                                    "content": _wrap_reminders(
-                                        pending_body,
-                                        tail=True,
-                                        header=not self._turn_header_persisted,
-                                    ),
-                                    "metadata": {
-                                        "ephemeral": True,
-                                        "persisted": True,
-                                        "reminder_placement": "tail",
-                                    },
-                                }
-                            )
-                            self._last_persisted_injection = pending_body
-                            self._turn_header_persisted = True
-                            logger.debug(
-                                "Persisted changed pending ephemeral injection(s) "
-                                "into canonical context"
-                            )
-                            message_dicts = await context.get_messages_for_request(
-                                provider=provider
-                            )
-                            message_dicts = list(message_dicts)
-                        else:
-                            logger.debug(
-                                "Pending ephemeral injection(s) text unchanged -- "
-                                "skipping persist (change-gate)"
+                        content, changed = await self._persist_reminder(
+                            context,
+                            pending_body,
+                            tail=True,
+                            verify_admitted=retaining_getter is not None,
+                        )
+                        retained_contents.append(content)
+                        if changed or retaining_getter is not None:
+                            message_dicts = list(
+                                await request_messages(retained_contents)
                             )
                 else:
                     if pending_to_tool_result:
@@ -4355,9 +4378,35 @@ class StreamingOrchestrator:
             # allowed provider call, not discarded at the next turn boundary.
             await self._drain_steering(context, hooks, iteration)
 
-            # Get one final response with the reminder (via _execute_stream helper)
-            message_dicts = await context.get_messages_for_request(provider=provider)
-            message_dicts = list(message_dicts)
+            # Current provider-hook requirements and a queued tool-post
+            # injection must survive the bounded finalization assembly too.
+            final_retained_contents: list[str] = []
+            if (
+                retaining_getter is not None
+                and finalization_result.action == "inject_context"
+                and finalization_result.ephemeral
+                and finalization_result.context_injection
+            ):
+                content, _ = await self._persist_reminder(
+                    context,
+                    finalization_result.context_injection,
+                    tail=True,
+                    verify_admitted=True,
+                )
+                final_retained_contents.append(content)
+            if retaining_getter is not None and self._pending_ephemeral_injections:
+                pending_body = "\n\n".join(
+                    injection["content"]
+                    for injection in self._pending_ephemeral_injections
+                    if injection.get("content")
+                )
+                if pending_body:
+                    content, _ = await self._persist_reminder(
+                        context, pending_body, tail=True, verify_admitted=True
+                    )
+                    final_retained_contents.append(content)
+                self._pending_ephemeral_injections.clear()
+            message_dicts = list(await request_messages(final_retained_contents))
             # The finalization hook and context assembly both await. Check
             # again before contacting the provider so a concurrent
             # cancellation cannot buy an unrequested final provider call.
