@@ -3487,12 +3487,33 @@ class StreamingOrchestrator:
             *,
             attempt: int,
         ) -> tuple[int | None, int | None]:
-            """Return a smaller context budget and effective output cap when available."""
+            """Return a smaller context budget and effective output cap when available.
+
+            ``None`` is a compatibility result only for the initial preflight:
+            it means this provider cannot make a trustworthy decision for this
+            request, so dispatch follows the historical no-capability path.
+            Every later probe is reachable only after a concrete decision made
+            a rebuild or output-reserve retry necessary. Losing the capability
+            then must fail locally rather than turn an unknown result into a
+            fit and send an unchecked request.
+            """
             request_budget = getattr(provider, "request_budget", None)
             if not budget_capable or not callable(request_budget):
+                if attempt:
+                    raise ContextLengthError(
+                        "Provider request_budget capability was unavailable after "
+                        "reporting a concrete budget"
+                    )
                 return None, None
             context_estimate = sum(len(str(message)) // 4 for message in base_messages)
             decision = request_budget(request, context_estimate=context_estimate)
+            if decision is None:
+                if attempt:
+                    raise ContextLengthError(
+                        "Provider request_budget capability was unavailable after "
+                        "reporting a concrete budget"
+                    )
+                return None, None
             required = (
                 "estimated_input_tokens",
                 "input_limit_tokens",
