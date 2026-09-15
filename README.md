@@ -46,6 +46,13 @@ draining pending state again. If that view still cannot fit, the loop raises
 locally and makes no SDK request. Providers without the capability retain the
 existing request and dispatch behavior.
 
+If a provider exposes `request_budget` but returns literal `None` on the
+initial preflight, the loop treats that request as unavailable and uses the
+same normal dispatch path. Once a concrete budget has required a rebuild or
+output-reserve probe, `None` (or a removed capability) is a local
+capability-loss error: it never counts as a fit or permits an unchecked SDK
+request.
+
 When `context.request_retention` advertises its optional `hard_fit` keyword,
 each provider-forced rebuild forwards `hard_fit=True`, allowing the context to
 target the provider's requested budget directly. The second rebuild runs only

@@ -40,12 +40,12 @@ def _output_decision(
 
 
 class BudgetProvider(RequestCapturingProvider):
-    def __init__(self, decisions: list[dict[str, int]]) -> None:
+    def __init__(self, decisions: list[object]) -> None:
         super().__init__()
         self.decisions = list(decisions)
         self.budget_calls: list[tuple[object, int]] = []
 
-    def request_budget(self, request, *, context_estimate: int) -> dict[str, int]:
+    def request_budget(self, request, *, context_estimate: int) -> object:
         self.budget_calls.append((request, context_estimate))
         return self.decisions.pop(0)
 
@@ -255,6 +255,27 @@ async def test_fitting_budget_dispatches_the_original_request_once() -> None:
     assert len(provider.requests) == 1
     assert len(provider.budget_calls) == 1
     assert context.request_calls == [([], None)]
+
+
+@pytest.mark.asyncio
+async def test_initial_unavailable_budget_keeps_normal_dispatch_without_budget_event() -> None:
+    context = BudgetContext()
+    provider = BudgetProvider([None])
+    hooks = ScriptedHooks({})
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        hooks,
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    assert len(provider.budget_calls) == 1
+    assert context.request_calls == [([], None)]
+    assert [name for name, _ in hooks.emitted].count("orchestrator:provider_budget") == 0
 
 
 @pytest.mark.asyncio
@@ -597,6 +618,52 @@ async def test_non_decreasing_second_budget_makes_no_extra_rebuild_or_sdk_call()
 
 
 @pytest.mark.asyncio
+async def test_unavailable_budget_after_rebuild_fails_without_sdk_dispatch() -> None:
+    context = BudgetContext()
+    provider = BudgetProvider([_decision(100, 10, 7), None])
+
+    with pytest.raises(ContextLengthError, match="unavailable after reporting a concrete budget"):
+        await StreamingOrchestrator({}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {},
+            ScriptedHooks({}),
+            _retaining_coordinator(context),
+        )
+
+    assert len(provider.budget_calls) == 2
+    assert [budget for _, budget in context.request_calls] == [None, 7]
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_budget_during_output_probe_fails_without_sdk_dispatch() -> None:
+    context = BudgetContext()
+    provider = BudgetProvider(
+        [
+            _output_decision(100, 10, 7, 128_000),
+            _output_decision(50, 10, 1, 128_000),
+            None,
+        ]
+    )
+
+    with pytest.raises(ContextLengthError, match="unavailable after reporting a concrete budget"):
+        await StreamingOrchestrator({}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {},
+            ScriptedHooks({}),
+            _retaining_coordinator(context),
+        )
+
+    assert len(provider.budget_calls) == 3
+    assert [budget for _, budget in context.request_calls] == [None, 7]
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "decision",
     [
@@ -605,7 +672,8 @@ async def test_non_decreasing_second_budget_makes_no_extra_rebuild_or_sdk_call()
         {"estimated_input_tokens": -1, "input_limit_tokens": 10, "context_token_budget": 7},
         {"estimated_input_tokens": float("nan"), "input_limit_tokens": 10, "context_token_budget": 7},
         {"estimated_input_tokens": "1", "input_limit_tokens": 10, "context_token_budget": 7},
-        None,
+        [],
+        0,
     ],
 )
 async def test_malformed_budget_result_fails_before_dispatch(decision) -> None:
@@ -620,6 +688,27 @@ async def test_malformed_budget_result_fails_before_dispatch(decision) -> None:
             {},
             ScriptedHooks({}),
             _retaining_coordinator(context),
+        )
+
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_budget_probe_exception_propagates_without_sdk_dispatch() -> None:
+    class ExplodingBudgetProvider(RequestCapturingProvider):
+        def request_budget(self, request, *, context_estimate: int) -> object:
+            raise RuntimeError("budget probe exploded")
+
+    provider = ExplodingBudgetProvider()
+
+    with pytest.raises(RuntimeError, match="budget probe exploded"):
+        await StreamingOrchestrator({}).execute(
+            "work",
+            BudgetContext(),
+            {"main": provider},
+            {},
+            ScriptedHooks({}),
+            MockCoordinator(),
         )
 
     assert provider.requests == []
@@ -743,12 +832,12 @@ async def test_pending_tool_overlay_is_replayed_once_after_budget_rebuild() -> N
 
 
 class FinalizingBudgetProvider(NRoundToolProvider):
-    def __init__(self, decisions: list[dict[str, int]] | None = None) -> None:
+    def __init__(self, decisions: list[object] | None = None) -> None:
         super().__init__(n_tool_rounds=1)
         self.budget_calls: list[object] = []
         self.decisions = decisions or [_decision(1, 10, 0), _decision(1, 10, 0)]
 
-    def request_budget(self, request, *, context_estimate: int) -> dict[str, int]:
+    def request_budget(self, request, *, context_estimate: int) -> object:
         self.budget_calls.append(request)
         return self.decisions.pop(0)
 
@@ -770,6 +859,86 @@ async def test_finalization_request_is_budget_checked_before_dispatch() -> None:
     assert len(provider.requests) == 2
     assert len(provider.budget_calls) == 2
     assert provider.requests[-1].tool_choice == "none"
+
+
+@pytest.mark.asyncio
+async def test_finalization_initial_unavailable_budget_keeps_normal_dispatch() -> None:
+    context = BudgetContext()
+    provider = FinalizingBudgetProvider([None, None])
+
+    await StreamingOrchestrator({"max_iterations": 1}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {"mock_tool": OneShotTool()},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 2
+    assert len(provider.budget_calls) == 2
+    assert provider.requests[-1].tool_choice == "none"
+
+
+@pytest.mark.asyncio
+async def test_finalization_unavailable_budget_after_rebuild_closes_tool_turn() -> None:
+    context = HardFitBudgetContext()
+    provider = FinalizingBudgetProvider(
+        [_decision(1, 10, 0), _decision(100, 10, 7), None]
+    )
+
+    with pytest.raises(ContextLengthError, match="unavailable after reporting a concrete budget"):
+        await StreamingOrchestrator({"max_iterations": 1}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {"mock_tool": OneShotTool()},
+            ScriptedHooks({}),
+            _retaining_coordinator(context),
+        )
+
+    assert len(provider.requests) == 1
+    assert len(provider.budget_calls) == 3
+    assert context.hard_fit_calls == [False, False, True]
+    messages = await context.get_messages()
+    assert messages[-2]["role"] == "tool"
+    assert messages[-1] == {
+        "role": "assistant",
+        "content": "The final response could not be generated because the context is too long.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_finalization_unavailable_budget_during_output_probe_closes_tool_turn() -> None:
+    context = HardFitBudgetContext()
+    provider = FinalizingBudgetProvider(
+        [
+            _decision(1, 10, 0),
+            _output_decision(100, 10, 7, 128_000),
+            _output_decision(50, 10, 1, 128_000),
+            None,
+        ]
+    )
+
+    with pytest.raises(ContextLengthError, match="unavailable after reporting a concrete budget"):
+        await StreamingOrchestrator({"max_iterations": 1}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {"mock_tool": OneShotTool()},
+            ScriptedHooks({}),
+            _retaining_coordinator(context),
+        )
+
+    assert len(provider.requests) == 1
+    assert len(provider.budget_calls) == 4
+    assert context.hard_fit_calls == [False, False, True]
+    messages = await context.get_messages()
+    assert messages[-2]["role"] == "tool"
+    assert messages[-1] == {
+        "role": "assistant",
+        "content": "The final response could not be generated because the context is too long.",
+    }
 
 
 @pytest.mark.asyncio
