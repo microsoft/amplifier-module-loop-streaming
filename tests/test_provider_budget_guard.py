@@ -1080,6 +1080,7 @@ async def test_mount_discovers_provider_budget_observability_event() -> None:
     )
     events = events_contributor()
     assert events.count("orchestrator:provider_budget") == 1
+    assert events.count("orchestrator:provider_overflow_recovery") == 1
     assert {
         "execution:start",
         "execution:end",
