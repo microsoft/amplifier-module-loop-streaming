@@ -115,6 +115,30 @@ class KwargsBudgetContext(BudgetContext):
         )
 
 
+class PositionalOnlyHardFitBudgetContext(BudgetContext):
+    """Legacy retention callable whose similarly named parameter is positional-only."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hard_fit_values: list[bool] = []
+
+    async def retaining_view(
+        self,
+        hard_fit: bool = False,
+        /,
+        *,
+        provider=None,
+        retain_contents: list[str],
+        token_budget: int | None = None,
+    ) -> list[dict]:
+        self.hard_fit_values.append(hard_fit)
+        return await super().retaining_view(
+            provider=provider,
+            retain_contents=retain_contents,
+            token_budget=token_budget,
+        )
+
+
 class OldSignatureBudgetContext(BudgetContext):
     """Pre-hard-fit retention capability; its call shape is the compatibility check."""
 
@@ -284,6 +308,28 @@ async def test_forced_rebuild_forwards_hard_fit_to_kwargs_retention() -> None:
     )
 
     assert context.hard_fit_calls == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_forced_rebuild_treats_positional_only_hard_fit_as_legacy() -> None:
+    context = PositionalOnlyHardFitBudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    # Passing hard_fit by keyword would raise for this positional-only callable.
+    # Its default on both legacy-shaped calls proves the guard withheld that keyword.
+    assert context.hard_fit_values == [False, False]
+    assert [budget for _, budget in context.request_calls] == [None, 7]
+    assert len(provider.requests) == 1
 
 
 @pytest.mark.asyncio

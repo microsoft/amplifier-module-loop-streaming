@@ -101,8 +101,10 @@ class _RecordingContext(SimpleContextManager):
 class _InMemoryResponses:
     """Completed Responses SDK fake whose usage is derived from received params."""
 
-    def __init__(self) -> None:
+    def __init__(self, hard_fit_calls: list[bool]) -> None:
         self.calls: list[dict] = []
+        self.hard_fit_counts_at_dispatch: list[int] = []
+        self._hard_fit_calls = hard_fit_calls
 
     async def create(self, **params):
         serialized = json.dumps(
@@ -111,6 +113,7 @@ class _InMemoryResponses:
         # Record exactly the SDK payload, and derive usage from that same payload
         # rather than a fixture outcome or a desired compaction size.
         self.calls.append(json.loads(serialized))
+        self.hard_fit_counts_at_dispatch.append(self._hard_fit_calls.count(True))
         input_tokens = len(serialized.encode("utf-8"))
         return SimpleNamespace(
             id=f"fake-{len(self.calls)}",
@@ -127,8 +130,8 @@ class _InMemoryResponses:
 
 
 class _InMemoryClient:
-    def __init__(self) -> None:
-        self.responses = _InMemoryResponses()
+    def __init__(self, hard_fit_calls: list[bool]) -> None:
+        self.responses = _InMemoryResponses(hard_fit_calls)
 
 
 def _payload_text(params: dict) -> str:
@@ -154,7 +157,7 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
     coordinator.register_capability(
         "context.request_retention", context.get_messages_for_request_retaining
     )
-    client = _InMemoryClient()
+    client = _InMemoryClient(context.hard_fit_calls)
     provider = OpenAIProvider(
         api_key="test-key",
         client=client,
@@ -208,12 +211,16 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
     # followed the provider-directed rebuild; the four subsequent calls prove
     # ordinary fetches do not resurrect the canonical bulk history.
     assert len(client.responses.calls) >= 5
+    payloads = [_payload_text(params) for params in client.responses.calls]
+    assert all("REMOVED-BULK-MARKER" not in payload for payload in payloads)
+    first_payload = payloads[0]
+    assert "ORIGINAL-HUMAN" in first_payload
+    assert "REQUIRED-REMINDER" in first_payload
+    assert context.hard_fit_calls[:2] == [False, True]
     assert context.hard_fit_calls.count(True) == 1
-    post_force_payloads = [
-        _payload_text(params) for params in client.responses.calls[1:]
-    ]
+    assert client.responses.hard_fit_counts_at_dispatch == [1] * len(payloads)
+    post_force_payloads = payloads[1:]
     assert post_force_payloads
-    assert all("REMOVED-BULK-MARKER" not in payload for payload in post_force_payloads)
     assert all("ORIGINAL-HUMAN" in payload for payload in post_force_payloads)
     assert "SECOND-HUMAN" in post_force_payloads[-1]
     assert "REQUIRED-REMINDER" in post_force_payloads[-1]

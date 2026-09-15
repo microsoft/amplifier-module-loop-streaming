@@ -3337,7 +3337,10 @@ class StreamingOrchestrator:
                 # legacy behavior rather than claiming hard-fit support.
                 return False
             return any(
-                parameter.name == "hard_fit"
+                (
+                    parameter.name == "hard_fit"
+                    and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+                )
                 or parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in parameters
             )
