@@ -36,6 +36,16 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 - Progressive rendering
 - Interruptible generation
 
+### Provider budget preflight
+
+When a provider exposes the optional synchronous `request_budget` capability,
+the loop checks the fully assembled request before dispatch. An oversized
+request gets exactly one smaller, retention-aware context view; required
+reminders and request-only injections are replayed without running hooks or
+draining pending state again. If that view still cannot fit, the loop raises
+locally and makes no SDK request. Providers without the capability retain the
+existing request and dispatch behavior.
+
 ## Configuration
 
 ```toml
