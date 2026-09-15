@@ -12,7 +12,6 @@ from amplifier_module_loop_streaming import (
 from tests.test_ephemeral_cache_persist_mode import (
     MockContext,
     MockCoordinator,
-    MockResponse,
     NRoundToolProvider,
     OneShotTool,
     RequestCapturingProvider,
@@ -215,7 +214,8 @@ async def test_streaming_dispatch_uses_the_same_budget_rebuild() -> None:
 
     assert len(provider.requests) == 1
     assert len(provider.budget_calls) == 2
-    assert [budget for _, budget in context.request_calls] == [7]
+    # Ordinary initial view, followed by exactly one explicitly budgeted rebuild.
+    assert [budget for _, budget in context.request_calls] == [None, 7]
 
 
 @pytest.mark.asyncio
@@ -258,9 +258,20 @@ async def test_second_oversize_after_one_rebuild_makes_no_sdk_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_budget_result_fails_before_dispatch() -> None:
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"estimated_input_tokens": 1},
+        {"estimated_input_tokens": True, "input_limit_tokens": 10, "context_token_budget": 7},
+        {"estimated_input_tokens": -1, "input_limit_tokens": 10, "context_token_budget": 7},
+        {"estimated_input_tokens": float("nan"), "input_limit_tokens": 10, "context_token_budget": 7},
+        {"estimated_input_tokens": "1", "input_limit_tokens": 10, "context_token_budget": 7},
+        None,
+    ],
+)
+async def test_malformed_budget_result_fails_before_dispatch(decision) -> None:
     context = BudgetContext()
-    provider = BudgetProvider([{"estimated_input_tokens": 1}])  # type: ignore[list-item]
+    provider = BudgetProvider([decision])
 
     with pytest.raises(ContextLengthError, match="invalid budget decision"):
         await StreamingOrchestrator({}).execute(
