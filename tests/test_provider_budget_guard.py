@@ -8,6 +8,8 @@ from amplifier_core import ContextLengthError
 from amplifier_module_loop_streaming import (
     StreamingOrchestrator,
     _replay_request_overlays,
+    _wrap_reminders,
+    mount,
 )
 from tests.test_ephemeral_cache_persist_mode import (
     MockContext,
@@ -72,6 +74,87 @@ class BudgetContext(MockContext):
             if message.get("role") != "assistant"
             or message.get("content") in retain_contents
         ]
+
+
+class HardFitBudgetContext(BudgetContext):
+    """Modern retention capability that records the optional hard-fit signal."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hard_fit_calls: list[bool] = []
+
+    async def retaining_view(
+        self,
+        *,
+        provider=None,
+        retain_contents: list[str],
+        token_budget: int | None = None,
+        hard_fit: bool = False,
+    ) -> list[dict]:
+        self.hard_fit_calls.append(hard_fit)
+        return await super().retaining_view(
+            provider=provider,
+            retain_contents=retain_contents,
+            token_budget=token_budget,
+        )
+
+
+class KwargsBudgetContext(BudgetContext):
+    """Modern retention capability accepting future keywords through ``**kwargs``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hard_fit_calls: list[bool] = []
+
+    async def retaining_view(self, **kwargs) -> list[dict]:
+        self.hard_fit_calls.append(kwargs.get("hard_fit", False))
+        return await super().retaining_view(
+            provider=kwargs["provider"],
+            retain_contents=kwargs["retain_contents"],
+            token_budget=kwargs.get("token_budget"),
+        )
+
+
+class PositionalOnlyHardFitBudgetContext(BudgetContext):
+    """Legacy retention callable whose similarly named parameter is positional-only."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hard_fit_values: list[bool] = []
+
+    async def retaining_view(
+        self,
+        hard_fit: bool = False,
+        /,
+        *,
+        provider=None,
+        retain_contents: list[str],
+        token_budget: int | None = None,
+    ) -> list[dict]:
+        self.hard_fit_values.append(hard_fit)
+        return await super().retaining_view(
+            provider=provider,
+            retain_contents=retain_contents,
+            token_budget=token_budget,
+        )
+
+
+class OldSignatureBudgetContext(BudgetContext):
+    """Pre-hard-fit retention capability; its call shape is the compatibility check."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.legacy_retention_calls: list[tuple[object, list[str], int | None]] = []
+
+    async def retaining_view(
+        self, *, provider=None, retain_contents: list[str], token_budget: int | None = None
+    ) -> list[dict]:
+        self.legacy_retention_calls.append((provider, list(retain_contents), token_budget))
+        return await super().retaining_view(
+            provider=provider,
+            retain_contents=retain_contents,
+            token_budget=token_budget,
+        )
 
 
 def _retaining_coordinator(context: BudgetContext) -> MockCoordinator:
@@ -139,8 +222,8 @@ async def test_tail_mode_without_budget_capability_stays_view_only() -> None:
         _retaining_coordinator(context),
     )
 
-    assert context.legacy_calls == [None]
-    assert context.request_calls == []
+    assert context.legacy_calls == []
+    assert context.request_calls == [([], None)]
     assert len(provider.requests) == 1
     assert "\n".join(message.content for message in provider.requests[0].messages).count(body) == 1
     assert [name for name, _ in hooks.emitted].count("provider:request") == 1
@@ -187,6 +270,158 @@ async def test_one_smaller_retained_view_is_rechecked_and_dispatches_once() -> N
     request_bodies = [message.content for message in provider.requests[0].messages]
     assert retained_body in "\n".join(request_bodies)
     assert "history" not in "\n".join(request_bodies)
+
+
+@pytest.mark.asyncio
+async def test_forced_normal_rebuild_forwards_hard_fit_only_to_modern_retention() -> None:
+    context = HardFitBudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    # The first ordinary request remains legacy/default behavior; exactly the
+    # forced provider-directed rebuild opts into hard fitting.
+    assert context.hard_fit_calls == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_forced_rebuild_forwards_hard_fit_to_kwargs_retention() -> None:
+    context = KwargsBudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert context.hard_fit_calls == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_forced_rebuild_treats_positional_only_hard_fit_as_legacy() -> None:
+    context = PositionalOnlyHardFitBudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    # Passing hard_fit by keyword would raise for this positional-only callable.
+    # Its default on both legacy-shaped calls proves the guard withheld that keyword.
+    assert context.hard_fit_values == [False, False]
+    assert [budget for _, budget in context.request_calls] == [None, 7]
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_forced_rebuild_preserves_old_retention_call_signature() -> None:
+    context = OldSignatureBudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert context.legacy_retention_calls == [
+        (provider, [], None),
+        (provider, [], 7),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forced_rebuild_uses_generic_legacy_context_when_retention_is_absent() -> None:
+    context = BudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    await StreamingOrchestrator({}).execute(
+        "work", context, {"main": provider}, {}, ScriptedHooks({}), MockCoordinator()
+    )
+
+    assert context.request_calls == []
+    assert context.legacy_calls == [None, 7]
+
+
+@pytest.mark.asyncio
+async def test_signature_inspection_failure_keeps_safe_legacy_retention_call(monkeypatch) -> None:
+    context = HardFitBudgetContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7), _decision(9, 10, 0)])
+
+    def unavailable_signature(_callable):
+        raise ValueError("signature unavailable")
+
+    monkeypatch.setattr(
+        "amplifier_module_loop_streaming.inspect.signature", unavailable_signature
+    )
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert context.hard_fit_calls == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_retention_type_error_is_not_mistaken_for_a_signature_mismatch() -> None:
+    class ExplodingHardFitContext(HardFitBudgetContext):
+        async def retaining_view(self, **kwargs) -> list[dict]:
+            self.hard_fit_calls.append(kwargs.get("hard_fit", False))
+            if kwargs.get("hard_fit"):
+                raise TypeError("retention implementation exploded")
+            return await BudgetContext.retaining_view(
+                self,
+                provider=kwargs["provider"],
+                retain_contents=kwargs["retain_contents"],
+                token_budget=kwargs.get("token_budget"),
+            )
+
+    context = ExplodingHardFitContext()
+    context._messages.append({"role": "assistant", "content": "history" * 200})
+    provider = BudgetProvider([_decision(100, 10, 7)])
+
+    with pytest.raises(TypeError, match="retention implementation exploded"):
+        await StreamingOrchestrator({}).execute(
+            "work",
+            context,
+            {"main": provider},
+            {},
+            ScriptedHooks({}),
+            _retaining_coordinator(context),
+        )
+
+    assert context.hard_fit_calls == [False, True]
+    assert provider.requests == []
 
 
 class StreamingBudgetProvider(BudgetProvider):
@@ -309,8 +544,8 @@ async def test_budget_replay_keeps_tail_overlay_once_without_rerunning_hooks() -
     assert "\n".join(request_bodies).count(body) == 1
     provider_requests = [name for name, _ in hooks.emitted if name == "provider:request"]
     assert provider_requests == ["provider:request"]
-    assert context.legacy_calls == [None]
-    assert [budget for _, budget in context.request_calls] == [7]
+    assert context.legacy_calls == []
+    assert [budget for _, budget in context.request_calls] == [None, 7]
 
 
 @pytest.mark.asyncio
@@ -337,8 +572,8 @@ async def test_budget_replay_keeps_pre_user_tail_overlay_in_its_original_positio
     assert request_messages[body_index + 1].content == "work"
     assert sum(body in message.content for message in request_messages) == 1
     assert [name for name, _ in hooks.emitted].count("provider:request") == 1
-    assert context.legacy_calls == [None]
-    assert [budget for _, budget in context.request_calls] == [7]
+    assert context.legacy_calls == []
+    assert [budget for _, budget in context.request_calls] == [None, 7]
 
 
 def test_replayed_pending_overlays_keep_tool_adjacency_and_bodies_once() -> None:
@@ -429,6 +664,90 @@ async def test_finalization_request_is_budget_checked_before_dispatch() -> None:
     assert len(provider.requests) == 2
     assert len(provider.budget_calls) == 2
     assert provider.requests[-1].tool_choice == "none"
+
+
+@pytest.mark.asyncio
+async def test_forced_finalization_rebuild_forwards_hard_fit_only_at_rebuild() -> None:
+    context = HardFitBudgetContext()
+    provider = FinalizingBudgetProvider(
+        [_decision(1, 10, 0), _decision(100, 10, 7), _decision(1, 10, 0)]
+    )
+
+    await StreamingOrchestrator({"max_iterations": 1}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {"mock_tool": OneShotTool()},
+        ScriptedHooks({}),
+        _retaining_coordinator(context),
+    )
+
+    assert context.hard_fit_calls == [False, False, True]
+
+
+class AnthropicStyleAssemblyProvider(RequestCapturingProvider):
+    """Non-budget control: preserve ordinary assembled requests for other providers."""
+
+    name = "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_non_budget_anthropic_style_provider_keeps_ordinary_request_assembly() -> None:
+    context = BudgetContext()
+    provider = AnthropicStyleAssemblyProvider()
+    body = "<system-reminder>ASSEMBLY-CONTROL</system-reminder>"
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        ScriptedHooks({"provider:request": _injection(body)}),
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    assert context.request_calls == [([_wrap_reminders(body, tail=False)], None)]
+    assert body in "\n".join(message.content for message in provider.requests[0].messages)
+
+
+class ContributorSpy:
+    """Mount-level coordinator double retaining real contributor callables."""
+
+    def __init__(self) -> None:
+        self.contributors: list[tuple[str, str, object]] = []
+        self.capabilities: dict[str, object] = {}
+
+    def register_contributor(self, channel: str, name: str, callback) -> None:
+        self.contributors.append((channel, name, callback))
+
+    async def mount(self, _name: str, _module: object) -> None:
+        pass
+
+    def register_capability(self, name: str, capability: object) -> None:
+        self.capabilities[name] = capability
+
+
+@pytest.mark.asyncio
+async def test_mount_discovers_provider_budget_observability_event() -> None:
+    coordinator = ContributorSpy()
+
+    await mount(coordinator, {})
+
+    events_contributor = next(
+        callback
+        for channel, name, callback in coordinator.contributors
+        if (channel, name) == ("observability.events", "loop-streaming")
+    )
+    events = events_contributor()
+    assert events.count("orchestrator:provider_budget") == 1
+    assert {
+        "execution:start",
+        "execution:end",
+        "orchestrator:steering_injected",
+        "orchestrator:goal_progress",
+        "orchestrator:budget_warning",
+    }.issubset(events)
 
 
 @pytest.mark.asyncio

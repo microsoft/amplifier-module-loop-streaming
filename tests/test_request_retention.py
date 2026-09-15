@@ -268,7 +268,9 @@ async def test_missing_retention_capability_warns_once_and_tail_remains_unmodifi
         ScriptedHooks({"provider:request": injection(body)}),
         coordinator_for(tail_context),
     )
-    assert tail_context.requirements == []
+    # A mounted retention capability owns every request view, even in explicit
+    # tail mode; tail still remains view-only and persists nothing.
+    assert tail_context.requirements == [[]]
     assert persisted(tail_context) == []
     assert reminder_contents(tail_provider.requests[0]) == [_wrap_reminders(body, tail=False)]
 

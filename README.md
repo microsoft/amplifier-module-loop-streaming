@@ -46,6 +46,16 @@ draining pending state again. If that view still cannot fit, the loop raises
 locally and makes no SDK request. Providers without the capability retain the
 existing request and dispatch behavior.
 
+When `context.request_retention` advertises its optional `hard_fit` keyword,
+that one provider-forced rebuild forwards `hard_fit=True`, allowing the context
+to target the provider's requested budget directly. Older retention
+capabilities, uninspectable dynamic callables, and the generic context fallback
+keep their existing `provider`/`retain_contents`/`token_budget` assembly; the
+second preflight and provider's final payload guard remain the safety boundary.
+The existing `orchestrator:provider_budget` event exposes each preflight's
+attempt, result, estimate, allowance, and requested context budget to mounted
+observability consumers.
+
 ## Configuration
 
 ```toml
