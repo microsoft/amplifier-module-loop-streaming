@@ -8,6 +8,7 @@ __amplifier_module_type__ = "orchestrator"
 
 import asyncio
 import fnmatch
+import inspect
 import json
 import logging
 import re
@@ -746,6 +747,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "orchestrator:steering_injected",  # When a steer message is injected mid-turn
             "orchestrator:goal_progress",  # /goal auto-continue loop progress (see docs/designs/goal-command.md)
             "orchestrator:budget_warning",  # Layer 1 call budget at budget_warn_ratio (see _execute_stream)
+            "orchestrator:provider_budget",  # Provider request-budget preflight result (see _execute_stream)
         ],
     )
 
@@ -3318,26 +3320,44 @@ class StreamingOrchestrator:
             )
             self._retention_capability_warned = True
 
+        def retention_accepts_hard_fit() -> bool:
+            """Whether the optional retention capability supports ``hard_fit``.
+
+            The capability is module-owned and evolves independently of Core.
+            Signature inspection is deliberately separate from invocation:
+            an implementation ``TypeError`` must reach the caller rather than
+            being mistaken for an old capability and invoked a second time.
+            """
+            if retaining_getter is None:
+                return False
+            try:
+                parameters = inspect.signature(retaining_getter).parameters.values()
+            except (TypeError, ValueError):
+                # Some dynamic callables cannot expose a signature. Keep their
+                # legacy behavior rather than claiming hard-fit support.
+                return False
+            return any(
+                parameter.name == "hard_fit"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+
         async def request_messages(
-            retain_contents: list[str], *, token_budget: int | None = None
+            retain_contents: list[str],
+            *,
+            token_budget: int | None = None,
+            hard_fit: bool = False,
         ):
-            if retaining_getter is not None and (
-                self._ephemeral_injection_mode == "persist" or token_budget is not None
-            ):
+            if retaining_getter is not None:
                 kwargs: dict[str, Any] = {
                     "provider": provider,
                     "retain_contents": retain_contents,
                 }
                 if token_budget is not None:
                     kwargs["token_budget"] = token_budget
-                try:
-                    return await retaining_getter(**kwargs)
-                except TypeError as exc:
-                    if token_budget is not None:
-                        raise ContextLengthError(
-                            "context.request_retention does not accept token_budget"
-                        ) from exc
-                    raise
+                if hard_fit and retention_accepts_hard_fit():
+                    kwargs["hard_fit"] = True
+                return await retaining_getter(**kwargs)
             kwargs = {"provider": provider}
             if token_budget is not None:
                 kwargs["token_budget"] = token_budget
@@ -4021,7 +4041,9 @@ class StreamingOrchestrator:
             if smaller_context_budget is not None:
                 rebuilt_base_messages = list(
                     await request_messages(
-                        retained_contents, token_budget=smaller_context_budget
+                        retained_contents,
+                        token_budget=smaller_context_budget,
+                        hard_fit=True,
                     )
                 )
                 rebuilt_messages = (
@@ -4706,6 +4728,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         await request_messages(
                             final_retained_contents,
                             token_budget=smaller_context_budget,
+                            hard_fit=True,
                         )
                     )
                     rebuilt_messages = (
