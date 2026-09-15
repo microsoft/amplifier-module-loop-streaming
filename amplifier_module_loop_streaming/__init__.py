@@ -13,10 +13,17 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
-from typing import Any, ClassVar, Mapping
+from collections.abc import AsyncIterator, Mapping
+from functools import partial
+from typing import Any, ClassVar
 
-from amplifier_core import ContextLengthError, HookRegistry, HookResult, ModuleCoordinator, ToolResult
+from amplifier_core import (
+    ContextLengthError,
+    HookRegistry,
+    HookResult,
+    ModuleCoordinator,
+    ToolResult,
+)
 from amplifier_core.events import (
     CANCEL_COMPLETED,
     CANCEL_REQUESTED,
@@ -3689,6 +3696,13 @@ class StreamingOrchestrator:
             if accepts_named_request_options(recovery):
                 recovery_kwargs["request_options"] = request_options
             decision = recovery(failed_request, error, **recovery_kwargs)
+            if decision is None:
+                logger.warning("Provider overflow recovery unavailable for this error")
+                await hooks.emit(
+                    "orchestrator:provider_overflow_recovery",
+                    {"result": "unavailable"},
+                )
+                return None
             required = (
                 "estimated_input_tokens",
                 "input_limit_tokens",
@@ -4422,10 +4436,10 @@ class StreamingOrchestrator:
                         hooks,
                         coordinator,
                         provider_name=provider_name,
-                        recover_overflow=lambda error: recover_context_overflow(
+                        recover_overflow=partial(
+                            recover_context_overflow,
                             chat_request,
-                            error,
-                            dispatch_base_messages,
+                            base_messages=dispatch_base_messages,
                             retain_contents=retained_contents,
                             turn_start_view_block=replay_turn_start_block,
                             request_injection=replay_request_injection,

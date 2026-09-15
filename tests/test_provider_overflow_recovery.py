@@ -13,7 +13,10 @@ from tests.test_ephemeral_cache_persist_mode import (
     ScriptedHooks,
     ToolCallStub,
 )
-from tests.test_provider_budget_guard import HardFitBudgetContext, _retaining_coordinator
+from tests.test_provider_budget_guard import (
+    HardFitBudgetContext,
+    _retaining_coordinator,
+)
 
 
 def _fit(cap: int = 128) -> dict[str, int]:
@@ -140,10 +143,11 @@ async def test_kwargs_only_budget_and_recovery_keep_legacy_call_shape() -> None:
         _overflow(cap=129),
     ],
 )
-async def test_invalid_or_unsafe_recovery_feedback_never_retries(feedback) -> None:
+async def test_unavailable_invalid_or_unsafe_recovery_feedback_never_retries(feedback) -> None:
     context = HardFitBudgetContext()
     provider = RecoveringProvider()
     provider.recovery = feedback
+    hooks = ScriptedHooks({})
 
     with pytest.raises(ContextLengthError, match="provider rejected input"):
         await StreamingOrchestrator({}).execute(
@@ -151,12 +155,17 @@ async def test_invalid_or_unsafe_recovery_feedback_never_retries(feedback) -> No
             context,
             {"main": provider},
             {},
-            ScriptedHooks({}),
+            hooks,
             _retaining_coordinator(context),
         )
 
     assert provider.complete_calls == 1
     assert context.hard_fit_calls == [False]
+    assert [
+        data["result"]
+        for name, data in hooks.emitted
+        if name == "orchestrator:provider_overflow_recovery"
+    ] == ["unavailable" if feedback is None else "invalid"]
 
 
 @pytest.mark.asyncio
