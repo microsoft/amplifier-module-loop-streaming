@@ -143,9 +143,10 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
     hooks = _StableReminderHooks()
     coordinator = _Coordinator(hooks)
     context = _RecordingContext(
-        # Initial ordinary assembly is deliberately below this context's own
-        # threshold. The provider's serialized-payload preflight forces the
-        # first fit, exercising the optional hard-fit seam.
+        # The character-based ordinary estimate stays below context-simple's
+        # real provider-derived budget; max_tokens is only a fallback here.
+        # Each supplementary Han character serializes as four UTF-8 bytes, so
+        # the provider's payload preflight forces the first hard-fit rebuild.
         max_tokens=500_000,
         compact_threshold=0.99,
         target_usage=0.50,
@@ -171,7 +172,7 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
     )
     loop = StreamingOrchestrator({})
 
-    bulk = "REMOVED-BULK-MARKER:" + ("x" * 800_000)
+    bulk = "REMOVED-BULK-MARKER:" + ("\U00020000" * 40_000)
     await context.add_message({"role": "assistant", "content": bulk})
 
     await loop.execute(
