@@ -213,7 +213,7 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
         # The character-based ordinary estimate stays below context-simple's
         # real provider-derived budget; max_tokens is only a fallback here.
         # Each supplementary Han character serializes as four UTF-8 bytes, so
-        # the provider's payload preflight forces the first hard-fit rebuild.
+        # the calibrated provider preflight forces the first hard-fit rebuild.
         max_tokens=500_000,
         compact_threshold=0.99,
         target_usage=0.50,
@@ -238,6 +238,18 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
         },
     )
     loop = StreamingOrchestrator({})
+
+    # Cold byte estimates no longer force compaction. Establish calibration
+    # through a real completed transport response before testing warm hard fit.
+    await provider.complete(
+        ChatRequest(
+            messages=[Message(role="user", content="CALIBRATION-ONLY-CONTROL")],
+            max_output_tokens=1024,
+        )
+    )
+    assert len(client.responses.calls) == 1
+    assert client.responses.hard_fit_counts_at_dispatch == [0]
+    assert "gpt-5-mini" in provider._budget_calibration
 
     bulk = "REMOVED-BULK-MARKER:" + ("\U00020000" * 40_000)
     await context.add_message({"role": "assistant", "content": bulk})
@@ -275,18 +287,18 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
             prompt, context, {"openai": provider}, {}, hooks, coordinator
         )
 
-    # Every call in this list reached the fake SDK. The first accepted call
-    # followed the provider-directed rebuild; the four subsequent calls prove
-    # ordinary fetches do not resurrect the canonical bulk history.
-    assert len(client.responses.calls) >= 5
-    payloads = [_payload_text(params) for params in client.responses.calls]
+    # Exclude only the explicit calibration control above. The first workload
+    # call followed the provider-directed rebuild; the four subsequent calls
+    # prove ordinary fetches do not resurrect the canonical bulk history.
+    assert len(client.responses.calls) >= 6
+    payloads = [_payload_text(params) for params in client.responses.calls[1:]]
     assert all("REMOVED-BULK-MARKER" not in payload for payload in payloads)
     first_payload = payloads[0]
     assert "ORIGINAL-HUMAN" in first_payload
     assert "REQUIRED-REMINDER" in first_payload
     assert context.hard_fit_calls[:2] == [False, True]
     assert context.hard_fit_calls.count(True) == 1
-    assert client.responses.hard_fit_counts_at_dispatch == [1] * len(payloads)
+    assert client.responses.hard_fit_counts_at_dispatch[1:] == [1] * len(payloads)
     post_force_payloads = payloads[1:]
     assert post_force_payloads
     assert all("ORIGINAL-HUMAN" in payload for payload in post_force_payloads)
