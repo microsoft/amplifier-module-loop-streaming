@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 
-from amplifier_core import HookRegistry, HookResult, ModuleCoordinator, ToolResult
+from amplifier_core import ContextLengthError, HookRegistry, HookResult, ModuleCoordinator, ToolResult
 from amplifier_core.events import (
     CANCEL_COMPLETED,
     CANCEL_REQUESTED,
@@ -383,6 +383,70 @@ def _last_real_user_index(msgs: list[dict[str, Any]]) -> int | None:
             continue
         return i
     return None
+
+
+def _replay_request_overlays(
+    base_messages: list[dict[str, Any]],
+    *,
+    turn_start_view_block: str | None,
+    request_injection: tuple[str, bool] | None,
+    pending_injections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply already-decided request-only injections to a fresh context view.
+
+    This is deliberately pure: a budget retry must not re-emit hooks or drain
+    pending state a second time.  Callers snapshot the plan before the normal
+    assembly consumes it, then replay the same placement against one smaller
+    context view.
+    """
+    messages = list(base_messages)
+    if turn_start_view_block is not None:
+        entry = {
+            "role": "user",
+            "content": turn_start_view_block,
+            "metadata": {"ephemeral": True, "reminder_placement": "pre_user"},
+        }
+        splice_idx = _last_real_user_index(messages)
+        if splice_idx is None:
+            messages.append(entry)
+        else:
+            messages.insert(splice_idx, entry)
+
+    def append_injection(body: str, append_to_tool_result: bool) -> None:
+        block = _wrap_reminders(body, tail=True)
+        if append_to_tool_result and messages and messages[-1].get("role") == "tool":
+            last = messages[-1]
+            messages[-1] = {
+                **last,
+                "content": f"{last.get('content', '')}\n\n{block}",
+            }
+            return
+        messages.append(
+            {
+                "role": "user",
+                "content": block,
+                "metadata": {"ephemeral": True, "reminder_placement": "tail"},
+            }
+        )
+
+    if request_injection is not None:
+        append_injection(*request_injection)
+
+    pending_to_tool_result = [
+        injection["content"]
+        for injection in pending_injections
+        if injection.get("content") and injection.get("append_to_last_tool_result")
+    ]
+    pending_to_message = [
+        injection["content"]
+        for injection in pending_injections
+        if injection.get("content") and not injection.get("append_to_last_tool_result")
+    ]
+    if pending_to_tool_result:
+        append_injection("\n\n".join(pending_to_tool_result), True)
+    if pending_to_message:
+        append_injection("\n\n".join(pending_to_message), False)
+    return messages
 
 
 class ConversationProviderPin:
@@ -3238,7 +3302,7 @@ class StreamingOrchestrator:
         """
         retaining_getter = None
         get_capability = getattr(coordinator, "get_capability", None)
-        if self._ephemeral_injection_mode == "persist" and callable(get_capability):
+        if callable(get_capability):
             candidate = get_capability("context.request_retention")
             if callable(candidate):
                 retaining_getter = candidate
@@ -3254,12 +3318,37 @@ class StreamingOrchestrator:
             )
             self._retention_capability_warned = True
 
-        async def request_messages(retain_contents: list[str]):
-            if retaining_getter is not None:
-                return await retaining_getter(
-                    provider=provider, retain_contents=retain_contents
-                )
-            return await context.get_messages_for_request(provider=provider)
+        async def request_messages(
+            retain_contents: list[str], *, token_budget: int | None = None
+        ):
+            if retaining_getter is not None and (
+                self._ephemeral_injection_mode == "persist" or token_budget is not None
+            ):
+                kwargs: dict[str, Any] = {
+                    "provider": provider,
+                    "retain_contents": retain_contents,
+                }
+                if token_budget is not None:
+                    kwargs["token_budget"] = token_budget
+                try:
+                    return await retaining_getter(**kwargs)
+                except TypeError as exc:
+                    if token_budget is not None:
+                        raise ContextLengthError(
+                            "context.request_retention does not accept token_budget"
+                        ) from exc
+                    raise
+            kwargs = {"provider": provider}
+            if token_budget is not None:
+                kwargs["token_budget"] = token_budget
+            try:
+                return await context.get_messages_for_request(**kwargs)
+            except TypeError as exc:
+                if token_budget is not None:
+                    raise ContextLengthError(
+                        "context request getter does not accept token_budget"
+                    ) from exc
+                raise
 
         turn_start_retained_contents: list[str] = []
         # Emit and process prompt submit (allows hooks to inject context before processing)
@@ -3319,6 +3408,7 @@ class StreamingOrchestrator:
             if prov is provider:
                 provider_name = name
                 break
+        budget_capable = callable(getattr(provider, "request_budget", None))
 
         # Pure observability. `basis` names WHY this provider won:
         # "pinned" when the conversation-scope pin decided it (capability
@@ -3347,6 +3437,71 @@ class StreamingOrchestrator:
                 "scope": "conversation",
             },
         )
+
+        def build_chat_request(
+            message_dicts: list[dict[str, Any]], *, tool_choice: str | None = None
+        ) -> ChatRequest:
+            tools_list = [_build_tool_spec(tool) for tool in tools.values()] if tools else None
+            kwargs: dict[str, Any] = {
+                "messages": [Message(**message) for message in message_dicts],
+                "tools": tools_list,
+                "reasoning_effort": self.config.get("reasoning_effort"),
+            }
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+            return ChatRequest(
+                **kwargs
+            )
+
+        async def check_request_budget(
+            request: ChatRequest,
+            base_messages: list[dict[str, Any]],
+            *,
+            attempt: int,
+        ) -> int | None:
+            """Return one requested smaller context budget, or ``None`` when it fits."""
+            request_budget = getattr(provider, "request_budget", None)
+            if not budget_capable or not callable(request_budget):
+                return None
+            context_estimate = sum(len(str(message)) // 4 for message in base_messages)
+            decision = request_budget(request, context_estimate=context_estimate)
+            required = (
+                "estimated_input_tokens",
+                "input_limit_tokens",
+                "context_token_budget",
+            )
+            if not isinstance(decision, dict) or any(
+                isinstance(decision.get(key), bool)
+                or not isinstance(decision.get(key), int)
+                or decision[key] < 0
+                for key in required
+            ):
+                raise ContextLengthError(
+                    "Provider request_budget returned an invalid budget decision"
+                )
+
+            estimated = decision["estimated_input_tokens"]
+            allowance = decision["input_limit_tokens"]
+            target = decision["context_token_budget"]
+            fits = estimated <= allowance
+            await hooks.emit(
+                "orchestrator:provider_budget",
+                {
+                    "attempt": attempt,
+                    "context_estimate": context_estimate,
+                    "estimated_input_tokens": estimated,
+                    "input_limit_tokens": allowance,
+                    "context_token_budget": target,
+                    "result": "fits" if fits else "oversized",
+                },
+            )
+            if fits:
+                return None
+            if target <= 0:
+                raise ContextLengthError(
+                    "Provider request exceeds its input budget and cannot retain a smaller context"
+                )
+            return target
 
         # --- Turn-start reminder assembly (reminder-redesign-spec.md,
         # W1.2, Option D). Hoists iteration 1's provider:request emit to
@@ -3581,11 +3736,16 @@ class StreamingOrchestrator:
             retained_contents = (
                 list(turn_start_retained_contents) if iteration == 1 else []
             )
+            # Admit a persistent provider injection before requesting the view.
+            # That keeps the injected body in this request (and, on a budget
+            # rebuild, in the one smaller retained view) without a second
+            # destructive retention read.
             if (
                 result.action == "inject_context"
                 and result.ephemeral
                 and result.context_injection
                 and retaining_getter is not None
+                and self._ephemeral_injection_mode == "persist"
             ):
                 content, _ = await self._persist_reminder(
                     context,
@@ -3598,6 +3758,25 @@ class StreamingOrchestrator:
             # Pass provider for dynamic budget calculation based on model's context window
             message_dicts = await request_messages(retained_contents)
             message_dicts = list(message_dicts)  # Convert to list for modification
+            base_message_dicts = list(message_dicts)
+            replay_turn_start_block = (
+                self._turn_start_view_block
+                if self._ephemeral_injection_mode == "tail" and iteration == 1
+                else None
+            )
+            replay_request_injection = (
+                (result.context_injection, result.append_to_last_tool_result)
+                if self._ephemeral_injection_mode == "tail"
+                and result.action == "inject_context"
+                and result.ephemeral
+                and result.context_injection
+                else None
+            )
+            replay_pending_injections = (
+                list(self._pending_ephemeral_injections)
+                if self._ephemeral_injection_mode == "tail"
+                else []
+            )
 
             # Splice the turn-start reminder block into the request VIEW
             # (reminder-redesign-spec.md, W1.2). Only reachable when
@@ -3667,6 +3846,7 @@ class StreamingOrchestrator:
                         )
                         if changed:
                             message_dicts = list(await request_messages([]))
+                            base_message_dicts = list(message_dicts)
                 # Check if we should append to last tool result
                 elif result.append_to_last_tool_result and len(message_dicts) > 0:
                     last_msg = message_dicts[-1]
@@ -3771,6 +3951,7 @@ class StreamingOrchestrator:
                             message_dicts = list(
                                 await request_messages(retained_contents)
                             )
+                            base_message_dicts = list(message_dicts)
                 else:
                     if pending_to_tool_result:
                         tool_result_block = _wrap_reminders(
@@ -3825,26 +4006,44 @@ class StreamingOrchestrator:
                 # Clear pending injections after applying (both modes)
                 self._pending_ephemeral_injections = []
 
-            # Convert dicts to ChatRequest for provider
-            messages_objects = [Message(**msg) for msg in message_dicts]
-
-            # Convert tools to ToolSpec format for ChatRequest
-            tools_list = None
-            if tools:
-                tools_list = [_build_tool_spec(t) for t in tools.values()]
-
-            chat_request = ChatRequest(
-                messages=messages_objects,
-                tools=tools_list,
-                reasoning_effort=self.config.get("reasoning_effort"),
-            )
+            chat_request = build_chat_request(message_dicts)
             logger.info(
-                f"[ORCHESTRATOR] ChatRequest created with {len(tools_list) if tools_list else 0} tools"
+                f"[ORCHESTRATOR] ChatRequest created with {len(tools) if tools else 0} tools"
             )
-            if tools_list:
+            if tools:
                 logger.debug(
-                    f"[ORCHESTRATOR] Tool names: {[t.name for t in tools_list]}"
+                    f"[ORCHESTRATOR] Tool names: {[t.name for t in tools.values()]}"
                 )
+
+            smaller_context_budget = await check_request_budget(
+                chat_request, base_message_dicts, attempt=0
+            )
+            if smaller_context_budget is not None:
+                rebuilt_base_messages = list(
+                    await request_messages(
+                        retained_contents, token_budget=smaller_context_budget
+                    )
+                )
+                rebuilt_messages = (
+                    _replay_request_overlays(
+                        rebuilt_base_messages,
+                        turn_start_view_block=replay_turn_start_block,
+                        request_injection=replay_request_injection,
+                        pending_injections=replay_pending_injections,
+                    )
+                    if self._ephemeral_injection_mode == "tail"
+                    else rebuilt_base_messages
+                )
+                rebuilt_request = build_chat_request(rebuilt_messages)
+                if (
+                    await check_request_budget(
+                        rebuilt_request, rebuilt_base_messages, attempt=1
+                    )
+                ) is not None:
+                    raise ContextLengthError(
+                        "Provider request remains over budget after one context rebuild"
+                    )
+                chat_request = rebuilt_request
 
             # Apply rate limit delay before provider call
             await self._apply_rate_limit_delay(hooks, iteration)
@@ -4381,8 +4580,25 @@ class StreamingOrchestrator:
             # Current provider-hook requirements and a queued tool-post
             # injection must survive the bounded finalization assembly too.
             final_retained_contents: list[str] = []
+            final_replay_request_injection = (
+                (
+                    finalization_result.context_injection,
+                    finalization_result.append_to_last_tool_result,
+                )
+                if self._ephemeral_injection_mode == "tail"
+                and finalization_result.action == "inject_context"
+                and finalization_result.ephemeral
+                and finalization_result.context_injection
+                else None
+            )
+            final_replay_pending_injections = (
+                list(self._pending_ephemeral_injections)
+                if self._ephemeral_injection_mode == "tail"
+                else []
+            )
             if (
                 retaining_getter is not None
+                and self._ephemeral_injection_mode == "persist"
                 and finalization_result.action == "inject_context"
                 and finalization_result.ephemeral
                 and finalization_result.context_injection
@@ -4394,7 +4610,11 @@ class StreamingOrchestrator:
                     verify_admitted=True,
                 )
                 final_retained_contents.append(content)
-            if retaining_getter is not None and self._pending_ephemeral_injections:
+            if (
+                retaining_getter is not None
+                and self._ephemeral_injection_mode == "persist"
+                and self._pending_ephemeral_injections
+            ):
                 pending_body = "\n\n".join(
                     injection["content"]
                     for injection in self._pending_ephemeral_injections
@@ -4406,7 +4626,37 @@ class StreamingOrchestrator:
                     )
                     final_retained_contents.append(content)
                 self._pending_ephemeral_injections.clear()
+            if (
+                retaining_getter is None
+                and self._ephemeral_injection_mode == "persist"
+            ):
+                if (
+                    finalization_result.action == "inject_context"
+                    and finalization_result.ephemeral
+                    and finalization_result.context_injection
+                ):
+                    await self._persist_reminder(
+                        context, finalization_result.context_injection, tail=True
+                    )
+                if self._pending_ephemeral_injections:
+                    pending_body = "\n\n".join(
+                        injection["content"]
+                        for injection in self._pending_ephemeral_injections
+                        if injection.get("content")
+                    )
+                    if pending_body:
+                        await self._persist_reminder(context, pending_body, tail=True)
+                    self._pending_ephemeral_injections.clear()
             message_dicts = list(await request_messages(final_retained_contents))
+            base_message_dicts = list(message_dicts)
+            if self._ephemeral_injection_mode == "tail":
+                message_dicts = _replay_request_overlays(
+                    message_dicts,
+                    turn_start_view_block=None,
+                    request_injection=final_replay_request_injection,
+                    pending_injections=final_replay_pending_injections,
+                )
+                self._pending_ephemeral_injections.clear()
             # The finalization hook and context assembly both await. Check
             # again before contacting the provider so a concurrent
             # cancellation cannot buy an unrequested final provider call.
@@ -4422,8 +4672,7 @@ class StreamingOrchestrator:
             # W5 (amplifier-module-provider-anthropic), an unstamped
             # trailing message here would be treated as stable and could
             # take a cache breakpoint on regenerated content.
-            message_dicts.append(
-                {
+            finalization_overlay = {
                     "role": "user",
                     "content": _wrap_reminders(
                         """<system-reminder source="orchestrator-loop-limit">
@@ -4437,27 +4686,52 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         "ephemeral": True,
                         "reminder_placement": "tail",
                     },
-                }
-            )
+            }
+            message_dicts.append(finalization_overlay)
 
             try:
-                # Convert dicts to ChatRequest
-                messages_objects = [Message(**msg) for msg in message_dicts]
-
                 # Preserve the normal declarations, including provider-native
                 # specifications, so any assistant tool call and paired tool
                 # result in the existing transcript stay valid. The portable
                 # choice prevents new calls; this finalization path never
                 # parses or dispatches a tool response.
-                tools_list = (
-                    [_build_tool_spec(tool) for tool in tools.values()] if tools else None
+                max_iter_chat_request = build_chat_request(
+                    message_dicts, tool_choice="none"
                 )
-                max_iter_chat_request = ChatRequest(
-                    messages=messages_objects,
-                    tools=tools_list,
-                    tool_choice="none",
-                    reasoning_effort=self.config.get("reasoning_effort"),
+                smaller_context_budget = await check_request_budget(
+                    max_iter_chat_request, base_message_dicts, attempt=0
                 )
+                if smaller_context_budget is not None:
+                    rebuilt_base_messages = list(
+                        await request_messages(
+                            final_retained_contents,
+                            token_budget=smaller_context_budget,
+                        )
+                    )
+                    rebuilt_messages = (
+                        _replay_request_overlays(
+                            rebuilt_base_messages,
+                            turn_start_view_block=None,
+                            request_injection=final_replay_request_injection,
+                            pending_injections=final_replay_pending_injections,
+                        )
+                        if self._ephemeral_injection_mode == "tail"
+                        else list(rebuilt_base_messages)
+                    )
+                    rebuilt_messages.append(finalization_overlay)
+                    rebuilt_request = build_chat_request(
+                        rebuilt_messages, tool_choice="none"
+                    )
+                    if (
+                        await check_request_budget(
+                            rebuilt_request, rebuilt_base_messages, attempt=1
+                        )
+                    ) is not None:
+                        raise ContextLengthError(
+                            "Provider finalization request remains over budget "
+                            "after one context rebuild"
+                        )
+                    max_iter_chat_request = rebuilt_request
 
                 kwargs = {}
                 if self.extended_thinking:
@@ -4538,6 +4812,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 await close_finalization_tool_turn(
                     "The previous operation was cancelled. Results from completed tools have been preserved."
                 )
+                raise
+            except ContextLengthError:
                 raise
             except LLMError as e:
                 await hooks.emit(
