@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from amplifier_core import ContextLengthError
 
@@ -54,6 +56,63 @@ class AsyncBudgetProvider(BudgetProvider):
     async def request_budget(self, request, *, context_estimate: int) -> object:
         self.budget_calls.append((request, context_estimate))
         return self.decisions.pop(0)
+
+
+class UnavailableDiagnosticFailureHooks(ScriptedHooks):
+    async def emit(self, event_name, payload=None):
+        if (
+            event_name == "orchestrator:provider_budget"
+            and payload.get("result") == "unavailable"
+        ):
+            raise self.failure
+        return await super().emit(event_name, payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_concrete", [False, True])
+async def test_unavailable_hook_failure_is_safe_and_preserves_outcome(
+    caplog, post_concrete
+):
+    marker = "SYNTHETIC-SENSITIVE-HOOK-ERROR"
+    hooks = UnavailableDiagnosticFailureHooks({})
+    hooks.failure = RuntimeError(marker)
+    context = BudgetContext()
+    provider = AsyncBudgetProvider(
+        [_decision(100, 10, 7), None] if post_concrete else [None]
+    )
+    caplog.set_level("DEBUG")
+    call = StreamingOrchestrator({}).execute(
+        "work", context, {"main": provider}, {}, hooks,
+        _retaining_coordinator(context),
+    )
+    if post_concrete:
+        with pytest.raises(ContextLengthError, match="unavailable after"):
+            await call
+        assert not provider.requests
+    else:
+        await call
+        assert len(provider.requests) == 1
+    assert "Provider budget unavailability event failed to emit" in caplog.text
+    assert marker not in caplog.text
+    assert all(
+        record.exc_info is None
+        for record in caplog.records
+        if "unavailability event failed" in record.message
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_diagnostic_cancellation_still_propagates():
+    hooks = UnavailableDiagnosticFailureHooks({})
+    hooks.failure = asyncio.CancelledError()
+    context = BudgetContext()
+    provider = AsyncBudgetProvider([None])
+    with pytest.raises(asyncio.CancelledError):
+        await StreamingOrchestrator({}).execute(
+            "work", context, {"main": provider}, {}, hooks,
+            _retaining_coordinator(context),
+        )
+    assert not provider.requests
 
 
 class BudgetContext(MockContext):

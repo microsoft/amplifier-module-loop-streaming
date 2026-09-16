@@ -3576,11 +3576,9 @@ class StreamingOrchestrator:
                 payload["attempt"] = attempt
             try:
                 await hooks.emit("orchestrator:provider_budget", payload)
-            except Exception:  # pragma: no cover - observability is best effort
-                logger.debug(
-                    "Provider budget unavailability event failed to emit",
-                    exc_info=True,
-                )
+            except Exception:
+                # A diagnostic hook may include request data in its exception.
+                logger.debug("Provider budget unavailability event failed to emit")
 
         async def check_request_budget(
             request: ChatRequest,
