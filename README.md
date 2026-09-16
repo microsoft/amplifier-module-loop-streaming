@@ -65,6 +65,22 @@ The existing `orchestrator:provider_budget` event exposes each preflight's
 attempt, result, estimate, allowance, and requested context budget to mounted
 observability consumers.
 
+### Provider-count measured compaction
+
+When both sides advertise the optional measured contracts —
+`context.measured_request_view` and
+`request_budget:provider_count` — the loop lets Context compact against the
+provider's native input count. Context returns the exact `ChatRequest` it
+counted, and the loop sends that same object after committing the selected
+retention transaction. This path is additive: contexts and providers without
+both capabilities keep the legacy request-budget preflight and estimate-based
+retention behavior.
+
+For non-streaming foreground responses, the optional
+`context.foreground_usage` capability records only normalized successful
+response usage. A counted streaming request records its final provider count;
+streams without a provider count do not invent usage.
+
 ### Provider-reported overflow recovery
 
 A provider may optionally expose synchronous `recover_context_overflow` to
