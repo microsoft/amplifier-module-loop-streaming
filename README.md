@@ -65,6 +65,19 @@ The existing `orchestrator:provider_budget` event exposes each preflight's
 attempt, result, estimate, allowance, and requested context budget to mounted
 observability consumers.
 
+The same event also reports the absence of a native count, so a session that
+silently fell back to estimate-based behavior is visible rather than invisible.
+An unavailable report carries `result: "unavailable"`, a `mode` of
+`initial_fallback`, `post_concrete_failure`, or `measured`, and a `reason` of
+`capability_missing`, `no_decision`, or `measurement_absent`; `attempt` is
+included only where the preflight naturally knows it. It carries no count, no
+fit, no provider exception, and no request or context data, and providers may
+separately report their own provider-specific reasons. These reports are
+diagnostic only: the compatibility fallback and the fail-closed capability-loss
+error both keep their existing behavior, a malformed advertised budget stays an
+error rather than becoming a fallback, and a provider that never advertised
+`request_budget` keeps its historical silent path.
+
 ### Provider-count measured compaction
 
 When both sides advertise the optional measured contracts —

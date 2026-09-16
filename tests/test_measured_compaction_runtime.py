@@ -640,3 +640,232 @@ async def test_invalid_measured_dispatch_rolls_back_its_staged_transaction() -> 
 
     assert provider.requests == []
     assert context.transactions[0].rolled_back == 1
+
+
+# ---------------------------------------------------------------------------
+# Native-count unavailability on the measured path. Every assertion below
+# reads the payloads the REAL orchestrator emitted through the hooks object
+# it was handed -- never a logger-only or helper-level probe.
+# ---------------------------------------------------------------------------
+
+
+def _budget_payloads(hooks) -> list[dict]:
+    return [
+        payload
+        for event, payload in hooks.emitted
+        if event == "orchestrator:provider_budget"
+    ]
+
+
+class _CountTolerantContext(_MeasuredContext):
+    """Measured context double that tolerates a decision with no usable count."""
+
+    async def get_measured_request_view(self, *, provider, retain_contents, count_view):
+        base_view = list(self._messages)
+        attempt = await count_view(base_view)
+        transaction = _Transaction()
+        self.transactions.append(transaction)
+        self.measured_calls.append((provider, list(retain_contents)))
+        decision = attempt["budget_decision"]
+        measurement = (decision or {}).get("measurement") or {}
+        count = measurement.get("input_tokens")
+        return {
+            "base_view": base_view,
+            "final_attempt": attempt,
+            "outcome": "not_needed",
+            "measured_before": count,
+            "measured_after": count,
+            "policy_budget": 100,
+            "trigger": 80.0,
+            "target": 50,
+            "count_calls": 1,
+            "transaction": transaction,
+        }
+
+
+class _NoMeasurementProvider(_MeasuredProvider):
+    """Advertises provider_count but returns a valid decision without one."""
+
+    def request_budget(self, request, *, context_estimate, request_options=None):
+        self.budget_calls.append(request)
+        return {
+            "estimated_input_tokens": 9,
+            "input_limit_tokens": 100,
+            "context_token_budget": 0,
+        }
+
+
+class _NoDecisionProvider(_MeasuredProvider):
+    def request_budget(self, request, *, context_estimate, request_options=None):
+        self.budget_calls.append(request)
+        return None
+
+
+class _MalformedMeasurementProvider(_MeasuredProvider):
+    """Structurally invalid envelope: must stay fail-closed, not fall back."""
+
+    def request_budget(self, request, *, context_estimate, request_options=None):
+        self.budget_calls.append(request)
+        return {
+            **_provider_count(),
+            "max_output_tokens": 0,
+        }
+
+
+def _measured_coordinator(context) -> MockCoordinator:
+    coordinator = MockCoordinator()
+    coordinator.register_capability(
+        "context.measured_request_view", context.get_measured_request_view
+    )
+    return coordinator
+
+
+@pytest.mark.asyncio
+async def test_measured_path_reports_a_decision_without_a_usable_count() -> None:
+    context = _CountTolerantContext()
+    provider = _NoMeasurementProvider()
+    hooks = ScriptedHooks({})
+
+    await StreamingOrchestrator({}).execute(
+        "current request",
+        context,
+        {"main": provider},
+        {},
+        hooks,
+        _measured_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    assert _budget_payloads(hooks) == [
+        {
+            "result": "unavailable",
+            "mode": "measured",
+            "reason": "measurement_absent",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_measured_path_reports_a_none_budget_decision() -> None:
+    context = _CountTolerantContext()
+    provider = _NoDecisionProvider()
+    hooks = ScriptedHooks({})
+
+    await StreamingOrchestrator({}).execute(
+        "current request",
+        context,
+        {"main": provider},
+        {},
+        hooks,
+        _measured_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    assert _budget_payloads(hooks) == [
+        {
+            "result": "unavailable",
+            "mode": "measured",
+            "reason": "no_decision",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_measured_valid_count_emits_no_unavailable_event() -> None:
+    context = _MeasuredContext()
+    provider = _MeasuredProvider()
+    hooks = ScriptedHooks({})
+
+    await StreamingOrchestrator({}).execute(
+        "current request",
+        context,
+        {"main": provider},
+        {},
+        hooks,
+        _measured_coordinator(context),
+    )
+
+    payloads = _budget_payloads(hooks)
+    assert [payload["result"] for payload in payloads] == ["fits"]
+    assert all(payload["result"] != "unavailable" for payload in payloads)
+    assert payloads[0]["measurement_kind"] == "provider_count"
+
+
+@pytest.mark.asyncio
+async def test_malformed_measured_envelope_stays_fail_closed_without_fallback() -> None:
+    context = _CountTolerantContext()
+    provider = _MalformedMeasurementProvider()
+    hooks = ScriptedHooks({})
+
+    with pytest.raises(ContextLengthError, match="invalid max_output_tokens"):
+        await StreamingOrchestrator({}).execute(
+            "current request",
+            context,
+            {"main": provider},
+            {},
+            hooks,
+            _measured_coordinator(context),
+        )
+
+    assert provider.requests == []
+    assert _budget_payloads(hooks) == []
+
+
+class _NoMeasurementFinalizingProvider(NRoundToolProvider):
+    """One tool round then finalization; never rejects, so no recovery probe.
+
+    Deliberately NOT derived from ``_MeasuredFinalizingProvider``: that double
+    raises ``ContextLengthError`` on its second completion to exercise overflow
+    recovery, which would add a third budget invocation and make the
+    one-event-per-invocation assertion below ambiguous.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(n_tool_rounds=1)
+        self.budget_calls: list[object] = []
+
+    def get_info(self):
+        return SimpleNamespace(capabilities=["request_budget:provider_count"])
+
+    def request_budget(self, request, *, context_estimate, request_options=None):
+        self.budget_calls.append(request)
+        return {
+            "estimated_input_tokens": 9,
+            "input_limit_tokens": 100,
+            "context_token_budget": 0,
+        }
+
+
+@pytest.mark.asyncio
+async def test_measured_finalization_reports_its_absent_count_once_per_call() -> None:
+    context = _CountTolerantContext()
+    provider = _NoMeasurementFinalizingProvider()
+    hooks = ScriptedHooks({})
+    coordinator = _retaining_coordinator(context)
+    coordinator.register_capability(
+        "context.measured_request_view", context.get_measured_request_view
+    )
+
+    await StreamingOrchestrator({"max_iterations": 1}).execute(
+        "current request",
+        context,
+        {"main": provider},
+        {"mock_tool": OneShotTool()},
+        hooks,
+        coordinator,
+    )
+
+    # One event per budget invocation: ordinary turn, then finalization.
+    assert _budget_payloads(hooks) == [
+        {
+            "result": "unavailable",
+            "mode": "measured",
+            "reason": "measurement_absent",
+        },
+        {
+            "result": "unavailable",
+            "mode": "measured",
+            "reason": "measurement_absent",
+        },
+    ]
+    assert len(provider.budget_calls) == len(_budget_payloads(hooks))
