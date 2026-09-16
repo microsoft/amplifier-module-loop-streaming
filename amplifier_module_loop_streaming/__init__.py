@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+import weakref
 from collections.abc import AsyncIterator, Mapping
 from functools import partial
 from typing import Any, ClassVar
@@ -1215,6 +1216,13 @@ class StreamingOrchestrator:
         # from the bounded iteration count when a forced finalization call is
         # needed after the loop has spent its budget.
         self._llm_calls_this_turn: int = 0
+        # Context owns the meter's persistent claim; Loop retains the exact
+        # returned recorder per Context so every foreground path (including a
+        # later no-count stream) addresses the original scoped meter. Weak
+        # keys avoid retaining completed Context instances.
+        self._foreground_usage_recorders: weakref.WeakKeyDictionary[Any, Any] = (
+            weakref.WeakKeyDictionary()
+        )
         # Layer 1 call-budget bookkeeping (spec: 298-replacement). Both are
         # per-execute()-call state, reset in _execute_one_turn alongside
         # _tool_calls_this_turn. Initialized here so a fresh instance never
@@ -3386,7 +3394,8 @@ class StreamingOrchestrator:
                 return False
             try:
                 capabilities = getattr(get_info(), "capabilities", ())
-            except Exception:  # Optional capability discovery must be additive.
+            except (AttributeError, TypeError, ValueError):
+                # Optional capability discovery must be additive.
                 return False
             return capability in capabilities
 
@@ -3665,6 +3674,33 @@ class StreamingOrchestrator:
                 raise ContextLengthError(
                     "Provider request_budget returned an invalid budget decision"
                 )
+            validate_measured_budget_decision(decision)
+            return decision
+
+        def validate_measured_budget_decision(
+            decision: Any, *, require_hard_fit: bool = False
+        ) -> int | None:
+            """Validate the old guard and return usable optional count truth."""
+            required = (
+                "estimated_input_tokens",
+                "input_limit_tokens",
+                "context_token_budget",
+            )
+            if not isinstance(decision, dict) or any(
+                isinstance(decision.get(key), bool)
+                or not isinstance(decision.get(key), int)
+                or decision[key] < 0
+                for key in required
+            ):
+                raise ContextLengthError(
+                    "Provider request_budget returned an invalid budget decision"
+                )
+            estimated = decision["estimated_input_tokens"]
+            allowance = decision["input_limit_tokens"]
+            if require_hard_fit and estimated > allowance:
+                raise ContextLengthError(
+                    "Provider request exceeds its input budget at measured dispatch"
+                )
             output_cap = decision.get("max_output_tokens")
             if output_cap is not None and (
                 isinstance(output_cap, bool)
@@ -3674,22 +3710,69 @@ class StreamingOrchestrator:
                 raise ContextLengthError(
                     "Provider request_budget returned an invalid max_output_tokens"
                 )
-            return decision
+            measurement = decision.get("measurement")
+            if not isinstance(measurement, dict):
+                return None
+            count = measurement.get("input_tokens")
+            source = measurement.get("source")
+            if (
+                measurement.get("kind") != "provider_count"
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                or not isinstance(source, str)
+                or not source
+                or estimated < count
+            ):
+                return None
+            return count
 
-        def record_foreground_usage(response: Any) -> None:
-            """Persist only a normalized successful foreground response usage."""
-            nonlocal foreground_usage_claim
+        def measured_final_count(measured_result: Any) -> int | None:
+            """Validate a Context-produced final attempt before dispatching it."""
+            if not isinstance(measured_result, dict):
+                raise TypeError("context.measured_request_view returned a non-dictionary result")
+            attempt = measured_result.get("final_attempt")
+            if not isinstance(attempt, dict):
+                raise TypeError("context.measured_request_view returned an invalid final attempt")
+            decision = attempt.get("budget_decision")
+            if decision is None:
+                return None
+            return validate_measured_budget_decision(
+                decision, require_hard_fit=True
+            )
+
+        def foreground_usage_recorder() -> Any | None:
+            """Claim one Context's foreground meter immediately before dispatch."""
+            if foreground_usage_claim is None:
+                return None
+            recorder = self._foreground_usage_recorders.get(context)
+            if callable(recorder):
+                return recorder
+            recorder = foreground_usage_claim()
+            if callable(recorder):
+                self._foreground_usage_recorders[context] = recorder
+                return recorder
+            return None
+
+        def record_foreground_usage(recorder: Any | None, response: Any) -> None:
+            """Persist a response usage or explicitly mark an owned value stale."""
             usage = getattr(response, "usage", None)
-            if usage is None or foreground_usage_claim is None:
+            if not callable(recorder):
+                return
+            if usage is None:
+                recorder(input_tokens=None)
                 return
             if hasattr(usage, "model_dump"):
                 usage = usage.model_dump()
             elif not isinstance(usage, dict):
                 usage = vars(usage)
             if not isinstance(usage, dict):
+                recorder(input_tokens=None)
                 return
             input_tokens = usage.get("input_tokens")
             cache_write_tokens = usage.get("cache_write_tokens", 0)
+            if cache_write_tokens is None:
+                cache_write_tokens = 0
             if (
                 isinstance(input_tokens, bool)
                 or not isinstance(input_tokens, int)
@@ -3698,32 +3781,43 @@ class StreamingOrchestrator:
                 or not isinstance(cache_write_tokens, int)
                 or cache_write_tokens < 0
             ):
+                recorder(input_tokens=None)
                 return
-            recorder = foreground_usage_claim()
-            if callable(recorder):
-                recorder(
-                    input_tokens=input_tokens,
-                    cache_write_tokens=cache_write_tokens,
-                )
+            recorder(
+                input_tokens=input_tokens,
+                cache_write_tokens=cache_write_tokens,
+            )
 
-        def record_measured_stream_usage(measured_result: dict[str, Any] | None) -> None:
-            """A counted stream has no normalized final response usage object."""
-            if foreground_usage_claim is None or not isinstance(measured_result, dict):
+        def record_unavailable_stream_usage() -> None:
+            """Keep a prior scoped meter stale rather than reopening generic hooks."""
+            if foreground_usage_claim is None:
                 return
-            attempt = measured_result.get("final_attempt")
-            decision = attempt.get("budget_decision") if isinstance(attempt, dict) else None
-            measurement = decision.get("measurement") if isinstance(decision, dict) else None
-            count = measurement.get("input_tokens") if isinstance(measurement, dict) else None
-            if (
-                isinstance(count, bool)
-                or not isinstance(count, int)
-                or count < 0
-                or measurement.get("kind") != "provider_count"
-            ):
+            if context not in self._foreground_usage_recorders:
+                logger.debug(
+                    "No provider count for an unclaimed stream; foreground usage "
+                    "ownership remains unavailable."
+                )
                 return
-            recorder = foreground_usage_claim()
+            recorder = foreground_usage_recorder()
             if callable(recorder):
-                recorder(input_tokens=count)
+                recorder(input_tokens=None)
+            logger.debug(
+                "No provider count for a previously claimed stream; retained "
+                "foreground usage is stale."
+            )
+
+        async def await_with_measured_rollback(
+            awaitable: Any, transaction: Any | None
+        ) -> Any:
+            """Propagate an interrupted post-selection await after rollback."""
+            completed = False
+            try:
+                result = await awaitable
+                completed = True
+                return result
+            finally:
+                if not completed and transaction is not None:
+                    transaction.rollback()
 
         def output_cap_candidates(original: int | None) -> list[int]:
             """Return the bounded lossless output-reserve ladder."""
@@ -4455,15 +4549,22 @@ class StreamingOrchestrator:
                 else {}
             )
             measured_transaction = None
-            measured_count = None
+            measured_stream_count = None
             if measured_compaction_capable:
-                async def count_view(base_view: list[dict[str, Any]]) -> dict[str, Any]:
+                async def count_view(
+                    base_view: list[dict[str, Any]],
+                    *,
+                    turn_start_view_block: str | None = replay_turn_start_block,
+                    request_injection: tuple[str, bool] | None = replay_request_injection,
+                    pending_injections: list[dict[str, Any]] = replay_pending_injections,
+                    options: Mapping[str, Any] = request_options,
+                ) -> dict[str, Any]:
                     candidate_messages = (
                         _replay_request_overlays(
                             base_view,
-                            turn_start_view_block=replay_turn_start_block,
-                            request_injection=replay_request_injection,
-                            pending_injections=replay_pending_injections,
+                            turn_start_view_block=turn_start_view_block,
+                            request_injection=request_injection,
+                            pending_injections=pending_injections,
                         )
                         if self._ephemeral_injection_mode == "tail"
                         else list(base_view)
@@ -4474,7 +4575,7 @@ class StreamingOrchestrator:
                         "budget_decision": await count_measured_request(
                             candidate_request,
                             base_view,
-                            request_options=request_options,
+                            request_options=options,
                         ),
                     }
 
@@ -4485,30 +4586,36 @@ class StreamingOrchestrator:
                 )
                 if not isinstance(measured_result, dict):
                     raise TypeError("context.measured_request_view returned a non-dictionary result")
-                chat_request = measured_result.get("final_attempt", {}).get("dispatch")
-                if not isinstance(chat_request, ChatRequest):
-                    raise TypeError(
-                        "context.measured_request_view did not return a ChatRequest dispatch"
-                    )
                 measured_transaction = measured_result.get("transaction")
-                measured_count = measured_result
+                try:
+                    chat_request = measured_result.get("final_attempt", {}).get("dispatch")
+                    if not isinstance(chat_request, ChatRequest):
+                        raise TypeError(
+                            "context.measured_request_view did not return a ChatRequest dispatch"
+                        )
+                    measured_stream_count = measured_final_count(measured_result)
+                    measured_base_view = measured_result.get("base_view")
+                    if not isinstance(measured_base_view, list) or not all(
+                        isinstance(message, dict) for message in measured_base_view
+                    ):
+                        raise TypeError(
+                            "context.measured_request_view returned an invalid base_view"
+                        )
+                except BaseException:
+                    if measured_transaction is not None:
+                        measured_transaction.rollback()
+                    raise
                 smaller_context_budget = None
                 original_output_cap = None
                 budget_decision = measured_result.get("final_attempt", {}).get(
                     "budget_decision"
                 )
-                if isinstance(budget_decision, dict) and isinstance(
-                    budget_decision.get("measurement"), dict
-                ):
+                if measured_stream_count is not None and isinstance(budget_decision, dict):
                     measurement = budget_decision["measurement"]
-                    if (
-                        measurement.get("kind") == "provider_count"
-                        and isinstance(measurement.get("input_tokens"), int)
-                        and not isinstance(measurement.get("input_tokens"), bool)
-                    ):
-                        estimated = budget_decision["estimated_input_tokens"]
-                        allowance = budget_decision["input_limit_tokens"]
-                        await hooks.emit(
+                    estimated = budget_decision["estimated_input_tokens"]
+                    allowance = budget_decision["input_limit_tokens"]
+                    await await_with_measured_rollback(
+                        hooks.emit(
                             "orchestrator:provider_budget",
                             {
                                 "attempt": measured_result.get("count_calls", 1) - 1,
@@ -4534,7 +4641,14 @@ class StreamingOrchestrator:
                                 "outcome": measured_result.get("outcome"),
                                 "count_calls": measured_result.get("count_calls"),
                             },
-                        )
+                        ),
+                        measured_transaction,
+                    )
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    if measured_transaction is not None:
+                        measured_transaction.rollback()
+                    await exit_for_cancellation()
+                    return
             else:
                 chat_request = build_chat_request(message_dicts)
                 smaller_context_budget, original_output_cap = await check_request_budget(
@@ -4551,7 +4665,9 @@ class StreamingOrchestrator:
                     f"[ORCHESTRATOR] Tool names: {[t.name for t in tools.values()]}"
                 )
 
-            dispatch_base_messages = base_message_dicts
+            dispatch_base_messages = (
+                measured_base_view if measured_compaction_capable else base_message_dicts
+            )
             if smaller_context_budget is not None:
                 if smaller_context_budget <= 0:
                     raise ContextLengthError(
@@ -4637,7 +4753,9 @@ class StreamingOrchestrator:
                     chat_request = rebuilt_request
 
             # Apply rate limit delay before provider call
-            await self._apply_rate_limit_delay(hooks, iteration)
+            await await_with_measured_rollback(
+                self._apply_rate_limit_delay(hooks, iteration), measured_transaction
+            )
             # A measured Context transaction becomes visible only at the
             # selected dispatch boundary.  Cancellation during the delay must
             # leave its staged sticky decisions and telemetry untouched.
@@ -4647,12 +4765,32 @@ class StreamingOrchestrator:
                 await exit_for_cancellation()
                 return
             if measured_transaction is not None:
-                await measured_transaction.commit()
+                committed = await await_with_measured_rollback(
+                    measured_transaction.commit(
+                        is_cancelled=(
+                            lambda: bool(
+                                coordinator and coordinator.cancellation.is_cancelled
+                            )
+                        )
+                    ),
+                    measured_transaction,
+                )
+                if not committed or (
+                    coordinator and coordinator.cancellation.is_cancelled
+                ):
+                    measured_transaction.rollback()
+                    await exit_for_cancellation()
+                    return
 
             # Check if provider supports streaming
             if stream_provider:
                 # Use streaming if available
-                record_measured_stream_usage(measured_count)
+                if measured_stream_count is None:
+                    record_unavailable_stream_usage()
+                else:
+                    recorder = foreground_usage_recorder()
+                    if callable(recorder):
+                        recorder(input_tokens=measured_stream_count)
                 self._llm_calls_this_turn += 1
                 if get_context_overflow_recovery() is not None:
                     response_stream = self._stream_with_overflow_recovery(
@@ -4678,6 +4816,7 @@ class StreamingOrchestrator:
                                 chat_request.max_output_tokens or original_output_cap
                             ),
                         ),
+                        on_unconfirmed_stream=record_unavailable_stream_usage,
                     )
                 else:
                     response_stream = self._stream_from_provider(
@@ -4688,6 +4827,7 @@ class StreamingOrchestrator:
                         hooks,
                         coordinator,
                         provider_name=provider_name,
+                        on_stream_error=record_unavailable_stream_usage,
                     )
                 async for chunk in response_stream:
                     # Check for immediate cancellation between chunks
@@ -4720,6 +4860,7 @@ class StreamingOrchestrator:
                     break
             else:
                 # Fallback to non-streaming
+                foreground_recorder = foreground_usage_recorder()
                 try:
                     self._llm_calls_this_turn += 1
                     response = await provider.complete(chat_request, **request_options)
@@ -4780,7 +4921,7 @@ class StreamingOrchestrator:
 
                 # Update rate limit timestamp after non-streaming response
                 self._last_provider_call_end = time.monotonic()
-                record_foreground_usage(response)
+                record_foreground_usage(foreground_recorder, response)
 
                 # Emit content block events if present
                 content_blocks = getattr(response, "content_blocks", None)
@@ -5368,18 +5509,23 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 if measured_compaction_capable:
                     async def count_final_view(
                         base_view: list[dict[str, Any]],
+                        *,
+                        request_injection: tuple[str, bool] | None = final_replay_request_injection,
+                        pending_injections: list[dict[str, Any]] = final_replay_pending_injections,
+                        overlay: dict[str, Any] = finalization_overlay,
+                        options: Mapping[str, Any] = request_options,
                     ) -> dict[str, Any]:
                         candidate_messages = (
                             _replay_request_overlays(
                                 base_view,
                                 turn_start_view_block=None,
-                                request_injection=final_replay_request_injection,
-                                pending_injections=final_replay_pending_injections,
+                                request_injection=request_injection,
+                                pending_injections=pending_injections,
                             )
                             if self._ephemeral_injection_mode == "tail"
                             else list(base_view)
                         )
-                        candidate_messages.append(finalization_overlay)
+                        candidate_messages.append(overlay)
                         candidate_request = build_chat_request(
                             candidate_messages, tool_choice="none"
                         )
@@ -5388,7 +5534,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             "budget_decision": await count_measured_request(
                                 candidate_request,
                                 base_view,
-                                request_options=request_options,
+                                request_options=options,
                             ),
                         }
 
@@ -5401,6 +5547,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         raise TypeError(
                             "context.measured_request_view returned a non-dictionary result"
                         )
+                    final_measured_transaction = measured_result.get("transaction")
                     max_iter_chat_request = measured_result.get(
                         "final_attempt", {}
                     ).get("dispatch")
@@ -5408,24 +5555,28 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         raise TypeError(
                             "context.measured_request_view did not return a ChatRequest dispatch"
                         )
-                    final_measured_transaction = measured_result.get("transaction")
+                    measured_final_count(measured_result)
+                    final_measured_base_view = measured_result.get("base_view")
+                    if not isinstance(final_measured_base_view, list) or not all(
+                        isinstance(message, dict) for message in final_measured_base_view
+                    ):
+                        raise TypeError(
+                            "context.measured_request_view returned an invalid base_view"
+                        )
                     smaller_context_budget = None
                     original_output_cap = None
                     budget_decision = measured_result.get("final_attempt", {}).get(
                         "budget_decision"
                     )
-                    if isinstance(budget_decision, dict) and isinstance(
-                        budget_decision.get("measurement"), dict
+                    if (
+                        measured_final_count(measured_result) is not None
+                        and isinstance(budget_decision, dict)
                     ):
                         measurement = budget_decision["measurement"]
-                        if (
-                            measurement.get("kind") == "provider_count"
-                            and isinstance(measurement.get("input_tokens"), int)
-                            and not isinstance(measurement.get("input_tokens"), bool)
-                        ):
-                            estimated = budget_decision["estimated_input_tokens"]
-                            allowance = budget_decision["input_limit_tokens"]
-                            await hooks.emit(
+                        estimated = budget_decision["estimated_input_tokens"]
+                        allowance = budget_decision["input_limit_tokens"]
+                        await await_with_measured_rollback(
+                            hooks.emit(
                                 "orchestrator:provider_budget",
                                 {
                                     "attempt": measured_result.get("count_calls", 1) - 1,
@@ -5455,7 +5606,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                                     "outcome": measured_result.get("outcome"),
                                     "count_calls": measured_result.get("count_calls"),
                                 },
-                            )
+                            ),
+                            final_measured_transaction,
+                        )
                 else:
                     max_iter_chat_request = build_chat_request(
                         message_dicts, tool_choice="none"
@@ -5468,7 +5621,11 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             request_options=request_options,
                         )
                     )
-                dispatch_base_messages = base_message_dicts
+                dispatch_base_messages = (
+                    final_measured_base_view
+                    if measured_compaction_capable
+                    else base_message_dicts
+                )
                 if smaller_context_budget is not None:
                     if smaller_context_budget <= 0:
                         raise ContextLengthError(
@@ -5562,6 +5719,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     else:
                         max_iter_chat_request = rebuilt_request
 
+                await await_with_measured_rollback(
+                    self._apply_rate_limit_delay(hooks, iteration),
+                    final_measured_transaction,
+                )
                 if coordinator and coordinator.cancellation.is_cancelled:
                     if final_measured_transaction is not None:
                         final_measured_transaction.rollback()
@@ -5571,7 +5732,27 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     await exit_for_cancellation()
                     return
                 if final_measured_transaction is not None:
-                    await final_measured_transaction.commit()
+                    committed = await await_with_measured_rollback(
+                        final_measured_transaction.commit(
+                            is_cancelled=(
+                                lambda: bool(
+                                    coordinator
+                                    and coordinator.cancellation.is_cancelled
+                                )
+                            )
+                        ),
+                        final_measured_transaction,
+                    )
+                    if not committed or (
+                        coordinator and coordinator.cancellation.is_cancelled
+                    ):
+                        final_measured_transaction.rollback()
+                        await close_finalization_tool_turn(
+                            "The previous operation was cancelled. Results from completed tools have been preserved."
+                        )
+                        await exit_for_cancellation()
+                        return
+                foreground_recorder = foreground_usage_recorder()
                 self._llm_calls_this_turn += 1
                 try:
                     response = await provider.complete(
@@ -5600,7 +5781,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     response = await provider.complete(
                         recovered_request, **request_options
                     )
-                record_foreground_usage(response)
+                record_foreground_usage(foreground_recorder, response)
                 response_text = getattr(response, "text", None)
                 if not isinstance(response_text, str) or not response_text:
                     response_text = self._extract_text_from_content(
@@ -5706,6 +5887,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 await close_finalization_tool_turn(
                     "The final response could not be generated."
                 )
+            finally:
+                if final_measured_transaction is not None:
+                    final_measured_transaction.rollback()
 
         # Emit execution end
         await hooks.emit(
@@ -5735,6 +5919,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         coordinator=None,
         provider_name=None,
         recover_overflow=None,
+        on_unconfirmed_stream=None,
     ) -> AsyncIterator[str]:
         """Forward a stream, retrying exactly once before its first SDK chunk."""
         while True:
@@ -5753,6 +5938,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 coordinator,
                 provider_name=provider_name,
                 on_provider_chunk=mark_provider_chunk,
+                on_stream_error=on_unconfirmed_stream,
             )
             try:
                 async for chunk in stream:
@@ -5783,6 +5969,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         coordinator=None,
         provider_name=None,
         on_provider_chunk=None,
+        on_stream_error=None,
     ) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming.
 
@@ -5804,6 +5991,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         tools_list = list(tools.values()) if tools else []
         try:
             stream_iter = provider.stream(chat_request, tools=tools_list)
+        except ContextLengthError:
+            if on_stream_error is not None:
+                on_stream_error()
+            raise
         except LLMError as e:
             await hooks.emit(
                 PROVIDER_ERROR,
@@ -5853,6 +6044,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     full_response += token
                     if self.stream_delay:
                         await asyncio.sleep(self.stream_delay)
+        except ContextLengthError:
+            if on_stream_error is not None:
+                on_stream_error()
+            raise
         finally:
             await self._close_async_iterator(
                 stream_iter, description="provider stream iterator"
