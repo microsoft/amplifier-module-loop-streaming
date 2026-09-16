@@ -38,13 +38,14 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 
 ### Provider budget preflight
 
-When a provider exposes the optional synchronous `request_budget` capability,
-the loop checks the fully assembled request before dispatch. An oversized
-request gets up to two smaller, retention-aware context views; required
-reminders and request-only injections are replayed without running hooks or
-draining pending state again. If that view still cannot fit, the loop raises
-locally and makes no SDK request. Providers without the capability retain the
-existing request and dispatch behavior.
+When a provider exposes the optional `request_budget` capability, the loop
+awaits an awaitable result (or accepts a synchronous result) before checking
+the fully assembled request for dispatch. An oversized request gets up to two
+smaller, retention-aware context views; required reminders and request-only
+injections are replayed without running hooks or draining pending state again.
+If that view still cannot fit, the loop raises locally and makes no SDK request.
+Providers without the capability retain the existing request and dispatch
+behavior.
 
 If a provider exposes `request_budget` but returns literal `None` on the
 initial preflight, the loop treats that request as unavailable and uses the
