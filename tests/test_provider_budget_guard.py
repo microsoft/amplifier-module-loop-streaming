@@ -184,6 +184,19 @@ def _injection(body: str) -> ScriptedHookResult:
     )
 
 
+def _budget_payloads(hooks) -> list[dict]:
+    """Return every provider-budget payload the real orchestrator emitted."""
+    return [
+        payload
+        for event, payload in hooks.emitted
+        if event == "orchestrator:provider_budget"
+    ]
+
+
+def _budget_results(hooks) -> list[str]:
+    return [payload["result"] for payload in _budget_payloads(hooks)]
+
+
 @pytest.mark.asyncio
 async def test_provider_without_budget_capability_keeps_single_normal_dispatch() -> None:
     context = MockContext()
@@ -283,7 +296,7 @@ async def test_awaitable_fitting_budget_dispatches_the_original_request_once() -
 
 
 @pytest.mark.asyncio
-async def test_initial_unavailable_budget_keeps_normal_dispatch_without_budget_event() -> None:
+async def test_initial_unavailable_budget_keeps_normal_dispatch_and_reports_it() -> None:
     context = BudgetContext()
     provider = BudgetProvider([None])
     hooks = ScriptedHooks({})
@@ -300,7 +313,33 @@ async def test_initial_unavailable_budget_keeps_normal_dispatch_without_budget_e
     assert len(provider.requests) == 1
     assert len(provider.budget_calls) == 1
     assert context.request_calls == [([], None)]
-    assert [name for name, _ in hooks.emitted].count("orchestrator:provider_budget") == 0
+    assert _budget_payloads(hooks) == [
+        {
+            "result": "unavailable",
+            "mode": "initial_fallback",
+            "reason": "no_decision",
+            "attempt": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_provider_without_budget_capability_emits_no_unavailable_event() -> None:
+    context = BudgetContext()
+    provider = RequestCapturingProvider()
+    hooks = ScriptedHooks({})
+
+    await StreamingOrchestrator({}).execute(
+        "work",
+        context,
+        {"main": provider},
+        {},
+        hooks,
+        _retaining_coordinator(context),
+    )
+
+    assert len(provider.requests) == 1
+    assert _budget_payloads(hooks) == []
 
 
 @pytest.mark.asyncio
@@ -701,11 +740,13 @@ async def test_awaitable_unavailable_budget_after_rebuild_fails_without_sdk_disp
     assert len(provider.budget_calls) == 2
     assert context.hard_fit_calls == [False, True]
     assert provider.requests == []
-    assert [
-        payload["result"]
-        for event, payload in hooks.emitted
-        if event == "orchestrator:provider_budget"
-    ] == ["oversized"]
+    assert _budget_results(hooks) == ["oversized", "unavailable"]
+    assert _budget_payloads(hooks)[-1] == {
+        "result": "unavailable",
+        "mode": "post_concrete_failure",
+        "reason": "no_decision",
+        "attempt": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -936,19 +977,35 @@ async def test_finalization_request_is_budget_checked_before_dispatch() -> None:
 async def test_finalization_initial_unavailable_budget_keeps_normal_dispatch() -> None:
     context = BudgetContext()
     provider = FinalizingBudgetProvider([None, None])
+    hooks = ScriptedHooks({})
 
     await StreamingOrchestrator({"max_iterations": 1}).execute(
         "work",
         context,
         {"main": provider},
         {"mock_tool": OneShotTool()},
-        ScriptedHooks({}),
+        hooks,
         _retaining_coordinator(context),
     )
 
     assert len(provider.requests) == 2
     assert len(provider.budget_calls) == 2
     assert provider.requests[-1].tool_choice == "none"
+    # Ordinary turn and finalization report the same unavailability shape.
+    assert _budget_payloads(hooks) == [
+        {
+            "result": "unavailable",
+            "mode": "initial_fallback",
+            "reason": "no_decision",
+            "attempt": 0,
+        },
+        {
+            "result": "unavailable",
+            "mode": "initial_fallback",
+            "reason": "no_decision",
+            "attempt": 0,
+        },
+    ]
 
 
 @pytest.mark.asyncio

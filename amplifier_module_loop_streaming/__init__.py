@@ -3552,6 +3552,36 @@ class StreamingOrchestrator:
                 **kwargs
             )
 
+        async def emit_budget_unavailable(
+            *, mode: str, reason: str, attempt: int | None = None
+        ) -> None:
+            """Report that an invoked budget path produced no usable count.
+
+            Diagnostic only. This never changes a decision: it is emitted
+            beside the existing compatibility fallback or immediately before
+            the existing fail-closed raise, and a failing observability hook
+            must not convert either into a different outcome. Cancellation
+            still propagates -- ``asyncio.CancelledError`` is a
+            ``BaseException`` and is deliberately not caught here.
+
+            The payload is scalar and provider-agnostic: no count, no fit, no
+            raw provider exception, and no request, prompt, or context data.
+            """
+            payload: dict[str, Any] = {
+                "result": "unavailable",
+                "mode": mode,
+                "reason": reason,
+            }
+            if attempt is not None:
+                payload["attempt"] = attempt
+            try:
+                await hooks.emit("orchestrator:provider_budget", payload)
+            except Exception:  # pragma: no cover - observability is best effort
+                logger.debug(
+                    "Provider budget unavailability event failed to emit",
+                    exc_info=True,
+                )
+
         async def check_request_budget(
             request: ChatRequest,
             base_messages: list[dict[str, Any]],
@@ -3572,6 +3602,28 @@ class StreamingOrchestrator:
             """
             request_budget = getattr(provider, "request_budget", None)
             if not budget_capable or not callable(request_budget):
+                # A provider that never advertised the capability keeps the
+                # historical silent path: this flow never invoked a budget
+                # check, so it gains no event. Only a capability that was
+                # present at provider selection and is missing here is a
+                # reportable unavailability.
+                if budget_capable:
+                    if attempt and not allow_unproven:
+                        await emit_budget_unavailable(
+                            mode="post_concrete_failure",
+                            reason="capability_missing",
+                            attempt=attempt,
+                        )
+                        raise ContextLengthError(
+                            "Provider request_budget capability was unavailable after "
+                            "reporting a concrete budget"
+                        )
+                    await emit_budget_unavailable(
+                        mode="initial_fallback",
+                        reason="capability_missing",
+                        attempt=attempt,
+                    )
+                    return None, None
                 if attempt and not allow_unproven:
                     raise ContextLengthError(
                         "Provider request_budget capability was unavailable after "
@@ -3587,10 +3639,20 @@ class StreamingOrchestrator:
                 decision = await decision
             if decision is None:
                 if attempt and not allow_unproven:
+                    await emit_budget_unavailable(
+                        mode="post_concrete_failure",
+                        reason="no_decision",
+                        attempt=attempt,
+                    )
                     raise ContextLengthError(
                         "Provider request_budget capability was unavailable after "
                         "reporting a concrete budget"
                     )
+                await emit_budget_unavailable(
+                    mode="initial_fallback",
+                    reason="no_decision",
+                    attempt=attempt,
+                )
                 return None, None
             required = (
                 "estimated_input_tokens",
@@ -3650,6 +3712,9 @@ class StreamingOrchestrator:
             """
             request_budget = getattr(provider, "request_budget", None)
             if not callable(request_budget):
+                await emit_budget_unavailable(
+                    mode="measured", reason="capability_missing"
+                )
                 return None
             context_estimate = sum(len(str(message)) // 4 for message in base_view)
             kwargs: dict[str, Any] = {"context_estimate": context_estimate}
@@ -3659,6 +3724,7 @@ class StreamingOrchestrator:
             if inspect.isawaitable(decision):
                 decision = await decision
             if decision is None:
+                await emit_budget_unavailable(mode="measured", reason="no_decision")
                 return None
             required = (
                 "estimated_input_tokens",
@@ -3674,7 +3740,14 @@ class StreamingOrchestrator:
                 raise ContextLengthError(
                     "Provider request_budget returned an invalid budget decision"
                 )
-            validate_measured_budget_decision(decision)
+            # Malformed advertised measurements still raise from here: an
+            # error must never be downgraded into a compatibility fallback.
+            # Only a structurally valid decision that carries no usable
+            # provider count is reported as an unavailable measurement.
+            if validate_measured_budget_decision(decision) is None:
+                await emit_budget_unavailable(
+                    mode="measured", reason="measurement_absent"
+                )
             return decision
 
         def validate_measured_budget_decision(
