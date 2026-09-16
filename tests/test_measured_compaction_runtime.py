@@ -18,7 +18,10 @@ from tests.test_ephemeral_cache_persist_mode import (
     ScriptedHookResult,
     ScriptedHooks,
 )
-from tests.test_provider_budget_guard import HardFitBudgetContext, _retaining_coordinator
+from tests.test_provider_budget_guard import (
+    HardFitBudgetContext,
+    _retaining_coordinator,
+)
 
 
 def _provider_count(count: int = 5) -> dict[str, object]:

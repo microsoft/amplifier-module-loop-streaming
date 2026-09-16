@@ -78,8 +78,10 @@ retention behavior.
 
 For non-streaming foreground responses, the optional
 `context.foreground_usage` capability records only normalized successful
-response usage. A counted streaming request records its final provider count;
-streams without a provider count do not invent usage.
+response usage. A counted streaming request records its selected provider count.
+If a pre-chunk overflow requires a stream retry, that reading is marked stale
+rather than attributed to the replacement request. Streams without a provider
+count do not invent usage; an already-owned reading is marked stale.
 
 ### Provider-reported overflow recovery
 
