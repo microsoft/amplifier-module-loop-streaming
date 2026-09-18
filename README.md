@@ -36,6 +36,22 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 - Progressive rendering
 - Interruptible generation
 
+### Durable completed-tool checkpoints
+
+A host may register a zero-argument `session.durable_checkpoint` capability on
+the coordinator. The Loop invokes it once after a normal tool batch has settled
+and all results have been appended in their original order, before a subsequent
+provider request (including budget finalization). The host owns storage and
+must persist the complete canonical context before returning; count-only
+debouncing is not a durable-write guarantee.
+
+The callable may be synchronous or awaitable. Literal `False`, an ordinary
+exception, or a non-callable registration fails the turn explicitly without
+another provider dispatch. Cancellation propagates with appended results intact;
+this does not add a cancellation-recovery policy. A missing capability preserves
+the behavior of existing hosts. The Loop itself does not write transcripts.
+This checkpoint is not the earlier `tool:post` event, which precedes result append.
+
 ### Provider budget preflight
 
 When a provider exposes the optional `request_budget` capability, the loop

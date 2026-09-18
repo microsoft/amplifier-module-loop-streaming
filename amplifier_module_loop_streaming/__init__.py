@@ -5391,6 +5391,29 @@ class StreamingOrchestrator:
                         }
                     )
 
+                # tool:post precedes this ordered append. Only now is the
+                # settled batch ready for a host-owned durable checkpoint.
+                # Keep older hosts compatible, but do not dispatch again when
+                # a host that promises persistence cannot complete its write.
+                checkpoint = (
+                    coordinator.get_capability("session.durable_checkpoint")
+                    if coordinator
+                    else None
+                )
+                if checkpoint is not None:
+                    try:
+                        if not callable(checkpoint):
+                            raise TypeError("session.durable_checkpoint is not callable")
+                        checkpoint_result = checkpoint()
+                        if inspect.isawaitable(checkpoint_result):
+                            checkpoint_result = await checkpoint_result
+                        if checkpoint_result is False:
+                            raise RuntimeError("session.durable_checkpoint returned False")
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Durable session checkpoint failed; refusing further provider dispatch"
+                        ) from exc
+
         # Add exactly one finalization call only when the bounded budget
         # prevented a continuation. A normal no-tool break at the cap is a
         # natural completion and must return without a duplicate provider call.
