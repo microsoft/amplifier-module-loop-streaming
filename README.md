@@ -105,12 +105,41 @@ retention transaction. This path is additive: contexts and providers without
 both capabilities keep the legacy request-budget preflight and estimate-based
 retention behavior.
 
+If the measured Context getter explicitly accepts `fit_output`, the loop also
+offers its lossless output-reserve ladder after Context exhausts its eight legal
+reduction rungs and still measures a hard oversize. Each of at most six extra
+counts uses a deep clone of the frozen request, preserving tools, overlays,
+options, and tool choice. Only the output cap changes, plus a view-only warning
+below 10,000 output tokens that is included **before** recounting. The exact
+accepted counted request is dispatched; hooks, tools, and the system-prompt
+factory are not rerun.
+
+A missing/unusable count during this fitting fails closed. A provider that
+does not honor the requested output cap also fails locally. An independent
+input ceiling can leave every rung oversized; protected content is never
+discarded to force a fit. Older measured getters that lack the keyword keep
+their existing behavior. Output fitting can help only when the provider's
+reported input allowance grows as its output reserve shrinks. For independent
+input ceilings, the bounded probes may add count calls without finding a fit;
+this change does not solve an input-only overflow.
+
 For non-streaming foreground responses, the optional
 `context.foreground_usage` capability records only normalized successful
 response usage. A counted streaming request records its selected provider count.
 If a pre-chunk overflow requires a stream retry, that reading is marked stale
 rather than attributed to the replacement request. Streams without a provider
 count do not invent usage; an already-owned reading is marked stale.
+
+### Failed goal turns
+
+A failed conversational turn ends the active `/goal`, flushes any pending error
+completion as final, and emits terminal goal progress without calling the
+evaluator, stall judge, or summary model. Task cancellation propagates after
+terminal goal progress; unlike a cooperative stop, it creates no completion.
+This applies to initial, continuation, and escalation turns. Cleanup diagnostics
+are best effort (including cancellation during those diagnostics); the original
+turn exception still propagates. No successful response, on-disk persistence,
+or absence of earlier provider calls is claimed by this cleanup.
 
 ### Provider-reported overflow recovery
 

@@ -18,6 +18,7 @@ three share the same `provider.complete()` entry point.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -3903,3 +3904,182 @@ class TestEvaluatorInputHygieneEndToEnd:
         assert "EXIT_STATUS_END code=0" in after_prompt
         # Tool-call arguments are now visible too.
         assert "/var/log/huge.log" in after_prompt
+
+
+# ---------------------------------------------------------------------------
+# 15. Goal-turn execution failures must finalize the failed deferred turn once,
+# clear state, and still propagate the original failure.
+# ---------------------------------------------------------------------------
+
+
+class _ConversationalFailureProvider(FakeProvider):
+    """Uses the real loop; only the selected conversational transport fails."""
+
+    def __init__(self, failures: dict[int, BaseException]) -> None:
+        super().__init__()
+        self.failures = failures
+        self.conversation_calls = 0
+
+    async def complete(self, chat_request, **kwargs):
+        system = next((m for m in chat_request.messages if m.role == "system"), None)
+        system_text = system.content if system and isinstance(system.content, str) else ""
+        if not any(
+            marker in system_text
+            for marker in ("tool-less evaluator", "tool-less judge", "single, short line for a developer")
+        ):
+            self.conversation_calls += 1
+            failure = self.failures.get(self.conversation_calls)
+            if failure is not None:
+                raise failure
+        return await super().complete(chat_request, **kwargs)
+
+
+def _active_goal() -> dict[str, Any]:
+    return {"condition": "solve it", "turns_used": 0, "last_reason": None, "cap": None}
+
+
+def _goal_completions(hooks: MockHooks) -> list[dict]:
+    return hooks.orchestrator_complete_events()
+
+
+@pytest.mark.asyncio
+class TestGoalTurnFailureCleanup:
+    async def test_first_goal_turn_failure_propagates_identity_and_cannot_leak_a_later_completion(
+        self,
+    ) -> None:
+        error = RuntimeError("first conversational transport failed")
+        orch = _make_orchestrator()
+        ctx, hooks, coordinator = MockContext(), MockHooks(), MockCoordinator()
+        provider = _ConversationalFailureProvider({1: error})
+        coordinator.session_state["goal"] = _active_goal()
+
+        with pytest.raises(RuntimeError) as raised:
+            await orch.execute("solve it", ctx, {"main": provider}, {}, hooks, coordinator)
+
+        assert raised.value is error
+        assert coordinator.session_state["goal"] is None
+        assert orch._pending_orchestrator_complete is None
+        completions = _goal_completions(hooks)
+        assert len(completions) == 1
+        assert completions[0]["status"] == "error"
+        assert completions[0]["goal_final"] is True
+        progress = hooks.goal_progress_events()
+        assert len(progress) == 1
+        assert progress[0]["state"] == "error"
+        assert provider.eval_call_requests == []
+        assert provider.summary_call_count == 0
+
+        # A later ordinary invocation must create only its own completion; it
+        # must never flush the prior failed goal turn a second time.
+        provider.turn_queue.append(MockTurnResponse(text="ordinary later success"))
+        assert await orch.execute("later", ctx, {"main": provider}, {}, hooks, coordinator) == (
+            "ordinary later success"
+        )
+        assert len(_goal_completions(hooks)) == 2
+        assert _goal_completions(hooks)[1]["goal_turn"] is None
+
+    async def test_continuation_failure_keeps_earlier_completion_nonfinal_and_stops_evaluation(
+        self,
+    ) -> None:
+        error = RuntimeError("continuation transport failed")
+        orch = _make_orchestrator()
+        ctx, hooks, coordinator = MockContext(), MockHooks(), MockCoordinator()
+        provider = _ConversationalFailureProvider({2: error})
+        provider.turn_queue.append(MockTurnResponse(text="first answer"))
+        provider.eval_queue.append((False, "continue with a different approach"))
+        coordinator.session_state["goal"] = _active_goal()
+
+        with pytest.raises(RuntimeError) as raised:
+            await orch.execute("solve it", ctx, {"main": provider}, {}, hooks, coordinator)
+
+        assert raised.value is error
+        assert coordinator.session_state["goal"] is None
+        assert orch._pending_orchestrator_complete is None
+        completions = _goal_completions(hooks)
+        assert [(item["status"], item["goal_final"]) for item in completions] == [
+            ("success", False),
+            ("error", True),
+        ]
+        assert len(provider.eval_call_requests) == 1
+        assert provider.summary_call_count == 0
+        assert [item["state"] for item in hooks.goal_progress_events()] == [
+            "continuing",
+            "error",
+        ]
+
+    async def test_stall_escalation_turn_failure_stops_without_summary_or_extra_judge(
+        self,
+    ) -> None:
+        error = RuntimeError("escalation transport failed")
+        orch = _make_orchestrator({"goal_stall_threshold": 1, "goal_busy_stall_window": 100})
+        ctx, hooks, coordinator = MockContext(), MockHooks(), MockCoordinator()
+        provider = _ConversationalFailureProvider({3: error})
+        provider.turn_queue.extend([MockTurnResponse(text="initial"), MockTurnResponse(text="idle")])
+        provider.eval_queue.extend([(False, "blocked"), (False, "still blocked")])
+        provider.judge_queue.append((True, "static blocker", "NOT_DEMONSTRATED"))
+        coordinator.session_state["goal"] = _active_goal()
+
+        with pytest.raises(RuntimeError) as raised:
+            await orch.execute("solve it", ctx, {"main": provider}, {}, hooks, coordinator)
+
+        assert raised.value is error
+        assert coordinator.session_state["goal"] is None
+        assert orch._pending_orchestrator_complete is None
+        assert len(provider.eval_call_requests) == 2
+        assert len(provider.judge_call_requests) == 1
+        assert provider.summary_call_count == 0
+        completions = _goal_completions(hooks)
+        assert [(item["status"], item["goal_final"]) for item in completions] == [
+            ("success", False),
+            ("success", False),
+            ("error", True),
+        ]
+        assert [item["state"] for item in hooks.goal_progress_events()] == [
+            "continuing",
+            "continuing",
+            "error",
+        ]
+
+    @pytest.mark.parametrize("event", ["orchestrator:complete", "orchestrator:goal_progress"])
+    @pytest.mark.parametrize("hook_error", [RuntimeError, asyncio.CancelledError])
+    async def test_terminal_diagnostic_hook_failures_do_not_mask_original_turn_error(
+        self, event, hook_error,
+    ) -> None:
+        error = RuntimeError("original turn error")
+
+        class FailingTerminalHooks(MockHooks):
+            async def emit(self, event_name: str, payload: dict | None = None):
+                result = await super().emit(event_name, payload)
+                if event_name == event:
+                    raise hook_error("diagnostic hook failed")
+                return result
+
+        orch = _make_orchestrator()
+        ctx, hooks, coordinator = MockContext(), FailingTerminalHooks(), MockCoordinator()
+        provider = _ConversationalFailureProvider({1: error})
+        coordinator.session_state["goal"] = _active_goal()
+
+        with pytest.raises(RuntimeError) as raised:
+            await orch.execute("solve it", ctx, {"main": provider}, {}, hooks, coordinator)
+
+        assert raised.value is error
+        assert coordinator.session_state["goal"] is None
+        assert orch._pending_orchestrator_complete is None
+        assert len(_goal_completions(hooks)) == 1
+        assert len(hooks.goal_progress_events()) == 1
+
+    async def test_cancelled_active_goal_clears_state_and_propagates_cancellation(self) -> None:
+        error = asyncio.CancelledError()
+        orch = _make_orchestrator()
+        ctx, hooks, coordinator = MockContext(), MockHooks(), MockCoordinator()
+        provider = _ConversationalFailureProvider({1: error})
+        coordinator.session_state["goal"] = _active_goal()
+
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await orch.execute("solve it", ctx, {"main": provider}, {}, hooks, coordinator)
+
+        assert raised.value is error
+        assert coordinator.session_state["goal"] is None
+        assert orch._pending_orchestrator_complete is None
+        assert _goal_completions(hooks) == []
+        assert [event["state"] for event in hooks.goal_progress_events()] == ["cancelled"]
