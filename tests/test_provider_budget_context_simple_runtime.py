@@ -211,7 +211,7 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
     coordinator = _Coordinator(hooks)
     context = _RecordingContext(
         # The character-based ordinary estimate stays below context-simple's
-        # real provider-derived budget; max_tokens is only a fallback here.
+        # real provider-derived budget; max_tokens does not lower it here.
         # Each supplementary Han character serializes as four UTF-8 bytes, so
         # the calibrated provider preflight forces the first hard-fit rebuild.
         max_tokens=500_000,
@@ -251,7 +251,9 @@ async def test_hard_fit_stays_compacted_across_real_openai_dispatches() -> None:
     assert client.responses.hard_fit_counts_at_dispatch == [0]
     assert "gpt-5-mini" in provider._budget_calibration
 
-    bulk = "REMOVED-BULK-MARKER:" + ("\U00020000" * 40_000)
+    # Stay oversized after mini's documented input ceiling was corrected to
+    # 272k: 70k four-byte characters, while chars/4 stays below Context's budget.
+    bulk = "REMOVED-BULK-MARKER:" + ("\U00020000" * 70_000)
     await context.add_message({"role": "assistant", "content": bulk})
 
     await loop.execute(

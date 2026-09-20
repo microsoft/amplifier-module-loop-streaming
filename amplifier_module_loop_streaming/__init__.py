@@ -47,6 +47,10 @@ from .steering import SteeringQueue
 logger = logging.getLogger(__name__)
 
 
+class _MeasuredOutputFitCancelled(BaseException):
+    """Unwind Context's staged fit into Loop's cooperative cancellation path."""
+
+
 def _build_tool_spec(tool: Any) -> ToolSpec:
     """Build a `ToolSpec` for one mounted tool, preserving model-native form.
 
@@ -1422,9 +1426,37 @@ class StreamingOrchestrator:
             self._ensure_goal_defaults(initial_goal)
         goal_turn = (initial_goal["turns_used"] + 1) if initial_goal else None
 
-        full_response = await self._execute_one_turn(
-            prompt, context, providers, tools, hooks, coordinator, goal_turn=goal_turn
-        )
+        async def run_turn(turn_prompt: str, *, goal_turn: int | None) -> str:
+            try:
+                return await self._execute_one_turn(
+                    turn_prompt, context, providers, tools, hooks, coordinator,
+                    goal_turn=goal_turn,
+                )
+            except (Exception, asyncio.CancelledError) as error:
+                if goal_turn is not None and coordinator is not None:
+                    failed_goal = coordinator.session_state.get("goal")
+                    coordinator.session_state["goal"] = None
+                    # Each diagnostic is best effort. Neither may replace the
+                    # original turn failure or prevent the other from flushing.
+                    try:
+                        await self._flush_pending_complete(goal_final=True)
+                    except (Exception, asyncio.CancelledError):
+                        logger.warning("Failed to emit final errored goal completion")
+                    if failed_goal:
+                        state = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+                        try:
+                            await hooks.emit(
+                                "orchestrator:goal_progress",
+                                self._goal_progress_payload(
+                                    failed_goal, state=state,
+                                    reason="Goal turn did not complete; automatic continuation stopped.",
+                                ),
+                            )
+                        except (Exception, asyncio.CancelledError):
+                            logger.warning("Failed to emit terminal goal progress")
+                raise
+
+        full_response = await run_turn(prompt, goal_turn=goal_turn)
 
         if coordinator is None:
             return full_response
@@ -1700,13 +1732,8 @@ class StreamingOrchestrator:
                     trigger=stall_trigger or "idle",
                     verdict=stall_verdict,
                 )
-                full_response = await self._execute_one_turn(
+                full_response = await run_turn(
                     stall_prompt,
-                    context,
-                    providers,
-                    tools,
-                    hooks,
-                    coordinator,
                     goal_turn=goal["turns_used"] + 1,
                 )
                 is_continuation_turn = True
@@ -1747,13 +1774,8 @@ class StreamingOrchestrator:
             )
 
             goal["continuations"] += 1
-            full_response = await self._execute_one_turn(
+            full_response = await run_turn(
                 reason,
-                context,
-                providers,
-                tools,
-                hooks,
-                coordinator,
                 goal_turn=goal["turns_used"] + 1,
             )
             is_continuation_turn = True
@@ -3956,6 +3978,89 @@ class StreamingOrchestrator:
                     return candidate_request
             return None
 
+        async def fit_measured_output(
+            base_view: list[dict[str, Any]],
+            attempt: dict[str, Any],
+            *,
+            request_options: Mapping[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            """Recount a frozen protected view at the existing legal output rungs."""
+            original = attempt.get("dispatch")
+            if not isinstance(original, ChatRequest):
+                raise TypeError("Measured output fitting requires a ChatRequest")
+            decision = attempt.get("budget_decision")
+            if validate_measured_budget_decision(decision) is None:
+                raise ContextLengthError("Measured output fitting requires a provider count")
+            original_cap = decision.get("max_output_tokens")
+            if original.max_output_tokens is not None and original_cap is not None:
+                original_cap = min(original_cap, original.max_output_tokens)
+            for count_calls, cap in enumerate(output_cap_candidates(original_cap), 1):
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    raise _MeasuredOutputFitCancelled()
+                # Clone the already-assembled request, not the underlying history:
+                # preserve overlays, tools, choice, metadata, and frozen options.
+                candidate = original.model_copy(deep=True)
+                candidate.max_output_tokens = cap
+                candidate.messages.extend(
+                    Message(**message) for message in degraded_output_warning(cap)
+                )
+                decision = await count_measured_request(
+                    candidate, base_view, request_options=request_options
+                )
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    raise _MeasuredOutputFitCancelled()
+                if decision is None or validate_measured_budget_decision(decision) is None:
+                    raise ContextLengthError(
+                        "Provider count became unavailable during measured output fitting"
+                    )
+                if decision.get("max_output_tokens") != cap:
+                    raise ContextLengthError(
+                        "Provider did not honor the measured output cap"
+                    )
+                if decision["estimated_input_tokens"] <= decision["input_limit_tokens"]:
+                    return {
+                        "dispatch": candidate,
+                        "budget_decision": decision,
+                        "count_calls": count_calls,
+                    }
+            return None
+
+        async def request_measured_view(
+            retain_contents: list[str], count_view: Any,
+            request_options: Mapping[str, Any] | None,
+        ) -> dict[str, Any]:
+            kwargs = {
+                "provider": provider,
+                "retain_contents": retain_contents,
+                "count_view": count_view,
+            }
+            # Explicit keyword negotiation keeps both mixed-version pairings
+            # on their existing path. Never catch an implementation TypeError.
+            try:
+                parameter = inspect.signature(measured_view_getter).parameters.get("fit_output")
+            except (TypeError, ValueError):
+                parameter = None
+            if parameter is not None and parameter.kind in (
+                inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                kwargs["fit_output"] = partial(
+                    fit_measured_output, request_options=request_options
+                )
+            return await measured_view_getter(**kwargs)
+
+        async def emit_measured_output_degradation(result: dict[str, Any], transaction) -> None:
+            if result.get("outcome") != "reduced_output":
+                return
+            request = result["final_attempt"]["dispatch"]
+            if request.max_output_tokens is not None and request.max_output_tokens < 10_000:
+                await await_with_measured_rollback(
+                    hooks.emit(
+                        "orchestrator:context_degradation",
+                        {"mode": "reduced_output", "max_output_tokens": request.max_output_tokens},
+                    ),
+                    transaction,
+                )
+
         async def recover_context_overflow(
             failed_request: ChatRequest,
             error: ContextLengthError,
@@ -4650,11 +4755,13 @@ class StreamingOrchestrator:
                         ),
                     }
 
-                measured_result = await measured_view_getter(
-                    provider=provider,
-                    retain_contents=retained_contents,
-                    count_view=count_view,
-                )
+                try:
+                    measured_result = await request_measured_view(
+                        retained_contents, count_view, request_options,
+                    )
+                except _MeasuredOutputFitCancelled:
+                    await exit_for_cancellation()
+                    return
                 if not isinstance(measured_result, dict):
                     raise TypeError("context.measured_request_view returned a non-dictionary result")
                 measured_transaction = measured_result.get("transaction")
@@ -4715,6 +4822,7 @@ class StreamingOrchestrator:
                         ),
                         measured_transaction,
                     )
+                await emit_measured_output_degradation(measured_result, measured_transaction)
                 if coordinator and coordinator.cancellation.is_cancelled:
                     if measured_transaction is not None:
                         measured_transaction.rollback()
@@ -5632,10 +5740,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             ),
                         }
 
-                    measured_result = await measured_view_getter(
-                        provider=provider,
-                        retain_contents=final_retained_contents,
-                        count_view=count_final_view,
+                    measured_result = await request_measured_view(
+                        final_retained_contents, count_final_view, request_options,
                     )
                     if not isinstance(measured_result, dict):
                         raise TypeError(
@@ -5703,6 +5809,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                             ),
                             final_measured_transaction,
                         )
+                    await emit_measured_output_degradation(
+                        measured_result, final_measured_transaction
+                    )
                 else:
                     max_iter_chat_request = build_chat_request(
                         message_dicts, tool_choice="none"
@@ -5945,6 +6054,12 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         "The final response could not be generated."
                     )
 
+            except _MeasuredOutputFitCancelled:
+                await close_finalization_tool_turn(
+                    "The previous operation was cancelled. Results from completed tools have been preserved."
+                )
+                await exit_for_cancellation()
+                return
             except asyncio.CancelledError:
                 await close_finalization_tool_turn(
                     "The previous operation was cancelled. Results from completed tools have been preserved."
