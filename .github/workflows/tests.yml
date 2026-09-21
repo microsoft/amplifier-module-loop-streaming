@@ -25,16 +25,13 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Create virtual environment
         run: uv venv --python "${{ matrix.python-version }}" .venv
-      - name: Install test runner dependencies
+      - name: Install current Amplifier sources and test runner dependencies
         run: |
-          # Do not use pyproject.toml's Git amplifier-core source mapping in CI.
           uv pip install --no-config --python .venv/bin/python \
-            "amplifier-core==1.5.2" \
+            "amplifier-core @ git+https://github.com/microsoft/amplifier-core@main" \
+            "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main" \
             "pytest==9.0.3" \
             "pytest-asyncio==1.3.0"
-          # Test-only: install Foundation without dependencies so it cannot replace packaged core.
-          uv pip install --no-config --no-deps --python .venv/bin/python \
-            "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation.git@5fb4b292afbd99d41e304a87ffedcdd5ad83929f"
           uv pip install --no-config --no-deps --python .venv/bin/python .
       - name: Run full test suite, including TestProgressRecovery
         run: .venv/bin/python -m pytest tests -v
