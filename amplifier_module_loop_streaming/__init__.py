@@ -2756,7 +2756,14 @@ class StreamingOrchestrator:
         )
 
         request_result = await hooks.emit(
-            PROVIDER_REQUEST, {"provider": provider_name, "iteration": 0}
+            PROVIDER_REQUEST,
+            {
+                "provider": provider_name,
+                "model": model_override
+                if model_override is not None
+                else self._provider_default_model(provider),
+                "iteration": 0,
+            },
         )
         if coordinator:
             request_result = await coordinator.process_hook_result(
@@ -3021,7 +3028,14 @@ class StreamingOrchestrator:
             )
 
             request_result = await hooks.emit(
-                PROVIDER_REQUEST, {"provider": provider_name, "iteration": 0}
+                PROVIDER_REQUEST,
+                {
+                    "provider": provider_name,
+                    "model": model_override
+                    if model_override is not None
+                    else self._provider_default_model(provider),
+                    "iteration": 0,
+                },
             )
             if coordinator:
                 request_result = await coordinator.process_hook_result(
@@ -3193,7 +3207,14 @@ class StreamingOrchestrator:
         # that gate LLM calls (approval, cost-aware routing, rate limiting)
         # see and can govern the evaluator's call too.
         request_result = await hooks.emit(
-            PROVIDER_REQUEST, {"provider": provider_name, "iteration": 0}
+            PROVIDER_REQUEST,
+            {
+                "provider": provider_name,
+                "model": model_override
+                if model_override is not None
+                else self._provider_default_model(provider),
+                "iteration": 0,
+            },
         )
         if coordinator:
             request_result = await coordinator.process_hook_result(
@@ -3513,12 +3534,10 @@ class StreamingOrchestrator:
             yield ("Error: No providers available", 0)
             return
 
-        # Find provider name for event emission
-        provider_name = None
-        for name, prov in providers.items():
-            if prov is provider:
-                provider_name = name
-                break
+        # Host wrappers can select a request-specific view of a mounted provider.
+        # Keep that view for execution, but report the exact mounted alias so
+        # provider-request hooks resolve the same provider before building tools.
+        provider_name = self._provider_name(provider, providers)
         budget_capable = callable(getattr(provider, "request_budget", None))
         measured_compaction_capable = (
             measured_view_getter is not None
@@ -4222,7 +4241,12 @@ class StreamingOrchestrator:
         if self._reminder_placement == "pre_user":
             turn_start_result = await hooks.emit(
                 PROVIDER_REQUEST,
-                {"provider": provider_name, "iteration": 1, "phase": "turn_start"},
+                {
+                    "provider": provider_name,
+                    "model": self._provider_default_model(provider),
+                    "iteration": 1,
+                    "phase": "turn_start",
+                },
             )
             if coordinator:
                 turn_start_result = await coordinator.process_hook_result(
@@ -4422,7 +4446,11 @@ class StreamingOrchestrator:
             else:
                 result = await hooks.emit(
                     PROVIDER_REQUEST,
-                    {"provider": provider_name, "iteration": iteration},
+                    {
+                        "provider": provider_name,
+                        "model": self._provider_default_model(provider),
+                        "iteration": iteration,
+                    },
                 )
                 if coordinator:
                     result = await coordinator.process_hook_result(
@@ -5549,6 +5577,7 @@ class StreamingOrchestrator:
                 PROVIDER_REQUEST,
                 {
                     "provider": provider_name,
+                    "model": self._provider_default_model(provider),
                     "iteration": iteration,
                     "max_reached": True,
                 },
@@ -6738,6 +6767,47 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
     async def _process_tools(self, context, tools, hooks) -> None:
         """Process any pending tool calls."""
         # Simplified - would process tracked tool calls
+
+    @staticmethod
+    def _provider_name(provider: Any, providers: dict[str, Any]) -> str | None:
+        """Resolve a mounted alias through transparent host wrappers by identity.
+
+        ``original`` and ``__wrapped__`` retain provider provenance without
+        replacing the mounted objects. Never match vendor ids or display names:
+        several instances can serve the same vendor with different credentials
+        and defaults. Prefer an exact match and decline ambiguous provenance.
+        This is recomputed each turn so replacing a host selection stays valid.
+        """
+        for name, mounted in providers.items():
+            if mounted is provider:
+                return name
+
+        def identities(value: Any) -> set[int]:
+            seen: set[int] = set()
+            pending = [value]
+            while pending and len(seen) < 32:
+                current = pending.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                for attribute in ("original", "__wrapped__"):
+                    # Read the wrapper's own link, not a delegated __getattr__
+                    # that may skip layers or recurse on malformed cycles.
+                    try:
+                        wrapped = object.__getattribute__(current, attribute)
+                    except AttributeError:
+                        continue
+                    if wrapped is not None and id(wrapped) not in seen:
+                        pending.append(wrapped)
+            return seen
+
+        selected = identities(provider)
+        matches = [
+            name
+            for name, mounted in providers.items()
+            if selected.intersection(identities(mounted))
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def _select_provider(self, providers: dict[str, Any]) -> Any:
         """Select the provider for the TOP-LEVEL CONVERSATION.

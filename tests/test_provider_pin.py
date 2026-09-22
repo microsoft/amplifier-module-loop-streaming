@@ -718,3 +718,126 @@ def test_not_mounted_check_precedes_vendor_check() -> None:
 
     with pytest.raises(ValueError, match="not mounted"):
         pin.pin("gemini-pro")
+
+
+class _ProviderView:
+    """Transparent request/telemetry views used by application hosts."""
+
+    def __init__(self, original):
+        self.original = original
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+
+class _SelectedProviderView(_ProviderView):
+    def __init__(self, original, model):
+        super().__init__(original)
+        self.model = model
+
+    def get_info(self):
+        info = self.original.get_info()
+        return info.model_copy(
+            update={"defaults": {**info.defaults, "model": self.model}}
+        )
+
+    async def complete(self, request, **kwargs):
+        return await self.original.complete(
+            request.model_copy(update={"model": self.model}), **kwargs
+        )
+
+
+def test_provider_alias_uses_identity_through_independent_wrapper_chains():
+    first = StubProvider("Anthropic", default_model="first")
+    second = StubProvider("Anthropic", default_model="second")
+    providers = {
+        "first": _ProviderView(first),
+        "second": _ProviderView(_ProviderView(second)),
+    }
+    assert (
+        StreamingOrchestrator._provider_name(
+            _SelectedProviderView(second, "override"), providers
+        )
+        == "second"
+    )
+    # Same vendor metadata is not evidence of the same mounted instance.
+    assert (
+        StreamingOrchestrator._provider_name(StubProvider("Anthropic"), providers)
+        is None
+    )
+    # Cycles terminate and ambiguous aliases are never guessed.
+    cycle = _ProviderView(second)
+    cycle.original = cycle
+    assert StreamingOrchestrator._provider_name(cycle, providers) is None
+    assert (
+        StreamingOrchestrator._provider_name(
+            _ProviderView(second), {"a": second, "b": second}
+        )
+        is None
+    )
+    assert StreamingOrchestrator._provider_name(second, {"a": second}) == "a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["pre_user", "tail"])
+async def test_wrapped_selection_reports_alias_and_effective_model_before_tool_snapshot(
+    placement,
+):
+    first = StubProvider("Anthropic", default_model="first-default")
+    second = StubProvider("Anthropic", default_model="second-default")
+    providers = {"first": _ProviderView(first), "second": _ProviderView(second)}
+    original_mounts = dict(providers)
+    selected = _SelectedProviderView(second, "second-override")
+    orch = StreamingOrchestrator(
+        {"max_iterations": 5, "stream_delay": 0, "reminder_placement": placement}
+    )
+    orch._select_provider = lambda _providers: selected
+    events = []
+    snapshots = []
+    hooks = HookRegistry()
+
+    async def before_request(event, data):
+        events.append(dict(data))
+
+    class Tool:
+        name = "probe"
+        description = "Capture native-tool construction timing"
+        @property
+        def input_schema(self):
+            return {"type": "object", "properties": {}}
+
+        @property
+        def native_tool_spec(self):
+            snapshots.append(dict(events[-1]))
+            return {"type": "test-native-tool"}
+
+    hooks.register("provider:request", before_request)
+    for underlying, model, alias in (
+        (second, "second-override", "second"),
+        (first, "first-override", "first"),
+    ):
+        # A warmed application replaces the root selection while retaining the
+        # same prepared execution map. The metadata must follow each new turn.
+        selected = _SelectedProviderView(underlying, model)
+        await orch.execute(
+            prompt="hi",
+            context=StubContext(),
+            providers=providers,
+            tools={"probe": Tool()},
+            hooks=hooks,
+        )
+        assert events[-1]["provider"] == alias
+        assert events[-1]["model"] == model
+        assert snapshots[-1]["provider"] == alias
+        assert snapshots[-1]["model"] == model
+    assert providers == original_mounts
+    assert first.get_info().defaults["model"] == "first-default"
+    assert second.get_info().defaults["model"] == "second-default"
+    # Goal/worker routing sees the unchanged provider map and original defaults.
+    orch._goal_model_cache = None
+    name, utility, model, config = await orch._resolve_goal_model(
+        providers, StubCoordinator(providers)
+    )
+    assert name == "first" and utility is providers["first"]
+    assert model is None and config == {}
+    assert utility.get_info().defaults["model"] == "first-default"
