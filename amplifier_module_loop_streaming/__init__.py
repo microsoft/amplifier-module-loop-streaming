@@ -42,6 +42,7 @@ from amplifier_core.events import (
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
+from ._text_estimate import estimate_messages
 from .steering import SteeringQueue
 
 logger = logging.getLogger(__name__)
@@ -3669,7 +3670,7 @@ class StreamingOrchestrator:
                         "reporting a concrete budget"
                     )
                 return None, None
-            context_estimate = sum(len(str(message)) // 4 for message in base_messages)
+            context_estimate = estimate_messages(base_messages).tokens
             budget_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
             if accepts_named_request_options(request_budget):
                 budget_kwargs["request_options"] = request_options
@@ -3726,6 +3727,11 @@ class StreamingOrchestrator:
                 {
                     "attempt": attempt,
                     "context_estimate": context_estimate,
+                    "context_estimate_scope": (
+                        "text_only"
+                        if estimate_messages(base_messages).has_unmeasured_images
+                        else "all_text"
+                    ),
                     "estimated_input_tokens": estimated,
                     "input_limit_tokens": allowance,
                     "context_token_budget": target,
@@ -3755,7 +3761,7 @@ class StreamingOrchestrator:
                     mode="measured", reason="capability_missing"
                 )
                 return None
-            context_estimate = sum(len(str(message)) // 4 for message in base_view)
+            context_estimate = estimate_messages(base_view).tokens
             kwargs: dict[str, Any] = {"context_estimate": context_estimate}
             if accepts_named_request_options(request_budget):
                 kwargs["request_options"] = request_options
@@ -4106,7 +4112,7 @@ class StreamingOrchestrator:
                 return None
 
             failed_call_end = time.monotonic()
-            context_estimate = sum(len(str(message)) // 4 for message in base_messages)
+            context_estimate = estimate_messages(base_messages).tokens
             recovery_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
             if accepts_named_request_options(recovery):
                 recovery_kwargs["request_options"] = request_options
@@ -4825,9 +4831,15 @@ class StreamingOrchestrator:
                             "orchestrator:provider_budget",
                             {
                                 "attempt": measured_result.get("count_calls", 1) - 1,
-                                "context_estimate": sum(
-                                    len(str(message)) // 4
-                                    for message in measured_result.get("base_view", [])
+                                "context_estimate": estimate_messages(
+                                    measured_result.get("base_view", [])
+                                ).tokens,
+                                "context_estimate_scope": (
+                                    "text_only"
+                                    if estimate_messages(
+                                        measured_result.get("base_view", [])
+                                    ).has_unmeasured_images
+                                    else "all_text"
                                 ),
                                 "estimated_input_tokens": estimated,
                                 "input_limit_tokens": allowance,
@@ -5809,9 +5821,15 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                                 "orchestrator:provider_budget",
                                 {
                                     "attempt": measured_result.get("count_calls", 1) - 1,
-                                    "context_estimate": sum(
-                                        len(str(message)) // 4
-                                        for message in measured_result.get("base_view", [])
+                                    "context_estimate": estimate_messages(
+                                        measured_result.get("base_view", [])
+                                    ).tokens,
+                                    "context_estimate_scope": (
+                                        "text_only"
+                                        if estimate_messages(
+                                            measured_result.get("base_view", [])
+                                        ).has_unmeasured_images
+                                        else "all_text"
                                     ),
                                     "estimated_input_tokens": estimated,
                                     "input_limit_tokens": allowance,
