@@ -1411,21 +1411,81 @@ class StreamingOrchestrator:
         self._goal_model_basis = None
         self._retention_capability_warned = False
 
-        # Peek at goal state *before* the first turn. Goal state can only be
-        # set (by the app layer's /goal command) before execute() is called,
-        # and can only be cleared (never newly set) from within this method's
-        # own goal loop below -- so whether a goal is active for this whole
-        # execute() invocation is a stable fact determinable once, up front.
-        # This lets us tell _execute_one_turn whether ORCHESTRATOR_COMPLETE
-        # emission must be deferred (see its `goal_turn` param and
-        # _flush_pending_complete below) -- deferred because "was this turn
-        # the *final* one" isn't knowable until the evaluator judges its
-        # result, which happens only after the turn (and its completion
-        # event) would otherwise already have fired.
+        # Hosts may create, revise, or pause a goal during a turn. Normalize
+        # the goal whenever it is consumed, not just at execute() entry.
         initial_goal = coordinator.session_state.get("goal") if coordinator else None
         if initial_goal:
             self._ensure_goal_defaults(initial_goal)
         goal_turn = (initial_goal["turns_used"] + 1) if initial_goal else None
+
+        def goal_version(goal):
+            # Identity covers replacement; these fields also cover an in-place
+            # edit while an evaluator or judge is awaiting its provider.
+            return tuple(
+                goal.get(key)
+                for key in ("condition", "task_id", "task_revision", "cap")
+            )
+
+        def current(goal, version):
+            return (
+                coordinator.session_state.get("goal") is goal
+                and goal_version(goal) == version
+            )
+
+        async def cancel_goal(goal, version):
+            cancelled_current = current(goal, version)
+            if cancelled_current:
+                coordinator.session_state["goal"] = None
+            # Best-effort diagnostics must not mask the original cancellation.
+            try:
+                await self._flush_pending_complete(goal_final=True)
+            except (Exception, asyncio.CancelledError):
+                logger.warning("Failed to emit cancelled goal completion")
+            if cancelled_current and not coordinator.session_state.get("goal"):
+                try:
+                    await hooks.emit(
+                        "orchestrator:goal_progress",
+                        self._goal_progress_payload(
+                            goal, state="cancelled",
+                            reason=f"condition was: {goal['condition']}",
+                        ),
+                    )
+                except (Exception, asyncio.CancelledError):
+                    logger.warning("Failed to emit cancelled goal progress")
+
+        async def stop_if_changed(goal, version):
+            if not current(goal, version):
+                await self._flush_pending_complete(goal_final=True)
+                return True
+            if coordinator.cancellation.is_cancelled:
+                await cancel_goal(goal, version)
+                return True
+            return False
+
+        async def finish_goal(goal, version, state, reason, **details):
+            summary = None
+            if self._goal_run_needs_summary(state):
+                try:
+                    summary = await self._summarize_goal_run(
+                        goal, providers, hooks, coordinator, state,
+                        **({"error_detail": reason} if state == "error" else {}),
+                    )
+                except asyncio.CancelledError:
+                    await cancel_goal(goal, version)
+                    raise
+            if await stop_if_changed(goal, version):
+                return
+            coordinator.session_state["goal"] = None
+            await self._flush_pending_complete(goal_final=True)
+            # A completion hook may install a successor goal. An old result
+            # must not mark that successor achieved or clear it.
+            if coordinator.session_state.get("goal"):
+                return
+            await hooks.emit(
+                "orchestrator:goal_progress",
+                self._goal_progress_payload(
+                    goal, state=state, reason=reason, summary=summary, **details),
+            )
 
         async def run_turn(turn_prompt: str, *, goal_turn: int | None) -> str:
             try:
@@ -1434,7 +1494,7 @@ class StreamingOrchestrator:
                     goal_turn=goal_turn,
                 )
             except (Exception, asyncio.CancelledError) as error:
-                if goal_turn is not None and coordinator is not None:
+                if coordinator is not None:
                     failed_goal = coordinator.session_state.get("goal")
                     coordinator.session_state["goal"] = None
                     # Each diagnostic is best effort. Neither may replace the
@@ -1468,6 +1528,8 @@ class StreamingOrchestrator:
         # part of that count, since it isn't a re-prompt. Set True right
         # after each continuation _execute_one_turn call below.
         is_continuation_turn = False
+        evaluated_goal = initial_goal
+        evaluated_version = None
 
         while True:
             goal = coordinator.session_state.get("goal")
@@ -1479,19 +1541,13 @@ class StreamingOrchestrator:
                 await self._flush_pending_complete(goal_final=True)
                 return full_response
 
-            if coordinator.cancellation.is_cancelled:
-                coordinator.session_state["goal"] = None
-                await self._flush_pending_complete(goal_final=True)
-                # No fast-model summary for a user-initiated cancellation --
-                # nothing to explain.
-                await hooks.emit(
-                    "orchestrator:goal_progress",
-                    self._goal_progress_payload(
-                        goal,
-                        state="cancelled",
-                        reason=f"condition was: {goal['condition']}",
-                    ),
-                )
+            self._ensure_goal_defaults(goal)
+            version = goal_version(goal)
+            if goal is not evaluated_goal or version != evaluated_version:
+                is_continuation_turn = False
+            evaluated_goal, evaluated_version = goal, version
+
+            if await stop_if_changed(goal, version):
                 return full_response
 
             goal["turns_used"] += 1
@@ -1521,34 +1577,18 @@ class StreamingOrchestrator:
                 satisfied, reason = await self._evaluate_goal(
                     goal["condition"], context, providers, hooks, coordinator
                 )
+            except asyncio.CancelledError:
+                await cancel_goal(goal, version)
+                raise
             except Exception as e:
-                # FAIL LOUD: never silently keep going, never silently
-                # declare success -- regardless of whether this turn also
-                # hit the cap. (Previously, an eval failure exactly at the
-                # cap boundary was swallowed into a bare "cap_hit" with no
-                # reason via a separate "final evaluation at cap" call;
-                # now there's only one evaluation call per turn, so a
-                # failure here is always reported honestly as "error".)
-                coordinator.session_state["goal"] = None
-                await self._flush_pending_complete(goal_final=True)
-                summary = (
-                    await self._summarize_goal_run(
-                        goal,
-                        providers,
-                        hooks,
-                        coordinator,
-                        "error",
-                        error_detail=str(e),
-                    )
-                    if self._goal_run_needs_summary("error")
-                    else None
-                )
-                await hooks.emit(
-                    "orchestrator:goal_progress",
-                    self._goal_progress_payload(
-                        goal, state="error", reason=str(e), summary=summary
-                    ),
-                )
+                # A result (including an error) for an obsolete goal cannot
+                # clear, complete, or continue the user's newer goal.
+                if await stop_if_changed(goal, version):
+                    return full_response
+                await finish_goal(goal, version, "error", str(e))
+                return full_response
+
+            if await stop_if_changed(goal, version):
                 return full_response
 
             goal["last_reason"] = reason
@@ -1556,24 +1596,7 @@ class StreamingOrchestrator:
             self._record_goal_evidence(goal, reason)
 
             if satisfied:
-                # Achieved regardless of cap_hit -- the cap merely stops the
-                # loop from re-checking again, it never fails a goal that
-                # was, in fact, satisfied on its last permitted turn.
-                coordinator.session_state["goal"] = None
-                await self._flush_pending_complete(goal_final=True)
-                summary = (
-                    await self._summarize_goal_run(
-                        goal, providers, hooks, coordinator, "achieved"
-                    )
-                    if self._goal_run_needs_summary("achieved")
-                    else None
-                )
-                await hooks.emit(
-                    "orchestrator:goal_progress",
-                    self._goal_progress_payload(
-                        goal, state="achieved", reason=reason, summary=summary
-                    ),
-                )
+                await finish_goal(goal, version, "achieved", reason)
                 return full_response
 
             # Stall bookkeeping runs for every completed continuation turn
@@ -1646,24 +1669,16 @@ class StreamingOrchestrator:
                             coordinator,
                             trigger=stall_trigger,
                         )
+                    except asyncio.CancelledError:
+                        await cancel_goal(goal, version)
+                        raise
                     except Exception as e:
+                        if await stop_if_changed(goal, version):
+                            return full_response
                         logger.exception("/goal: progress assessment failed")
-                        coordinator.session_state["goal"] = None
-                        await self._flush_pending_complete(goal_final=True)
-                        summary = await self._summarize_goal_run(
-                            goal,
-                            providers,
-                            hooks,
-                            coordinator,
-                            "error",
-                            error_detail=str(e),
-                        )
-                        await hooks.emit(
-                            "orchestrator:goal_progress",
-                            self._goal_progress_payload(
-                                goal, state="error", reason=str(e), summary=summary
-                            ),
-                        )
+                        await finish_goal(goal, version, "error", str(e))
+                        return full_response
+                    if await stop_if_changed(goal, version):
                         return full_response
                     if progress_verdict == "demonstrated":
                         self._snapshot_goal_progress_anchors(goal)
@@ -1675,34 +1690,9 @@ class StreamingOrchestrator:
             if is_stalled and (
                 stall_trigger == "recovery" or goal["escalated"] or cap_hit
             ):
-                # Either this is the second trip (escalation already used
-                # and it stalled again), or it's the first trip but there's
-                # no cap budget left to offer the one-shot rescue turn.
-                # Either way: hard stop, reported as "stalled" rather than
-                # "cap_hit" -- we now know definitively the run is stuck,
-                # which is more informative than "ran out of turns", even
-                # when the cap also happened to run out on this same turn.
-                # This is a LOUD failure state, never mistakable for success.
-                coordinator.session_state["goal"] = None
-                await self._flush_pending_complete(goal_final=True)
-                summary = (
-                    await self._summarize_goal_run(
-                        goal, providers, hooks, coordinator, "stalled"
-                    )
-                    if self._goal_run_needs_summary("stalled")
-                    else None
-                )
-                await hooks.emit(
-                    "orchestrator:goal_progress",
-                    self._goal_progress_payload(
-                        goal,
-                        state="stalled",
-                        reason=reason,
-                        stall_detail=stall_detail,
-                        stall_verdict=stall_verdict,
-                        progress_verdict=progress_verdict,
-                        summary=summary,
-                    ),
+                await finish_goal(
+                    goal, version, "stalled", reason, stall_detail=stall_detail,
+                    stall_verdict=stall_verdict, progress_verdict=progress_verdict,
                 )
                 return full_response
 
@@ -1715,7 +1705,8 @@ class StreamingOrchestrator:
                 goal["recovery_pending"] = {
                     "before": list(goal.get("progress_evidence", [])[-1:])
                 }
-                await self._flush_pending_complete(goal_final=False)
+                # Let host controls veto continuation before publishing an
+                # intermediate completion for the saved answer.
                 await hooks.emit(
                     "orchestrator:goal_progress",
                     self._goal_progress_payload(
@@ -1726,6 +1717,11 @@ class StreamingOrchestrator:
                         progress_verdict=progress_verdict,
                     ),
                 )
+                if await stop_if_changed(goal, version):
+                    return full_response
+                await self._flush_pending_complete(goal_final=False)
+                if await stop_if_changed(goal, version):
+                    return full_response
                 goal["continuations"] += 1
                 stall_prompt = self._goal_stall_escalation_prompt(
                     goal,
@@ -1741,29 +1737,11 @@ class StreamingOrchestrator:
                 continue
 
             if cap_hit:
-                # Not stalled (or the mechanical streak hadn't reached
-                # threshold this turn) -- the cap simply ran out. `reason`
-                # is already known from the evaluation above; no separate
-                # "final" evaluation call is needed since evaluation now
-                # always runs before the cap is checked.
-                coordinator.session_state["goal"] = None
-                await self._flush_pending_complete(goal_final=True)
-                summary = await self._summarize_goal_run(
-                    goal, providers, hooks, coordinator, "cap_hit"
-                )
-                await hooks.emit(
-                    "orchestrator:goal_progress",
-                    self._goal_progress_payload(
-                        goal,
-                        state="cap_hit",
-                        reason=reason,
-                        progress_verdict=progress_verdict,
-                        summary=summary,
-                    ),
+                await finish_goal(
+                    goal, version, "cap_hit", reason, progress_verdict=progress_verdict,
                 )
                 return full_response
 
-            await self._flush_pending_complete(goal_final=False)
             await hooks.emit(
                 "orchestrator:goal_progress",
                 self._goal_progress_payload(
@@ -1774,6 +1752,11 @@ class StreamingOrchestrator:
                 ),
             )
 
+            if await stop_if_changed(goal, version):
+                return full_response
+            await self._flush_pending_complete(goal_final=False)
+            if await stop_if_changed(goal, version):
+                return full_response
             goal["continuations"] += 1
             full_response = await run_turn(
                 reason,
@@ -1803,9 +1786,9 @@ class StreamingOrchestrator:
             goal_turn: When this turn is part of an active /goal auto-continue
                 pursuit (spike: docs/designs/goal-command.md), the 1-based
                 goal-turn number; ``None`` when no goal is active. When
-                ``None`` (the default), ``ORCHESTRATOR_COMPLETE`` is emitted
-                immediately as before -- zero behavior change. When set, the
-                caller (``execute()``'s goal loop) doesn't yet know whether
+                ``None`` (the default), completion is immediate unless a
+                goal was introduced during this turn. When a goal is active,
+                the caller (``execute()``'s goal loop) doesn't yet know whether
                 this is the *final* turn of the pursuit (that depends on the
                 evaluator judging this turn's result, which hasn't happened
                 yet), so emission is deferred via
@@ -1824,7 +1807,7 @@ class StreamingOrchestrator:
         # increment it) so execute()'s stall detection can read an accurate
         # "did this turn run any tools" count once this method returns.
         self._tool_calls_this_turn = 0
-        self._goal_turn_evidence = {"tools": []} if goal_turn is not None else None
+        self._goal_turn_evidence = {"tools": []} if coordinator is not None else None
         self._llm_calls_this_turn = 0
         # Layer 1 call-budget bookkeeping, reset per turn alongside
         # _tool_calls_this_turn above (spec: 298-replacement).
@@ -1871,6 +1854,9 @@ class StreamingOrchestrator:
         # payload below. None when no goal is active -- same discriminator
         # pattern as goal_turn/goal_final.
         goal_state = coordinator.session_state.get("goal") if coordinator else None
+        if goal_state:
+            self._ensure_goal_defaults(goal_state)
+            goal_turn = goal_state["turns_used"] + 1
 
         payload = {
             "orchestrator": "loop-streaming",
