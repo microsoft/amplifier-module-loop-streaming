@@ -36,6 +36,27 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 - Progressive rendering
 - Interruptible generation
 
+### Goals changed during a turn
+
+Hosts may set `coordinator.session_state["goal"]` before execution or while a
+conversation turn is running. The original goal fields (`condition`,
+`turns_used`, `last_reason`, `cap`) remain supported; the loop initializes its
+additional bookkeeping whenever it consumes a goal. A goal introduced during
+a turn receives the same bounded tool/response evidence and completion
+ordering as one set before execution.
+
+If the host clears, replaces, or revises a goal while its evaluator, stall
+judge, or terminal summary is awaiting a response, the old result is discarded.
+The current answer is finalized and returned; a successor goal is preserved
+for the next explicit execution, without replaying the input or starting work
+for that successor. Hosts that revise a goal in place must change its condition,
+cap, or task revision. Cancellation stops automatic continuation and clears
+only the goal being cancelled.
+
+`orchestrator:complete` is deferred until the goal decision is known. Continuing
+progress hooks run before an intermediate completion so a host can pause there;
+the final completion then remains marked `goal_final: true`.
+
 ### Durable completed-tool checkpoints
 
 A host may register a zero-argument `session.durable_checkpoint` capability on
