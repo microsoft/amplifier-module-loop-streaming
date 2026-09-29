@@ -5345,28 +5345,80 @@ class StreamingOrchestrator:
 
                 await context.add_message(assistant_msg)
 
-                # Process tool calls in parallel (user guidance: assume parallel intent)
-                # Execute tools concurrently, but add results to context sequentially for determinism
+                # Process tool calls in parallel by default. A provider can mark
+                # native-toolset calls as one ordered batch; one such marker makes
+                # the complete response batch sequential so response order is
+                # preserved even when it also contains an ordinary tool call.
+                # Results are always added to context in response order.
                 import uuid
 
                 parallel_group_id = str(uuid.uuid4())
-
-                # Execute all tools in parallel (no context updates inside).
-                # Materialized as Tasks rather than bare coroutines so the
-                # cancellation handler below can ask each one INDIVIDUALLY
-                # whether it finished. A completed sibling's result must never
-                # be overwritten by another task's cancellation.
-                tool_tasks = [
-                    asyncio.ensure_future(
-                        self._execute_tool_only(
-                            tc, tools, hooks, parallel_group_id, coordinator
-                        )
-                    )
+                sequential_batch = any(
+                    getattr(tc, "_amplifier_execution_mode", None) == "sequential"
                     for tc in tool_calls
-                ]
+                )
+                tool_tasks: list[asyncio.Task] = []
+                tool_result_errors: list[bool] | None = None
 
                 try:
-                    tool_results = await asyncio.gather(*tool_tasks)
+                    if sequential_batch:
+                        # Native computer members mutate one shared UI. They must
+                        # run in exactly the provider response order; dispatching
+                        # the later action before the prior action settles makes
+                        # coordinate/state-dependent actions unsafe.
+                        tool_results = []
+                        tool_result_errors = []
+                        failed_tool_call_id: str | None = None
+                        for tc in tool_calls:
+                            if failed_tool_call_id is not None:
+                                tool_results.append(
+                                    (
+                                        tc.id,
+                                        tc.name,
+                                        json.dumps(
+                                            {
+                                                "error": (
+                                                    "Skipped because a prior sequential "
+                                                    "tool call failed"
+                                                ),
+                                                "skipped": True,
+                                                "failed_tool_call_id": failed_tool_call_id,
+                                                "tool": tc.name,
+                                            }
+                                        ),
+                                    )
+                                )
+                                tool_result_errors.append(True)
+                                continue
+
+                            tool_call_id, tool_name, content, is_error = (
+                                await self._execute_tool_only(
+                                    tc,
+                                    tools,
+                                    hooks,
+                                    parallel_group_id,
+                                    coordinator,
+                                    include_error_status=True,
+                                )
+                            )
+                            tool_results.append((tool_call_id, tool_name, content))
+                            tool_result_errors.append(is_error)
+                            if is_error:
+                                failed_tool_call_id = tool_call_id
+                    else:
+                        # Materialized as Tasks rather than bare coroutines so the
+                        # cancellation handler below can ask each one INDIVIDUALLY
+                        # whether it finished. A completed sibling's result must
+                        # never be overwritten by another task's cancellation.
+                        tool_tasks = [
+                            asyncio.ensure_future(
+                                self._execute_tool_only(
+                                    tc, tools, hooks, parallel_group_id, coordinator
+                                )
+                            )
+                            for tc in tool_calls
+                        ]
+                        tool_results = await asyncio.gather(*tool_tasks)
                 except asyncio.CancelledError:
                     # Cancellation reached this batch. Two ways in:
                     #   (a) the enclosing task was cancelled (second Ctrl+C) --
@@ -5388,32 +5440,55 @@ class StreamingOrchestrator:
                     # tool_result pairing is preserved (the property the
                     # blanket overwrite was protecting).
                     preserved = 0
-                    for tc, task in zip(tool_calls, tool_tasks):
-                        content: str | None = None
-                        if task.done() and not task.cancelled():
-                            task_exc = task.exception()
-                            if task_exc is None:
-                                # Completed -- keep ITS OWN output verbatim.
-                                _done_id, _done_name, content = task.result()
+                    if sequential_batch:
+                        # No sequential task is ever left running: the active
+                        # await propagated cancellation and later calls have not
+                        # started. Preserve each already-settled result, then pair
+                        # every remaining call with a cancelled result.
+                        for index, tc in enumerate(tool_calls):
+                            if index < len(tool_results):
+                                _done_id, _done_name, content = tool_results[index]
                                 preserved += 1
+                                is_error = bool(tool_result_errors[index])
                             else:
-                                # Finished by raising something that is not a
-                                # cancellation; report that, not "cancelled".
-                                content = f"Internal error executing tool: {task_exc!s}"
-                        elif not task.done():
-                            # Still in flight. Stop it rather than leaving it
-                            # running unobserved past the cancelled turn.
-                            task.cancel()
-                        if content is None:
-                            content = f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}'
-                        await context.add_message(
-                            {
+                                content = f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}'
+                                is_error = False
+                            tool_message = {
                                 "role": "tool",
                                 "name": tc.name,
                                 "tool_call_id": tc.id,
                                 "content": content,
                             }
-                        )
+                            if is_error:
+                                tool_message["is_error"] = True
+                            await context.add_message(tool_message)
+                    else:
+                        for tc, task in zip(tool_calls, tool_tasks):
+                            content: str | None = None
+                            if task.done() and not task.cancelled():
+                                task_exc = task.exception()
+                                if task_exc is None:
+                                    # Completed -- keep ITS OWN output verbatim.
+                                    _done_id, _done_name, content = task.result()
+                                    preserved += 1
+                                else:
+                                    # Finished by raising something that is not a
+                                    # cancellation; report that, not "cancelled".
+                                    content = f"Internal error executing tool: {task_exc!s}"
+                            elif not task.done():
+                                # Still in flight. Stop it rather than leaving it
+                                # running unobserved past the cancelled turn.
+                                task.cancel()
+                            if content is None:
+                                content = f'{{"error": "Tool execution was cancelled by user", "cancelled": true, "tool": "{tc.name}"}}'
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "name": tc.name,
+                                    "tool_call_id": tc.id,
+                                    "content": content,
+                                }
+                            )
                     logger.info(
                         "Tool execution cancelled - preserved %d of %d completed tool result(s)",
                         preserved,
@@ -5465,15 +5540,18 @@ class StreamingOrchestrator:
                     # MUST add tool results to context before returning
                     # Otherwise we leave orphaned tool_calls without matching tool_results
                     # which violates provider API contracts (Anthropic, OpenAI)
-                    for tool_call_id, tool_name, content in tool_results:
-                        await context.add_message(
-                            {
-                                "role": "tool",
-                                "name": tool_name,
-                                "tool_call_id": tool_call_id,
-                                "content": content,
-                            }
-                        )
+                    for index, (tool_call_id, tool_name, content) in enumerate(
+                        tool_results
+                    ):
+                        tool_message = {
+                            "role": "tool",
+                            "name": tool_name,
+                            "tool_call_id": tool_call_id,
+                            "content": content,
+                        }
+                        if tool_result_errors is not None and tool_result_errors[index]:
+                            tool_message["is_error"] = True
+                        await context.add_message(tool_message)
                     # Emit cancel:requested on first detection and trigger cleanup callbacks
                     if not self._cancel_requested_emitted:
                         self._cancel_requested_emitted = True
@@ -5515,15 +5593,16 @@ class StreamingOrchestrator:
 
                 # Add all results to context in original order (sequential, deterministic)
                 # Note: Context manager handles compaction internally when get_messages_for_request() is called
-                for tool_call_id, tool_name, content in tool_results:
-                    await context.add_message(
-                        {
-                            "role": "tool",
-                            "name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "content": content,
-                        }
-                    )
+                for index, (tool_call_id, tool_name, content) in enumerate(tool_results):
+                    tool_message = {
+                        "role": "tool",
+                        "name": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "content": content,
+                    }
+                    if tool_result_errors is not None and tool_result_errors[index]:
+                        tool_message["is_error"] = True
+                    await context.add_message(tool_message)
 
                 # tool:post precedes this ordered append. Only now is the
                 # settled batch ready for a host-owned durable checkpoint.
@@ -6401,7 +6480,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         hooks: HookRegistry,
         parallel_group_id: str,
         coordinator: ModuleCoordinator | None = None,
-    ) -> tuple[str, str, str]:
+        *,
+        include_error_status: bool = False,
+    ) -> tuple[str, str, str] | tuple[str, str, str, bool]:
         """Execute a single tool in parallel without adding to context.
 
         Returns (tool_call_id, name, content) tuple.
@@ -6423,6 +6504,12 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         was false for exactly that case, and it is what made the gather site
         look safe while it was overwriting completed work.
         """
+        def outcome(
+            content: str, is_error: bool
+        ) -> tuple[str, str, str] | tuple[str, str, str, bool]:
+            result = (tool_call.id, tool_call.name, content)
+            return (*result, is_error) if include_error_status else result
+
         try:
             # Pre-tool hook
             pre_result = await hooks.emit(
@@ -6439,11 +6526,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     pre_result, "tool:pre", tool_call.name
                 )
                 if pre_result.action == "deny":
-                    return (
-                        tool_call.id,
-                        tool_call.name,
-                        f"Denied by hook: {pre_result.reason}",
-                    )
+                    return outcome(f"Denied by hook: {pre_result.reason}", True)
 
             # Get tool
             tool = tools.get(tool_call.name)
@@ -6458,7 +6541,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         "parallel_group_id": parallel_group_id,
                     },
                 )
-                return (tool_call.id, tool_call.name, error_msg)
+                return outcome(error_msg, True)
 
             # Register tool with cancellation token for visibility
             if coordinator:
@@ -6566,7 +6649,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     content = str(modified_result)
             else:
                 content = result.get_serialized_output()
-            return (tool_call.id, tool_call.name, content)
+            return outcome(content, not result.success)
 
         except Exception as e:
             # Safety net: errors become error messages
@@ -6581,7 +6664,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     "parallel_group_id": parallel_group_id,
                 },
             )
-            return (tool_call.id, tool_call.name, error_msg)
+            return outcome(error_msg, True)
 
     async def _execute_tool_with_result(
         self,
