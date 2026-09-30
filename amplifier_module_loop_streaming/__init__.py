@@ -3365,6 +3365,8 @@ class StreamingOrchestrator:
                 retaining_getter = candidate
         measured_view_getter = None
         foreground_usage_claim = None
+        record_final_request = None
+        bind_signed_response = None
         if callable(get_capability):
             candidate = get_capability("context.measured_request_view")
             if callable(candidate):
@@ -3372,6 +3374,31 @@ class StreamingOrchestrator:
             candidate = get_capability("context.foreground_usage")
             if callable(candidate):
                 foreground_usage_claim = candidate
+            candidate = get_capability("context.final_request_record")
+            if callable(candidate):
+                record_final_request = candidate
+            candidate = get_capability("context.signed_replay")
+            if callable(candidate):
+                bind_signed_response = candidate
+
+        # These capabilities form one handoff, not two independent features:
+        # Context must both snapshot the exact request about to reach the
+        # provider and associate its admitted assistant response with that
+        # snapshot.  A mixed-version Context gets the legacy path unchanged.
+        if not (callable(record_final_request) and callable(bind_signed_response)):
+            record_final_request = None
+            bind_signed_response = None
+
+        def record_dispatch(request: ChatRequest) -> Any | None:
+            """Synchronously snapshot one final foreground provider dispatch."""
+            if record_final_request is None:
+                return None
+            return record_final_request(request)
+
+        def bind_admitted_response(ticket: Any | None) -> None:
+            """Synchronously associate an admitted assistant turn with its request."""
+            if ticket is not None and bind_signed_response is not None:
+                bind_signed_response(ticket)
         if (
             self._ephemeral_injection_mode == "persist"
             and retaining_getter is None
@@ -5031,6 +5058,8 @@ class StreamingOrchestrator:
                             ),
                         ),
                         on_unconfirmed_stream=record_unavailable_stream_usage,
+                        record_dispatch=record_dispatch,
+                        bind_admitted_response=bind_admitted_response,
                     )
                 else:
                     response_stream = self._stream_from_provider(
@@ -5042,6 +5071,8 @@ class StreamingOrchestrator:
                         coordinator,
                         provider_name=provider_name,
                         on_stream_error=record_unavailable_stream_usage,
+                        record_dispatch=record_dispatch,
+                        bind_admitted_response=bind_admitted_response,
                     )
                 async for chunk in response_stream:
                     # Check for immediate cancellation between chunks
@@ -5075,8 +5106,10 @@ class StreamingOrchestrator:
             else:
                 # Fallback to non-streaming
                 foreground_recorder = foreground_usage_recorder()
+                response_ticket = None
                 try:
                     self._llm_calls_this_turn += 1
+                    response_ticket = record_dispatch(chat_request)
                     response = await provider.complete(chat_request, **request_options)
                 except ContextLengthError as error:
                     recovered_request = await recover_context_overflow(
@@ -5109,6 +5142,7 @@ class StreamingOrchestrator:
                         )
                         raise
                     self._llm_calls_this_turn += 1
+                    response_ticket = record_dispatch(recovered_request)
                     response = await provider.complete(
                         recovered_request, **request_options
                     )
@@ -5268,6 +5302,7 @@ class StreamingOrchestrator:
                         assistant_msg["metadata"] = response.metadata
 
                     await context.add_message(assistant_msg)
+                    bind_admitted_response(response_ticket)
                     # Last-drain edge: if a steer arrived during the final generation,
                     # loop once more so the model acts on it this turn. The top-of-
                     # iteration drain performs the actual injection.
@@ -5353,6 +5388,7 @@ class StreamingOrchestrator:
                     assistant_msg["metadata"] = response.metadata
 
                 await context.add_message(assistant_msg)
+                bind_admitted_response(response_ticket)
 
                 # Process tool calls in parallel by default. A provider can mark
                 # native-toolset calls as one ordered batch; one such marker makes
@@ -6078,7 +6114,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         return
                 foreground_recorder = foreground_usage_recorder()
                 self._llm_calls_this_turn += 1
+                response_ticket = None
                 try:
+                    response_ticket = record_dispatch(max_iter_chat_request)
                     response = await provider.complete(
                         max_iter_chat_request, **request_options
                     )
@@ -6102,6 +6140,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     if recovered_request is None:
                         raise
                     self._llm_calls_this_turn += 1
+                    response_ticket = record_dispatch(recovered_request)
                     response = await provider.complete(
                         recovered_request, **request_options
                     )
@@ -6170,6 +6209,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     if response_compliant and getattr(response, "metadata", None):
                         assistant_msg["metadata"] = response.metadata
                     await context.add_message(assistant_msg)
+                    bind_admitted_response(response_ticket)
                 else:
                     await close_finalization_tool_turn(
                         "The final response could not be generated."
@@ -6250,6 +6290,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         provider_name=None,
         recover_overflow=None,
         on_unconfirmed_stream=None,
+        record_dispatch=None,
+        bind_admitted_response=None,
     ) -> AsyncIterator[str]:
         """Forward a stream, retrying exactly once before its first SDK chunk."""
         while True:
@@ -6269,6 +6311,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 provider_name=provider_name,
                 on_provider_chunk=mark_provider_chunk,
                 on_stream_error=on_unconfirmed_stream,
+                record_dispatch=record_dispatch,
+                bind_admitted_response=bind_admitted_response,
             )
             try:
                 async for chunk in stream:
@@ -6300,6 +6344,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         provider_name=None,
         on_provider_chunk=None,
         on_stream_error=None,
+        record_dispatch=None,
+        bind_admitted_response=None,
     ) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming.
 
@@ -6319,7 +6365,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
         # Convert tools dict to list for provider
         tools_list = list(tools.values()) if tools else []
+        response_ticket = None
         try:
+            if record_dispatch is not None:
+                response_ticket = record_dispatch(chat_request)
             stream_iter = provider.stream(chat_request, tools=tools_list)
         except ContextLengthError:
             if on_stream_error is not None:
@@ -6357,6 +6406,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         await context.add_message(
                             {"role": "assistant", "content": full_response}
                         )
+                        if bind_admitted_response is not None:
+                            bind_admitted_response(response_ticket)
                     return
 
                 # Skip non-text block deltas (e.g. thinking block streaming chunks).
@@ -6386,6 +6437,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         # Add complete message to context
         if full_response:
             await context.add_message({"role": "assistant", "content": full_response})
+            if bind_admitted_response is not None:
+                bind_admitted_response(response_ticket)
 
     def _extract_text_from_content(self, content) -> str:
         """Extract text from content blocks.
