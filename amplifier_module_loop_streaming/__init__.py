@@ -2740,6 +2740,7 @@ class StreamingOrchestrator:
             model=model_override,
             metadata={"stream": False},
             max_output_tokens=self._GOAL_INTERNAL_CALL_MAX_TOKENS,
+            reasoning_effort="high",
         )
 
         request_result = await hooks.emit(
@@ -2787,14 +2788,16 @@ class StreamingOrchestrator:
         # hooks-session-naming's identical opt-out, same file/line cited
         # above).
         #
-        # `role_config` (from the resolved model role's `ProviderPreference`,
-        # e.g. `{"reasoning_effort": "high"}`) is forwarded as complete()
-        # kwargs first -- `extended_thinking=False` is applied AFTER so it
-        # always wins regardless of what the routing matrix's per-role
-        # config carries.
+        # Fresh utility calls use the compatible `high` effort overlay. This
+        # prevents a main-conversation xhigh/max role setting from becoming
+        # incompatible with their explicit thinking opt-out. Preserve all
+        # other role config (including credentials and source metadata).
         complete_kwargs: dict[str, Any] = dict(role_config)
+        complete_kwargs.pop("thinking_budget_tokens", None)
+        complete_kwargs.pop("thinking_display", None)
         if model_override:
             complete_kwargs["model"] = model_override
+        complete_kwargs["effort"] = "high"
         complete_kwargs["extended_thinking"] = False
         try:
             response = await provider.complete(chat_request, **complete_kwargs)
@@ -3012,6 +3015,7 @@ class StreamingOrchestrator:
                 model=model_override,
                 metadata={"stream": False},
                 max_output_tokens=self._GOAL_INTERNAL_CALL_MAX_TOKENS,
+                reasoning_effort="high",
             )
 
             request_result = await hooks.emit(
@@ -3042,12 +3046,14 @@ class StreamingOrchestrator:
             # simply not setting it is not sufficient (a session-level
             # provider config can force thinking on regardless).
             #
-            # `role_config` forwarded first, extended_thinking=False applied
-            # after so it always wins (see the matching comment in
-            # _judge_stall / _resolve_goal_model).
+            # See _judge_stall: utility calls use a compatible `high` effort
+            # overlay while retaining unrelated role config.
             complete_kwargs: dict[str, Any] = dict(role_config)
+            complete_kwargs.pop("thinking_budget_tokens", None)
+            complete_kwargs.pop("thinking_display", None)
             if model_override:
                 complete_kwargs["model"] = model_override
+            complete_kwargs["effort"] = "high"
             complete_kwargs["extended_thinking"] = False
             response = await provider.complete(chat_request, **complete_kwargs)
             summary_text = ""
@@ -3188,6 +3194,7 @@ class StreamingOrchestrator:
             model=model_override,
             metadata={"stream": False},
             max_output_tokens=self._GOAL_INTERNAL_CALL_MAX_TOKENS,
+            reasoning_effort="high",
         )
 
         # Mirror _execute_stream's provider:request instrumentation so hooks
@@ -3223,12 +3230,14 @@ class StreamingOrchestrator:
         # confirmed (via real-session telemetry) to have run with thinking
         # enabled and a 32000-token budget in session e97e192b.
         #
-        # `role_config` forwarded first, extended_thinking=False applied
-        # after so it always wins (see the matching comment in
-        # _judge_stall / _resolve_goal_model).
+        # See _judge_stall: utility calls use a compatible `high` effort
+        # overlay while retaining unrelated role config.
         complete_kwargs: dict[str, Any] = dict(role_config)
+        complete_kwargs.pop("thinking_budget_tokens", None)
+        complete_kwargs.pop("thinking_display", None)
         if model_override:
             complete_kwargs["model"] = model_override
+        complete_kwargs["effort"] = "high"
         complete_kwargs["extended_thinking"] = False
         try:
             response = await provider.complete(chat_request, **complete_kwargs)

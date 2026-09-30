@@ -2089,10 +2089,10 @@ class TestModelRoleResolution:
         self,
     ) -> None:
         """A resolved role's `ProviderPreference.config` (e.g.
-        `{"reasoning_effort": "high"}`) must be forwarded as `complete()`
+        `{"reasoning_effort": "high"}`) must preserve unrelated `complete()`
         kwargs -- this is how the delegate path applies per-role config.
-        `extended_thinking=False` must still win even when the role's own
-        config tries to turn it on (DEFECT 4 invariant).
+        The utility-specific effort and thinking opt-out still take
+        precedence.
         """
         orch = _make_orchestrator()
         ctx = MockContext()
@@ -2102,7 +2102,10 @@ class TestModelRoleResolution:
                 ProviderPreference(
                     provider="main",
                     model="routed-fast-model",
-                    config={"reasoning_effort": "high", "extended_thinking": True},
+                    config={
+                        "reasoning_effort": "high",
+                        "extended_thinking": True,
+                    },
                 )
             ]
         )
@@ -2122,6 +2125,7 @@ class TestModelRoleResolution:
 
         kwargs = provider.eval_call_kwargs[0]
         assert kwargs.get("reasoning_effort") == "high"
+        assert kwargs.get("effort") == "high"
         # extended_thinking=False always wins, even though the role's own
         # config tried to set it True.
         assert kwargs.get("extended_thinking") is False
@@ -3190,6 +3194,101 @@ class TestDistinctBlockerCount:
 
 @pytest.mark.asyncio
 class TestInternalCallsDoNotStream:
+    @pytest.mark.parametrize(
+        "role_config",
+        [
+            {
+                "reasoning_effort": "xhigh",
+                "thinking_budget_tokens": 32_000,
+                "thinking_display": "enabled",
+                "credential": "utility-role-credential",
+                "source": "goal-utility-test",
+            },
+            {
+                "effort": "max",
+                "thinking_budget_tokens": 32_000,
+                "thinking_display": "enabled",
+                "credential": "utility-role-credential",
+                "source": "goal-utility-test",
+            },
+        ],
+    )
+    async def test_fresh_utility_calls_overlay_high_effort_and_drop_thinking_config(
+        self, role_config: dict[str, Any]
+    ) -> None:
+        """Fresh /goal utilities must not inherit incompatible thinking config."""
+        orch = _make_orchestrator()
+        ctx = MockContext()
+        hooks = MockHooks()
+        coordinator = MockCoordinator(
+            capabilities={
+                "model_role_resolver": FakeModelRoleResolver(
+                    preferences=[
+                        ProviderPreference(
+                            provider="main",
+                            model="routed-fast-model",
+                            config=role_config,
+                        )
+                    ]
+                )
+            }
+        )
+        provider = FakeProvider()
+        provider.eval_queue.append((True, "looks satisfied"))
+        provider.judge_queue.append((True, "same blocker again"))
+
+        await ctx.add_message({"role": "user", "content": "do the thing"})
+        await orch._evaluate_goal(
+            "the thing is done",
+            ctx,
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+        await orch._judge_stall(
+            {
+                "condition": "solved",
+                "turns_used": 2,
+                "last_reason": None,
+                "cap": None,
+                "reasons": ["blocked: x", "blocked: x"],
+                "no_tool_turns": 2,
+            },
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+        )
+        await orch._summarize_goal_run(
+            {
+                "condition": "solved",
+                "turns_used": 3,
+                "last_reason": "still blocked",
+                "cap": None,
+                "reasons": ["blocked: x"],
+                "no_tool_turns": 3,
+            },
+            {"main": provider},
+            hooks,  # type: ignore[arg-type]
+            coordinator,  # type: ignore[arg-type]
+            final_state="stalled",
+        )
+
+        utility_calls = [
+            (provider.eval_call_requests[0], provider.eval_call_kwargs[0]),
+            (provider.judge_call_requests[0], provider.judge_call_kwargs[0]),
+            (provider.summary_call_requests[0], provider.summary_call_kwargs[0]),
+        ]
+        for request, kwargs in utility_calls:
+            assert request.reasoning_effort == "high"
+            assert kwargs["effort"] == "high"
+            assert kwargs["extended_thinking"] is False
+            assert "thinking_budget_tokens" not in kwargs
+            assert "thinking_display" not in kwargs
+            assert kwargs["credential"] == "utility-role-credential"
+            assert kwargs["source"] == "goal-utility-test"
+        assert role_config["thinking_budget_tokens"] == 32_000
+        assert role_config["thinking_display"] == "enabled"
+
     async def test_evaluate_goal_sets_stream_false_and_disables_thinking(
         self,
     ) -> None:
