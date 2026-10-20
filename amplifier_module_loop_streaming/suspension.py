@@ -62,7 +62,7 @@ def validate(continuation: dict[str, Any], messages: list, config: dict) -> dict
     frame = canonical_copy(continuation)
     if frame.get("version") != 1 or frame.get("engine") != "loop-streaming":
         raise ValueError("Unsupported execution continuation")
-    if frame.get("phase") not in {"provider", "prepared_request", "tools", "settling_tools", "goal"}:
+    if frame.get("phase") not in {"provider", "prepared_request", "tools", "settling_tools", "goal", "prepared_finalization"}:
         raise ValueError("Unsupported execution continuation phase")
     if frame.get("history") != fingerprint(messages):
         raise ValueError("Execution continuation history changed; inspect before resuming")
@@ -76,7 +76,7 @@ def validate(continuation: dict[str, Any], messages: list, config: dict) -> dict
         len(frame.get("settled_tools", [])) != len(frame["tool_calls"])
     ):
         raise ValueError("Tool continuation outcomes do not match calls")
-    if frame["phase"] == "prepared_request" and not isinstance(frame.get("prepared_request"), dict):
+    if frame["phase"] in {"prepared_request", "prepared_finalization"} and not isinstance(frame.get("prepared_request"), dict):
         raise ValueError("Prepared continuation has no request")
     if frame["phase"] == "goal" and (not isinstance(frame.get("goal_loop"), dict) or
             frame["goal_loop"].get("phase") not in {"evaluate", "evaluated", "judge", "judged", "finish", "next_turn"}):

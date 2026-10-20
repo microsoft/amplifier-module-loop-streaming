@@ -4767,7 +4767,10 @@ class StreamingOrchestrator:
                 return
             await self._suspend_at_boundary("provider", iteration, context, coordinator)
 
-        prepared = continuation.get("prepared_request") if continuation else None
+        prepared = (continuation.get("prepared_request") if continuation
+                    and continuation["phase"] == "prepared_request" else None)
+        final_prepared = (continuation.get("prepared_request") if continuation
+                          and continuation["phase"] == "prepared_finalization" else None)
         while prepared is not None or self.max_iterations == -1 or iteration < self.max_iterations:
             # Check for cancellation at iteration start
             if coordinator and coordinator.cancellation.is_cancelled:
@@ -5834,424 +5837,457 @@ class StreamingOrchestrator:
             self._budget_exhausted = True
             logger.warning(f"Max iterations ({self.max_iterations}) reached")
 
-            # Inject system reminder to agent before returning
-            finalization_result = await hooks.emit(
-                PROVIDER_REQUEST,
-                {
-                    "provider": provider_name,
-                    "model": self._provider_default_model(provider),
-                    "iteration": iteration,
-                    "max_reached": True,
-                },
-            )
-            if coordinator:
-                finalization_result = await coordinator.process_hook_result(
-                    finalization_result, "provider:request", "orchestrator"
+            if final_prepared is None:
+                # Inject system reminder to agent before returning
+                finalization_result = await hooks.emit(
+                    PROVIDER_REQUEST,
+                    {
+                        "provider": provider_name,
+                        "model": self._provider_default_model(provider),
+                        "iteration": iteration,
+                        "max_reached": True,
+                    },
                 )
-                if coordinator.cancellation.is_cancelled:
+                if coordinator:
+                    finalization_result = await coordinator.process_hook_result(
+                        finalization_result, "provider:request", "orchestrator"
+                    )
+                    if coordinator.cancellation.is_cancelled:
+                        await close_finalization_tool_turn(
+                            "The previous operation was cancelled. Results from completed tools have been preserved."
+                        )
+                        await exit_for_cancellation()
+                        return
+                    if finalization_result.action == "deny":
+                        denial_text = f"Operation denied: {finalization_result.reason}"
+                        await close_finalization_tool_turn(denial_text)
+                        yield (denial_text, iteration)
+                        return
+
+                if coordinator and coordinator.cancellation.is_cancelled:
                     await close_finalization_tool_turn(
                         "The previous operation was cancelled. Results from completed tools have been preserved."
                     )
                     await exit_for_cancellation()
                     return
-                if finalization_result.action == "deny":
-                    denial_text = f"Operation denied: {finalization_result.reason}"
-                    await close_finalization_tool_turn(denial_text)
-                    yield (denial_text, iteration)
-                    return
 
-            if coordinator and coordinator.cancellation.is_cancelled:
-                await close_finalization_tool_turn(
-                    "The previous operation was cancelled. Results from completed tools have been preserved."
-                )
-                await exit_for_cancellation()
-                return
+                # A steer that required this finalization must be part of its one
+                # allowed provider call, not discarded at the next turn boundary.
+                await self._drain_steering(context, hooks, iteration)
 
-            # A steer that required this finalization must be part of its one
-            # allowed provider call, not discarded at the next turn boundary.
-            await self._drain_steering(context, hooks, iteration)
-
-            # Current provider-hook requirements and a queued tool-post
-            # injection must survive the bounded finalization assembly too.
-            final_retained_contents: list[str] = []
-            final_replay_request_injection = (
-                (
-                    finalization_result.context_injection,
-                    finalization_result.append_to_last_tool_result,
-                )
-                if self._ephemeral_injection_mode == "tail"
-                and finalization_result.action == "inject_context"
-                and finalization_result.ephemeral
-                and finalization_result.context_injection
-                else None
-            )
-            final_replay_pending_injections = (
-                list(self._pending_ephemeral_injections)
-                if self._ephemeral_injection_mode == "tail"
-                else []
-            )
-            if (
-                retaining_getter is not None
-                and self._ephemeral_injection_mode == "persist"
-                and finalization_result.action == "inject_context"
-                and finalization_result.ephemeral
-                and finalization_result.context_injection
-            ):
-                content, _ = await self._persist_reminder(
-                    context,
-                    finalization_result.context_injection,
-                    tail=True,
-                    verify_admitted=True,
-                )
-                final_retained_contents.append(content)
-            if (
-                retaining_getter is not None
-                and self._ephemeral_injection_mode == "persist"
-                and self._pending_ephemeral_injections
-            ):
-                pending_body = "\n\n".join(
-                    injection["content"]
-                    for injection in self._pending_ephemeral_injections
-                    if injection.get("content")
-                )
-                if pending_body:
-                    content, _ = await self._persist_reminder(
-                        context, pending_body, tail=True, verify_admitted=True
+                # Current provider-hook requirements and a queued tool-post
+                # injection must survive the bounded finalization assembly too.
+                final_retained_contents: list[str] = []
+                final_replay_request_injection = (
+                    (
+                        finalization_result.context_injection,
+                        finalization_result.append_to_last_tool_result,
                     )
-                    final_retained_contents.append(content)
-                self._pending_ephemeral_injections.clear()
-            if (
-                retaining_getter is None
-                and self._ephemeral_injection_mode == "persist"
-            ):
+                    if self._ephemeral_injection_mode == "tail"
+                    and finalization_result.action == "inject_context"
+                    and finalization_result.ephemeral
+                    and finalization_result.context_injection
+                    else None
+                )
+                final_replay_pending_injections = (
+                    list(self._pending_ephemeral_injections)
+                    if self._ephemeral_injection_mode == "tail"
+                    else []
+                )
                 if (
-                    finalization_result.action == "inject_context"
+                    retaining_getter is not None
+                    and self._ephemeral_injection_mode == "persist"
+                    and finalization_result.action == "inject_context"
                     and finalization_result.ephemeral
                     and finalization_result.context_injection
                 ):
-                    await self._persist_reminder(
-                        context, finalization_result.context_injection, tail=True
+                    content, _ = await self._persist_reminder(
+                        context,
+                        finalization_result.context_injection,
+                        tail=True,
+                        verify_admitted=True,
                     )
-                if self._pending_ephemeral_injections:
+                    final_retained_contents.append(content)
+                if (
+                    retaining_getter is not None
+                    and self._ephemeral_injection_mode == "persist"
+                    and self._pending_ephemeral_injections
+                ):
                     pending_body = "\n\n".join(
                         injection["content"]
                         for injection in self._pending_ephemeral_injections
                         if injection.get("content")
                     )
                     if pending_body:
-                        await self._persist_reminder(context, pending_body, tail=True)
+                        content, _ = await self._persist_reminder(
+                            context, pending_body, tail=True, verify_admitted=True
+                        )
+                        final_retained_contents.append(content)
                     self._pending_ephemeral_injections.clear()
-            if measured_compaction_capable:
-                # Context's measured capability owns the snapshot; do not make
-                # an estimate-driven finalization view before asking it.
-                message_dicts: list[dict[str, Any]] = []
-                base_message_dicts: list[dict[str, Any]] = []
-            else:
-                message_dicts = list(await request_messages(final_retained_contents))
-                base_message_dicts = list(message_dicts)
-            if self._ephemeral_injection_mode == "tail":
-                message_dicts = _replay_request_overlays(
-                    message_dicts,
-                    turn_start_view_block=None,
-                    request_injection=final_replay_request_injection,
-                    pending_injections=final_replay_pending_injections,
-                )
-                self._pending_ephemeral_injections.clear()
-            # The finalization hook and context assembly both await. Check
-            # again before contacting the provider so a concurrent
-            # cancellation cannot buy an unrequested final provider call.
-            if coordinator and coordinator.cancellation.is_cancelled:
-                await close_finalization_tool_turn(
-                    "The previous operation was cancelled. Results from completed tools have been preserved."
-                )
-                await exit_for_cancellation()
-                return
-            # Enveloped (tail variant) and metadata-stamped. This message is
-            # VIEW-ONLY -- appended to message_dicts, never persisted via
-            # context.add_message -- so it carries no "persisted" key: under
-            # W5 (amplifier-module-provider-anthropic), an unstamped
-            # trailing message here would be treated as stable and could
-            # take a cache breakpoint on regenerated content.
-            finalization_overlay = {
-                    "role": "user",
-                    "content": _wrap_reminders(
-                        """<system-reminder source="orchestrator-loop-limit">
-You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
-
-DO NOT mention this iteration limit or reminder to the user explicitly. Simply wrap up naturally.
-</system-reminder>""",
-                        tail=True,
-                    ),
-                    "metadata": {
-                        "ephemeral": True,
-                        "reminder_placement": "tail",
-                    },
-            }
-            message_dicts.append(finalization_overlay)
-
-            try:
-                # Preserve the normal declarations, including provider-native
-                # specifications, so any assistant tool call and paired tool
-                # result in the existing transcript stay valid. The portable
-                # choice prevents new calls; this finalization path never
-                # parses or dispatches a tool response.
-                request_options: dict[str, Any] = {}
-                if self.extended_thinking:
-                    request_options["extended_thinking"] = True
-                final_measured_transaction = None
-                if measured_compaction_capable:
-                    async def count_final_view(
-                        base_view: list[dict[str, Any]],
-                        *,
-                        request_injection: tuple[str, bool] | None = final_replay_request_injection,
-                        pending_injections: list[dict[str, Any]] = final_replay_pending_injections,
-                        overlay: dict[str, Any] = finalization_overlay,
-                        options: Mapping[str, Any] = request_options,
-                    ) -> dict[str, Any]:
-                        candidate_messages = (
-                            _replay_request_overlays(
-                                base_view,
-                                turn_start_view_block=None,
-                                request_injection=request_injection,
-                                pending_injections=pending_injections,
-                            )
-                            if self._ephemeral_injection_mode == "tail"
-                            else list(base_view)
-                        )
-                        candidate_messages.append(overlay)
-                        candidate_request = build_chat_request(
-                            candidate_messages, tool_choice="none"
-                        )
-                        return {
-                            "dispatch": candidate_request,
-                            "budget_decision": await count_measured_request(
-                                candidate_request,
-                                base_view,
-                                request_options=options,
-                            ),
-                        }
-
-                    measured_result = await request_measured_view(
-                        final_retained_contents, count_final_view, request_options,
-                    )
-                    if not isinstance(measured_result, dict):
-                        raise TypeError(
-                            "context.measured_request_view returned a non-dictionary result"
-                        )
-                    final_measured_transaction = measured_result.get("transaction")
-                    max_iter_chat_request = measured_result.get(
-                        "final_attempt", {}
-                    ).get("dispatch")
-                    if not isinstance(max_iter_chat_request, ChatRequest):
-                        raise TypeError(
-                            "context.measured_request_view did not return a ChatRequest dispatch"
-                        )
-                    measured_final_count(measured_result)
-                    final_measured_base_view = measured_result.get("base_view")
-                    if not isinstance(final_measured_base_view, list) or not all(
-                        isinstance(message, dict) for message in final_measured_base_view
-                    ):
-                        raise TypeError(
-                            "context.measured_request_view returned an invalid base_view"
-                        )
-                    smaller_context_budget = None
-                    original_output_cap = None
-                    budget_decision = measured_result.get("final_attempt", {}).get(
-                        "budget_decision"
-                    )
+                if (
+                    retaining_getter is None
+                    and self._ephemeral_injection_mode == "persist"
+                ):
                     if (
-                        measured_final_count(measured_result) is not None
-                        and isinstance(budget_decision, dict)
+                        finalization_result.action == "inject_context"
+                        and finalization_result.ephemeral
+                        and finalization_result.context_injection
                     ):
-                        measurement = budget_decision["measurement"]
-                        estimated = budget_decision["estimated_input_tokens"]
-                        allowance = budget_decision["input_limit_tokens"]
-                        await await_with_measured_rollback(
-                            hooks.emit(
-                                "orchestrator:provider_budget",
-                                {
-                                    "attempt": measured_result.get("count_calls", 1) - 1,
-                                    "context_estimate": estimate_messages(
-                                        measured_result.get("base_view", [])
-                                    ).tokens,
-                                    "context_estimate_scope": (
-                                        "text_only"
-                                        if estimate_messages(
-                                            measured_result.get("base_view", [])
-                                        ).has_unmeasured_images
-                                        else "all_text"
-                                    ),
-                                    "estimated_input_tokens": estimated,
-                                    "input_limit_tokens": allowance,
-                                    "context_token_budget": budget_decision[
-                                        "context_token_budget"
-                                    ],
-                                    "result": (
-                                        "fits"
-                                        if estimated <= allowance
-                                        else "oversized"
-                                    ),
-                                    "measurement_kind": measurement["kind"],
-                                    "measurement_source": measurement.get("source"),
-                                    "measured_before": measured_result.get(
-                                        "measured_before"
-                                    ),
-                                    "measured_after": measured_result.get("measured_after"),
-                                    "policy_budget": measured_result.get("policy_budget"),
-                                    "trigger": measured_result.get("trigger"),
-                                    "target": measured_result.get("target"),
-                                    "outcome": measured_result.get("outcome"),
-                                    "count_calls": measured_result.get("count_calls"),
-                                },
-                            ),
-                            final_measured_transaction,
+                        await self._persist_reminder(
+                            context, finalization_result.context_injection, tail=True
                         )
-                    await emit_measured_output_degradation(
-                        measured_result, final_measured_transaction
-                    )
+                    if self._pending_ephemeral_injections:
+                        pending_body = "\n\n".join(
+                            injection["content"]
+                            for injection in self._pending_ephemeral_injections
+                            if injection.get("content")
+                        )
+                        if pending_body:
+                            await self._persist_reminder(context, pending_body, tail=True)
+                        self._pending_ephemeral_injections.clear()
+                if measured_compaction_capable:
+                    # Context's measured capability owns the snapshot; do not make
+                    # an estimate-driven finalization view before asking it.
+                    message_dicts: list[dict[str, Any]] = []
+                    base_message_dicts: list[dict[str, Any]] = []
                 else:
-                    max_iter_chat_request = build_chat_request(
-                        message_dicts, tool_choice="none"
+                    message_dicts = list(await request_messages(final_retained_contents))
+                    base_message_dicts = list(message_dicts)
+                if self._ephemeral_injection_mode == "tail":
+                    message_dicts = _replay_request_overlays(
+                        message_dicts,
+                        turn_start_view_block=None,
+                        request_injection=final_replay_request_injection,
+                        pending_injections=final_replay_pending_injections,
                     )
-                    smaller_context_budget, original_output_cap = (
-                        await check_request_budget(
-                            max_iter_chat_request,
-                            base_message_dicts,
-                            attempt=0,
-                            request_options=request_options,
-                        )
-                    )
-                dispatch_base_messages = (
-                    final_measured_base_view
-                    if measured_compaction_capable
-                    else base_message_dicts
-                )
-                if smaller_context_budget is not None:
-                    if smaller_context_budget <= 0:
-                        raise ContextLengthError(
-                            "Provider request exceeds its input budget and cannot retain "
-                            "a smaller context"
-                        )
-                    rebuilt_base_messages = list(
-                        await request_messages(
-                            final_retained_contents,
-                            token_budget=smaller_context_budget,
-                            hard_fit=True,
-                        )
-                    )
-                    dispatch_base_messages = rebuilt_base_messages
-                    rebuilt_messages = (
-                        _replay_request_overlays(
-                            rebuilt_base_messages,
-                            turn_start_view_block=None,
-                            request_injection=final_replay_request_injection,
-                            pending_injections=final_replay_pending_injections,
-                        )
-                        if self._ephemeral_injection_mode == "tail"
-                        else list(rebuilt_base_messages)
-                    )
-                    rebuilt_messages.append(finalization_overlay)
-                    rebuilt_request = build_chat_request(
-                        rebuilt_messages, tool_choice="none"
-                    )
-                    next_context_budget, _ = await check_request_budget(
-                        rebuilt_request,
-                        rebuilt_base_messages,
-                        attempt=1,
-                        request_options=request_options,
-                    )
-                    if next_context_budget is not None:
-                        reduced_output_request = await try_reduced_output(
-                            rebuilt_messages,
-                            rebuilt_base_messages,
-                            original_output_cap=original_output_cap,
-                            tool_choice="none",
-                            request_options=request_options,
-                        )
-                        if reduced_output_request is not None:
-                            max_iter_chat_request = reduced_output_request
-                        else:
-                            if next_context_budget <= 0:
-                                raise ContextLengthError(
-                                    "Provider request exceeds its input budget and cannot retain "
-                                    "a smaller context"
-                                )
-                            if next_context_budget >= smaller_context_budget:
-                                raise ContextLengthError(
-                                    "Provider finalization request remains over budget and a "
-                                    "second context budget would not reduce it"
-                                )
-                            rebuilt_base_messages = list(
-                                await request_messages(
-                                    final_retained_contents,
-                                    token_budget=next_context_budget,
-                                    hard_fit=True,
-                                )
-                            )
-                            dispatch_base_messages = rebuilt_base_messages
-                            rebuilt_messages = (
-                                _replay_request_overlays(
-                                    rebuilt_base_messages,
-                                    turn_start_view_block=None,
-                                    request_injection=final_replay_request_injection,
-                                    pending_injections=final_replay_pending_injections,
-                                )
-                                if self._ephemeral_injection_mode == "tail"
-                                else list(rebuilt_base_messages)
-                            )
-                            rebuilt_messages.append(finalization_overlay)
-                            rebuilt_request = build_chat_request(
-                                rebuilt_messages, tool_choice="none"
-                            )
-                            if (
-                                await check_request_budget(
-                                    rebuilt_request,
-                                    rebuilt_base_messages,
-                                    attempt=2,
-                                    request_options=request_options,
-                                )
-                            )[0] is not None:
-                                raise ContextLengthError(
-                                    "Provider finalization request remains over budget "
-                                    "after two context rebuilds"
-                                )
-                            max_iter_chat_request = rebuilt_request
-                    else:
-                        max_iter_chat_request = rebuilt_request
-
-                await await_with_measured_rollback(
-                    self._apply_rate_limit_delay(hooks, iteration),
-                    final_measured_transaction,
-                )
+                    self._pending_ephemeral_injections.clear()
+                # The finalization hook and context assembly both await. Check
+                # again before contacting the provider so a concurrent
+                # cancellation cannot buy an unrequested final provider call.
                 if coordinator and coordinator.cancellation.is_cancelled:
-                    if final_measured_transaction is not None:
-                        final_measured_transaction.rollback()
                     await close_finalization_tool_turn(
                         "The previous operation was cancelled. Results from completed tools have been preserved."
                     )
                     await exit_for_cancellation()
                     return
-                if final_measured_transaction is not None:
-                    committed = await await_with_measured_rollback(
-                        final_measured_transaction.commit(
-                            is_cancelled=(
-                                lambda: bool(
-                                    coordinator
-                                    and coordinator.cancellation.is_cancelled
-                                )
-                            )
+                # Enveloped (tail variant) and metadata-stamped. This message is
+                # VIEW-ONLY -- appended to message_dicts, never persisted via
+                # context.add_message -- so it carries no "persisted" key: under
+                # W5 (amplifier-module-provider-anthropic), an unstamped
+                # trailing message here would be treated as stable and could
+                # take a cache breakpoint on regenerated content.
+                finalization_overlay = {
+                        "role": "user",
+                        "content": _wrap_reminders(
+                            """<system-reminder source="orchestrator-loop-limit">
+    You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
+
+    DO NOT mention this iteration limit or reminder to the user explicitly. Simply wrap up naturally.
+    </system-reminder>""",
+                            tail=True,
                         ),
+                        "metadata": {
+                            "ephemeral": True,
+                            "reminder_placement": "tail",
+                        },
+                }
+                message_dicts.append(finalization_overlay)
+
+            try:
+                if final_prepared is not None:
+                    if final_prepared["provider"] != provider_name:
+                        raise ValueError("Prepared finalization provider changed")
+                    max_iter_chat_request = ChatRequest(**final_prepared["request"])
+                    request_options = final_prepared["request_options"]
+                    dispatch_base_messages = final_prepared["dispatch_base_messages"]
+                    final_retained_contents = final_prepared["retained_contents"]
+                    final_replay_request_injection = final_prepared["request_injection"]
+                    final_replay_pending_injections = final_prepared["pending_injections"]
+                    finalization_overlay = final_prepared["finalization_overlay"]
+                    original_output_cap = final_prepared["original_output_cap"]
+                    final_overflow_retried = final_prepared["overflow_retried"]
+                    final_measured_transaction = None
+                else:
+                    # Preserve the normal declarations, including provider-native
+                    # specifications, so any assistant tool call and paired tool
+                    # result in the existing transcript stay valid. The portable
+                    # choice prevents new calls; this finalization path never
+                    # parses or dispatches a tool response.
+                    request_options: dict[str, Any] = {}
+                    if self.extended_thinking:
+                        request_options["extended_thinking"] = True
+                    final_measured_transaction = None
+                    if measured_compaction_capable:
+                        async def count_final_view(
+                            base_view: list[dict[str, Any]],
+                            *,
+                            request_injection: tuple[str, bool] | None = final_replay_request_injection,
+                            pending_injections: list[dict[str, Any]] = final_replay_pending_injections,
+                            overlay: dict[str, Any] = finalization_overlay,
+                            options: Mapping[str, Any] = request_options,
+                        ) -> dict[str, Any]:
+                            candidate_messages = (
+                                _replay_request_overlays(
+                                    base_view,
+                                    turn_start_view_block=None,
+                                    request_injection=request_injection,
+                                    pending_injections=pending_injections,
+                                )
+                                if self._ephemeral_injection_mode == "tail"
+                                else list(base_view)
+                            )
+                            candidate_messages.append(overlay)
+                            candidate_request = build_chat_request(
+                                candidate_messages, tool_choice="none"
+                            )
+                            return {
+                                "dispatch": candidate_request,
+                                "budget_decision": await count_measured_request(
+                                    candidate_request,
+                                    base_view,
+                                    request_options=options,
+                                ),
+                            }
+
+                        measured_result = await request_measured_view(
+                            final_retained_contents, count_final_view, request_options,
+                        )
+                        if not isinstance(measured_result, dict):
+                            raise TypeError(
+                                "context.measured_request_view returned a non-dictionary result"
+                            )
+                        final_measured_transaction = measured_result.get("transaction")
+                        max_iter_chat_request = measured_result.get(
+                            "final_attempt", {}
+                        ).get("dispatch")
+                        if not isinstance(max_iter_chat_request, ChatRequest):
+                            raise TypeError(
+                                "context.measured_request_view did not return a ChatRequest dispatch"
+                            )
+                        measured_final_count(measured_result)
+                        final_measured_base_view = measured_result.get("base_view")
+                        if not isinstance(final_measured_base_view, list) or not all(
+                            isinstance(message, dict) for message in final_measured_base_view
+                        ):
+                            raise TypeError(
+                                "context.measured_request_view returned an invalid base_view"
+                            )
+                        smaller_context_budget = None
+                        original_output_cap = None
+                        budget_decision = measured_result.get("final_attempt", {}).get(
+                            "budget_decision"
+                        )
+                        if (
+                            measured_final_count(measured_result) is not None
+                            and isinstance(budget_decision, dict)
+                        ):
+                            measurement = budget_decision["measurement"]
+                            estimated = budget_decision["estimated_input_tokens"]
+                            allowance = budget_decision["input_limit_tokens"]
+                            await await_with_measured_rollback(
+                                hooks.emit(
+                                    "orchestrator:provider_budget",
+                                    {
+                                        "attempt": measured_result.get("count_calls", 1) - 1,
+                                        "context_estimate": estimate_messages(
+                                            measured_result.get("base_view", [])
+                                        ).tokens,
+                                        "context_estimate_scope": (
+                                            "text_only"
+                                            if estimate_messages(
+                                                measured_result.get("base_view", [])
+                                            ).has_unmeasured_images
+                                            else "all_text"
+                                        ),
+                                        "estimated_input_tokens": estimated,
+                                        "input_limit_tokens": allowance,
+                                        "context_token_budget": budget_decision[
+                                            "context_token_budget"
+                                        ],
+                                        "result": (
+                                            "fits"
+                                            if estimated <= allowance
+                                            else "oversized"
+                                        ),
+                                        "measurement_kind": measurement["kind"],
+                                        "measurement_source": measurement.get("source"),
+                                        "measured_before": measured_result.get(
+                                            "measured_before"
+                                        ),
+                                        "measured_after": measured_result.get("measured_after"),
+                                        "policy_budget": measured_result.get("policy_budget"),
+                                        "trigger": measured_result.get("trigger"),
+                                        "target": measured_result.get("target"),
+                                        "outcome": measured_result.get("outcome"),
+                                        "count_calls": measured_result.get("count_calls"),
+                                    },
+                                ),
+                                final_measured_transaction,
+                            )
+                        await emit_measured_output_degradation(
+                            measured_result, final_measured_transaction
+                        )
+                    else:
+                        max_iter_chat_request = build_chat_request(
+                            message_dicts, tool_choice="none"
+                        )
+                        smaller_context_budget, original_output_cap = (
+                            await check_request_budget(
+                                max_iter_chat_request,
+                                base_message_dicts,
+                                attempt=0,
+                                request_options=request_options,
+                            )
+                        )
+                    dispatch_base_messages = (
+                        final_measured_base_view
+                        if measured_compaction_capable
+                        else base_message_dicts
+                    )
+                    if smaller_context_budget is not None:
+                        if smaller_context_budget <= 0:
+                            raise ContextLengthError(
+                                "Provider request exceeds its input budget and cannot retain "
+                                "a smaller context"
+                            )
+                        rebuilt_base_messages = list(
+                            await request_messages(
+                                final_retained_contents,
+                                token_budget=smaller_context_budget,
+                                hard_fit=True,
+                            )
+                        )
+                        dispatch_base_messages = rebuilt_base_messages
+                        rebuilt_messages = (
+                            _replay_request_overlays(
+                                rebuilt_base_messages,
+                                turn_start_view_block=None,
+                                request_injection=final_replay_request_injection,
+                                pending_injections=final_replay_pending_injections,
+                            )
+                            if self._ephemeral_injection_mode == "tail"
+                            else list(rebuilt_base_messages)
+                        )
+                        rebuilt_messages.append(finalization_overlay)
+                        rebuilt_request = build_chat_request(
+                            rebuilt_messages, tool_choice="none"
+                        )
+                        next_context_budget, _ = await check_request_budget(
+                            rebuilt_request,
+                            rebuilt_base_messages,
+                            attempt=1,
+                            request_options=request_options,
+                        )
+                        if next_context_budget is not None:
+                            reduced_output_request = await try_reduced_output(
+                                rebuilt_messages,
+                                rebuilt_base_messages,
+                                original_output_cap=original_output_cap,
+                                tool_choice="none",
+                                request_options=request_options,
+                            )
+                            if reduced_output_request is not None:
+                                max_iter_chat_request = reduced_output_request
+                            else:
+                                if next_context_budget <= 0:
+                                    raise ContextLengthError(
+                                        "Provider request exceeds its input budget and cannot retain "
+                                        "a smaller context"
+                                    )
+                                if next_context_budget >= smaller_context_budget:
+                                    raise ContextLengthError(
+                                        "Provider finalization request remains over budget and a "
+                                        "second context budget would not reduce it"
+                                    )
+                                rebuilt_base_messages = list(
+                                    await request_messages(
+                                        final_retained_contents,
+                                        token_budget=next_context_budget,
+                                        hard_fit=True,
+                                    )
+                                )
+                                dispatch_base_messages = rebuilt_base_messages
+                                rebuilt_messages = (
+                                    _replay_request_overlays(
+                                        rebuilt_base_messages,
+                                        turn_start_view_block=None,
+                                        request_injection=final_replay_request_injection,
+                                        pending_injections=final_replay_pending_injections,
+                                    )
+                                    if self._ephemeral_injection_mode == "tail"
+                                    else list(rebuilt_base_messages)
+                                )
+                                rebuilt_messages.append(finalization_overlay)
+                                rebuilt_request = build_chat_request(
+                                    rebuilt_messages, tool_choice="none"
+                                )
+                                if (
+                                    await check_request_budget(
+                                        rebuilt_request,
+                                        rebuilt_base_messages,
+                                        attempt=2,
+                                        request_options=request_options,
+                                    )
+                                )[0] is not None:
+                                    raise ContextLengthError(
+                                        "Provider finalization request remains over budget "
+                                        "after two context rebuilds"
+                                    )
+                                max_iter_chat_request = rebuilt_request
+                        else:
+                            max_iter_chat_request = rebuilt_request
+
+                    await await_with_measured_rollback(
+                        self._apply_rate_limit_delay(hooks, iteration),
                         final_measured_transaction,
                     )
-                    if not committed or (
-                        coordinator and coordinator.cancellation.is_cancelled
-                    ):
-                        final_measured_transaction.rollback()
+                    if coordinator and coordinator.cancellation.is_cancelled:
+                        if final_measured_transaction is not None:
+                            final_measured_transaction.rollback()
                         await close_finalization_tool_turn(
                             "The previous operation was cancelled. Results from completed tools have been preserved."
                         )
                         await exit_for_cancellation()
                         return
+                    if final_measured_transaction is not None:
+                        committed = await await_with_measured_rollback(
+                            final_measured_transaction.commit(
+                                is_cancelled=(
+                                    lambda: bool(
+                                        coordinator
+                                        and coordinator.cancellation.is_cancelled
+                                    )
+                                )
+                            ),
+                            final_measured_transaction,
+                        )
+                        if not committed or (
+                            coordinator and coordinator.cancellation.is_cancelled
+                        ):
+                            final_measured_transaction.rollback()
+                            await close_finalization_tool_turn(
+                                "The previous operation was cancelled. Results from completed tools have been preserved."
+                            )
+                            await exit_for_cancellation()
+                            return
+                    final_overflow_retried = False
+
+                def prepared_finalization(request, *, retried=False):
+                    return {
+                        "provider": provider_name, "request": request.model_dump(mode="json"),
+                        "request_options": request_options,
+                        "dispatch_base_messages": dispatch_base_messages,
+                        "retained_contents": final_retained_contents,
+                        "request_injection": final_replay_request_injection,
+                        "pending_injections": final_replay_pending_injections,
+                        "finalization_overlay": finalization_overlay,
+                        "original_output_cap": original_output_cap,
+                        "overflow_retried": retried,
+                    }
+
+                await self._suspend_at_boundary("prepared_finalization", iteration, context, coordinator,
+                    prepared_request=lambda: prepared_finalization(max_iter_chat_request,
+                                                                  retried=final_overflow_retried))
                 foreground_recorder = foreground_usage_recorder()
                 self._llm_calls_this_turn += 1
                 try:
@@ -6259,6 +6295,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         max_iter_chat_request, **request_options
                     )
                 except ContextLengthError as error:
+                    if final_overflow_retried:
+                        raise
                     recovered_request = await recover_context_overflow(
                         max_iter_chat_request,
                         error,
@@ -6277,6 +6315,8 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     )
                     if recovered_request is None:
                         raise
+                    await self._suspend_at_boundary("prepared_finalization", iteration, context, coordinator,
+                        prepared_request=lambda: prepared_finalization(recovered_request, retried=True))
                     self._llm_calls_this_turn += 1
                     response = await provider.complete(
                         recovered_request, **request_options

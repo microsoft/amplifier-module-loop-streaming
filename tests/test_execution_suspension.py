@@ -102,6 +102,59 @@ async def test_pause_during_preparation_preserves_exact_request_without_replayin
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wait_at", ["hook", "context", "rate_limit"])
+async def test_pause_during_finalization_preserves_exact_request_and_settled_effects(tmp_path, wait_at):
+    context, coordinator, owner = setup_owner(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+    provider, tool, hooks = BatchProvider(), OrderedTool(), ScriptedHooks({})
+    config = {"max_iterations": 1, "reminder_placement": "tail"}
+    loop = StreamingOrchestrator(config)
+    original_hook = hooks.emit
+    original_messages = context.get_messages_for_request
+    original_delay = loop._apply_rate_limit_delay
+    counts = {"hook": 0, "context": 0, "rate_limit": 0}
+
+    async def hold(kind):
+        counts[kind] += 1
+        if wait_at == kind and counts[kind] == 2:
+            entered.set()
+            await release.wait()
+
+    async def held_hook(name, payload=None):
+        if name == "provider:request":
+            await hold("hook")
+        return await original_hook(name, payload)
+
+    async def held_messages(**kwargs):
+        await hold("context")
+        return await original_messages(**kwargs)
+
+    async def held_delay(*args):
+        await hold("rate_limit")
+        return await original_delay(*args)
+
+    hooks.emit, context.get_messages_for_request = held_hook, held_messages
+    loop._apply_rate_limit_delay = held_delay
+    task = asyncio.create_task(loop.execute("original request", context, {"main": provider},
+                                          {"mock_tool": tool}, hooks, coordinator))
+    await asyncio.wait_for(entered.wait(), 2)
+    owner.hold = True
+    release.set()
+    with pytest.raises(ExecutionSuspended) as stopped:
+        await task
+    frame = stopped.value.continuation
+    assert frame["phase"] == "prepared_finalization" and frame["iteration"] == 1
+    assert provider.calls == 1 and tool.completed == [1, 0]
+    before = dict(counts)
+    owner.hold = False
+    assert await StreamingOrchestrator(config).resume(
+        frame, context, {"main": provider}, {"mock_tool": tool}, hooks, coordinator) == "done"
+    assert counts == before and provider.calls == 2 and tool.completed == [1, 0]
+    assert len([row for row in context._messages if row["role"] == "user" and
+                row["content"] == "original request"]) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pause_at", [
     "turn-return", "eval-return", "judge-return",
     "eval-hook", "judge-hook", "summary-hook", "continuation-hook",
