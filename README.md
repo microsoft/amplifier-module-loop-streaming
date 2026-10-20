@@ -2,6 +2,9 @@
 
 Token-level streaming orchestration for real-time response delivery.
 
+Hosts can opt into [cooperative execution suspension](docs/execution-suspension.md)
+at settled model/tool boundaries, with explicit durable checkpoint and resume ownership.
+
 ## Prerequisites
 
 - **Python 3.11+**
