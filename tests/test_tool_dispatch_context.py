@@ -44,6 +44,9 @@ def _make_coordinator():
     populates it vs when it never does.
     """
     coord = MagicMock()
+    # Real coordinators return None for capabilities the host did not register.
+    # A free-form MagicMock instead invents a truthy requested() hold.
+    coord.get_capability.return_value = None
     # Use a real dict so dict operations work deterministically
     coord._tool_dispatch_contexts = {}
     # cancellation token methods
