@@ -12,12 +12,14 @@ RED / GREEN notes:
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from amplifier_core import HookRegistry, ToolResult
 from amplifier_module_loop_streaming import StreamingOrchestrator
+from amplifier_module_loop_streaming.suspension import ToolExecutionSuspended
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,79 @@ def _make_coordinator():
 
 def _make_orchestrator():
     return StreamingOrchestrator(config={})
+
+
+def test_dispatch_fixture_does_not_invent_optional_capabilities():
+    assert _make_coordinator().get_capability("execution.suspension") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", [False, True])
+async def test_real_suspension_capability_controls_tool_admission(hold):
+    coordinator = _make_coordinator()
+    coordinator.get_capability.side_effect = lambda name: (
+        SimpleNamespace(requested=lambda: hold)
+        if name == "execution.suspension" else None
+    )
+    execute = AsyncMock(return_value=ToolResult(success=True, output="ok"))
+    tool = SimpleNamespace(execute=execute)
+    call = _make_tool_call(tool_call_id="call-admission")
+    orch = _make_orchestrator()
+    operation = orch._execute_tool_only(
+        call, {"delegate": tool}, HookRegistry(), "group-admission", coordinator
+    )
+    if hold:
+        with pytest.raises(ToolExecutionSuspended) as suspended:
+            await operation
+        assert suspended.value.continuation == {"version": 1, "kind": "not_started"}
+        execute.assert_not_awaited()
+        coordinator.cancellation.register_tool_start.assert_not_called()
+        coordinator.cancellation.register_tool_complete.assert_not_called()
+        assert orch._tool_calls_this_turn == 0
+    else:
+        await operation
+        execute.assert_awaited_once_with(call.arguments)
+        coordinator.cancellation.register_tool_start.assert_called_once()
+        coordinator.cancellation.register_tool_complete.assert_called_once_with(call.id)
+        assert orch._tool_calls_this_turn == 1
+    assert coordinator._tool_dispatch_contexts == {}
+
+
+@pytest.mark.asyncio
+async def test_pause_arriving_during_policy_hook_prevents_tool_admission():
+    coordinator = _make_coordinator()
+    entered, release = asyncio.Event(), asyncio.Event()
+    hold = False
+    coordinator.get_capability.side_effect = lambda name: (
+        SimpleNamespace(requested=lambda: hold)
+        if name == "execution.suspension" else None
+    )
+
+    async def policy(*args):
+        entered.set()
+        await release.wait()
+        return SimpleNamespace(action="continue")
+
+    coordinator.process_hook_result = policy
+    execute = AsyncMock(return_value=ToolResult(success=True, output="must not run"))
+    orch = _make_orchestrator()
+    task = asyncio.create_task(orch._execute_tool_only(
+        _make_tool_call(), {"delegate": SimpleNamespace(execute=execute)},
+        HookRegistry(), "group-held-policy", coordinator
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        hold = True
+        release.set()
+        with pytest.raises(ToolExecutionSuspended):
+            await asyncio.wait_for(task, 2)
+        execute.assert_not_awaited()
+        coordinator.cancellation.register_tool_start.assert_not_called()
+        assert coordinator._tool_dispatch_contexts == {}
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
