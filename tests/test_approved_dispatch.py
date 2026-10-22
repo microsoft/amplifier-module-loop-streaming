@@ -945,7 +945,10 @@ async def test_resumed_batch_keeps_mounted_tool_lock(environment, second_kind, a
     record_property("execution_counters", json.dumps(observed, sort_keys=True))
     assert observed["call_ids"] == ["original-a", "original-b"]
     assert values == ["continued-a", "fresh-b" if second_kind == "not_started" else "continued-b"]
-    assert tool.resumed == ([first] if second_kind == "not_started" else [first, second])
+    # Concurrent approval paths may acquire the shared lock in either order.
+    # Each continuation is consumed once; only result publication is ordered.
+    assert sorted(tool.resumed, key=lambda row: row["token"]) == (
+        [first] if second_kind == "not_started" else [first, second])
     assert tool.executed == ([{"value": "fresh-b"}] if second_kind == "not_started" else [])
     assert tool.active == 0
     assert tool.peak == 1, observed
