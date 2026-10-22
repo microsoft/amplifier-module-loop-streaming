@@ -30,6 +30,7 @@ jobs:
           uv pip install --no-config --python .venv/bin/python \
             "amplifier-core @ git+https://github.com/microsoft/amplifier-core@main" \
             "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main" \
+            "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main" \
             "pytest==9.0.3" \
             "pytest-asyncio==1.3.0"
           uv pip install --no-config --no-deps --python .venv/bin/python .
