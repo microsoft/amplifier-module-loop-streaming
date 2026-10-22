@@ -702,4 +702,93 @@ async def test_legacy_subclass_dispatcher_keeps_ownership_of_its_pipeline(enviro
             ToolCall(id="legacy", name="read", arguments={}),
             coordinator.get("tools"), context, coordinator.hooks, coordinator,
         )
+
+
+async def test_nested_pause_does_not_make_started_controller_replayable(environment):
+    """The second nested call did not start; its parent already made an effect."""
+    _, coordinator, _, echo = environment
+    owner = SimpleNamespace(hold=False)
+    owner.requested = lambda: owner.hold
+    coordinator.register_capability("execution.suspension", owner)
+
+    async def program(lease):
+        first = await lease.call("read", {}, request_id="settled")
+        assert first["status"] == "completed"
+        owner.hold = True
+        with pytest.raises(RuntimeError, match="not replay"):
+            await lease.call("read", {}, request_id="held")
+        return {"first": first, "held": True}
+
+    result, client = await call_client(environment, Client(coordinator, program))
+    assert result["held"] and echo.calls == 1
+    assert coordinator._tool_dispatch_contexts == {}
+    with pytest.raises(RuntimeError):
+        await client.lease.call("read", {})
+
+
+async def test_resume_retains_nested_model_budget_and_expires_old_lease(environment):
+    from amplifier_core.message_models import ChatRequest, Message
+    from amplifier_module_loop_streaming import ExecutionSuspended, StreamingOrchestrator
+
+    _, coordinator, loop, _ = environment
+    context = coordinator.get("context")
+    loop.config.update(programmatic_max_model_calls=1, max_iterations=4)
+    owner = SimpleNamespace(hold=False, saved=None)
+    owner.requested = lambda: owner.hold
+    async def checkpoint(frame):
+        owner.saved = frame
+        return True
+    owner.checkpoint = checkpoint
+    coordinator.register_capability("execution.suspension", owner)
+    coordinator.register_capability("execution.resume", lambda frame: True)
+    root_calls, utility_calls, controller_calls = [], [], []
+
+    class Provider:
+        name, config = "fixture", {}
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+        def parse_tool_calls(self, response):
+            return response.tool_calls or []
+        async def complete(self, request, **kwargs):
+            if any(message.content == "utility" for message in request.messages):
+                utility_calls.append(request)
+                return ChatResponse(content=[TextBlock(text="selected")])
+            root_calls.append(request)
+            if len(root_calls) <= 2:
+                return ChatResponse(content=[], tool_calls=[
+                    ToolCall(id=f"controller-{len(root_calls)}", name="tool_exec", arguments={})
+                ])
+            return ChatResponse(content=[TextBlock(text="done")])
+
+    provider = Provider()
+    await coordinator.mount("providers", provider, name="fixture")
+    request = ChatRequest(messages=[Message(role="user", content="utility")])
+    async def program(lease):
+        controller_calls.append(lease)
+        complete = coordinator.get_capability("model.complete")
+        if len(controller_calls) == 1:
+            await complete(request)
+            owner.hold = True
+        else:
+            with pytest.raises(RuntimeError, match="budget exhausted"):
+                await complete(request)
+        return {"settled": True}
+    client = Client(coordinator, program)
+    await coordinator.mount("tools", client, name="tool_exec")
+    with pytest.raises(ExecutionSuspended) as held:
+        await loop.execute("original", context, {"fixture": provider},
+                           coordinator.get("tools"), coordinator.hooks, coordinator)
+    assert len(utility_calls) == 1 and len(controller_calls) == 1
+    first_lease = controller_calls[0]
+    with pytest.raises(RuntimeError):
+        await first_lease.call("read", {})
+    owner.hold = False
+    restored = StreamingOrchestrator(dict(loop.config))
+    coordinator.register_capability("tools.dispatch", restored.approved_dispatch)
+    coordinator.register_capability("model.complete", restored.approved_dispatch.complete)
+    assert await restored.resume(held.value.continuation, context, {"fixture": provider},
+                                 coordinator.get("tools"), coordinator.hooks, coordinator) == "done"
+    assert len(utility_calls) == 1
+    assert len(controller_calls) == 2 and len(root_calls) == 3
+    assert restored._llm_calls_this_turn == 4
         assert echo.calls == 1
