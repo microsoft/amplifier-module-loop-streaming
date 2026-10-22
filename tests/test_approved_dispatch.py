@@ -892,3 +892,78 @@ async def test_legacy_dispatch_owner_cannot_borrow_streaming_model_capability(en
     with pytest.raises(RuntimeError, match="authorized"):
         await coordinator.get_capability("model.complete")(
             ChatRequest(messages=[Message(role="user", content="not admitted")]))
+
+
+@pytest.mark.parametrize("second_kind", ["resumed", "not_started"])
+@pytest.mark.parametrize("alias", [False, True])
+async def test_resumed_batch_keeps_mounted_tool_lock(environment, second_kind, alias, record_property):
+    _, coordinator, loop, _ = environment
+    class ContinuingTool:
+        name = "read"
+        description = "Fixture with per-call continuations"
+        input_schema = {"type": "object", "properties": {}}
+        def __init__(self):
+            self.active = self.peak = 0
+            self.resumed, self.executed = [], []
+        async def effect(self, value):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                # Both dispatched tasks have an opportunity to enter execution.
+                await asyncio.sleep(0.01)
+                return ToolResult(success=True, output={"value": value})
+            finally:
+                self.active -= 1
+        async def execute(self, arguments):
+            self.executed.append(dict(arguments))
+            return await self.effect(arguments["value"])
+        async def resume_execution(self, continuation):
+            self.resumed.append(dict(continuation))
+            return await self.effect(continuation["value"])
+    tool = ContinuingTool()
+    await coordinator.mount("tools", tool, name="read")
+    if alias:
+        await coordinator.mount("tools", tool, name="same-instance")
+    calls = [
+        ToolCall(id="original-a", name="read", arguments={"value": "must-not-replay-a"}),
+        ToolCall(id="original-b", name="same-instance" if alias else "read",
+                 arguments={"value": "fresh-b" if second_kind == "not_started" else "must-not-replay-b"}),
+    ]
+    first = {"kind": "cooperating", "value": "continued-a", "token": "a"}
+    second = ({"kind": "not_started"} if second_kind == "not_started" else
+              {"kind": "cooperating", "value": "continued-b", "token": "b"})
+    with loop.approved_dispatch.run_scope(coordinator):
+        assert await loop._settle_tool_batch(
+            calls, coordinator.get("context"), coordinator.get("tools"),
+            coordinator.hooks, coordinator, 1,
+            settled=[{"continuation": first}, {"continuation": second}])
+    rows = [row for row in await coordinator.get("context").get_messages()
+            if row.get("role") == "tool"]
+    values = [json.loads(row["content"])["output"]["value"] for row in rows]
+    observed = {"peak": tool.peak, "resumed": tool.resumed, "executed": tool.executed,
+                "call_ids": [row["tool_call_id"] for row in rows], "values": values}
+    record_property("execution_counters", json.dumps(observed, sort_keys=True))
+    assert observed["call_ids"] == ["original-a", "original-b"]
+    assert values == ["continued-a", "fresh-b" if second_kind == "not_started" else "continued-b"]
+    assert tool.resumed == ([first] if second_kind == "not_started" else [first, second])
+    assert tool.executed == ([{"value": "fresh-b"}] if second_kind == "not_started" else [])
+    assert tool.active == 0
+    assert tool.peak == 1, observed
+
+
+async def test_resume_wrapper_lock_identity_is_not_the_execution_adapter(environment):
+    from amplifier_module_loop_streaming.dispatch import GuardedTool
+    from amplifier_module_loop_streaming.suspension import ResumingTool
+    _, _, loop, _ = environment
+    raw = SimpleNamespace(name="read", resume_execution=lambda continuation: None)
+    first = ResumingTool(raw, {"token": "first"})
+    second = ResumingTool(GuardedTool(raw, asyncio.Lock()), {"token": "second"})
+    wrapped = loop.approved_dispatch.wrap_tools({"first": first, "second": second, "raw": raw})
+    assert wrapped["first"].tool is first and wrapped["second"].tool is second
+    assert wrapped["first"].lock is wrapped["second"].lock is wrapped["raw"].lock
+    # Rewrapping must preserve both lock identity and the per-call adapter.
+    again = loop.approved_dispatch.wrap_tools(wrapped)
+    assert again["first"].tool is first and again["first"].lock is wrapped["raw"].lock
+    for name in ("delegate", "task", "live_job"):
+        excluded = ResumingTool(SimpleNamespace(name=name, resume_execution=lambda c: None), {})
+        assert loop.approved_dispatch.wrap_tools({name: excluded})[name] is excluded
