@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -15,6 +15,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "amplifier-module-context-simple"
+version = "1.0.0"
+source = { git = "https://github.com/microsoft/amplifier-module-context-simple?rev=main#db641363013ff906b656f49498a87ab01f5c506f" }
+
+[[package]]
 name = "amplifier-module-loop-streaming"
 version = "1.0.0"
 source = { editable = "." }
@@ -22,6 +27,7 @@ source = { editable = "." }
 [package.dev-dependencies]
 dev = [
     { name = "amplifier-core" },
+    { name = "amplifier-module-context-simple" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -31,6 +37,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "amplifier-core", git = "https://github.com/microsoft/amplifier-core?branch=main" },
+    { name = "amplifier-module-context-simple", git = "https://github.com/microsoft/amplifier-module-context-simple?rev=main" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
 ]

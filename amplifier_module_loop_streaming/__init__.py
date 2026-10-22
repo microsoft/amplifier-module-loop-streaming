@@ -762,12 +762,16 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "orchestrator:budget_warning",  # Layer 1 call budget at budget_warn_ratio (see _execute_stream)
             "orchestrator:provider_budget",  # Provider request-budget preflight result (see _execute_stream)
             "orchestrator:provider_overflow_recovery",  # Bounded provider-authorized input-overflow retry
+            "model:complete",  # Attributed stateless inference by an approved caller
+            "tool:dispatch_cancelled",  # Nested execution outcome may be unknown
         ],
     )
 
     orchestrator = StreamingOrchestrator(config)
     await coordinator.mount("orchestrator", orchestrator)
     coordinator.register_capability("session.steer", orchestrator.steer)
+    coordinator.register_capability("tools.dispatch", orchestrator.approved_dispatch)
+    coordinator.register_capability("model.complete", orchestrator.approved_dispatch.complete)
     # Conversation-scope provider pin (see ConversationProviderPin). Registered
     # as a capability, NOT read from config, so an app can detect its absence
     # (`get_capability` -> None) under a different orchestrator and refuse
@@ -1088,6 +1092,9 @@ class StreamingOrchestrator:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
+        from .dispatch import ApprovedDispatch
+        self.approved_dispatch = ApprovedDispatch(self)
+        self._streaming_dispatch = self.approved_dispatch
         # -1 means unlimited iterations (default)
         max_iter_config = config.get("max_iterations", -1)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
@@ -1379,7 +1386,27 @@ class StreamingOrchestrator:
             )
         return total
 
-    async def execute(
+    async def execute(self, prompt, context, providers, tools, hooks, coordinator=None):
+        # One execution authority is shared by foreground and nested tools.
+        # The lease expires even when the turn fails or is cancelled.
+        if not self._owns_dispatch_pipeline:
+            return await self._execute_with_goals(
+                prompt, context, providers, tools, hooks, coordinator
+            )
+        with self._streaming_dispatch.run_scope(coordinator):
+            return await self._execute_with_goals(
+                prompt, context, providers, tools, hooks, coordinator
+            )
+
+    @property
+    def _owns_dispatch_pipeline(self):
+        # Older loop-live versions replace the public dispatcher and already
+        # establish their own scopes and guarded tools. Preserve that extension
+        # boundary during independent module upgrades: never double-wrap their
+        # pipeline or call new dispatcher methods on their legacy instance.
+        return self.approved_dispatch is self._streaming_dispatch
+
+    async def _execute_with_goals(
         self,
         prompt: str,
         context,
@@ -1809,6 +1836,8 @@ class StreamingOrchestrator:
         self._tool_calls_this_turn = 0
         self._goal_turn_evidence = {"tools": []} if coordinator is not None else None
         self._llm_calls_this_turn = 0
+        if self._owns_dispatch_pipeline:
+            self._streaming_dispatch.reset_model_budget()
         # Layer 1 call-budget bookkeeping, reset per turn alongside
         # _tool_calls_this_turn above (spec: 298-replacement).
         self._budget_exhausted = False
@@ -6394,7 +6423,19 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             tool_call, tools, context, hooks, coordinator
         )
 
-    async def _execute_tool_only(
+    async def _execute_tool_only(self, tool_call, tools, hooks, parallel_group_id, coordinator=None):
+        """Run the ordinary tool pipeline in an active dispatch scope.
+
+        Tool errors become results; asyncio.CancelledError still propagates so
+        the caller can preserve completed sibling results during cancellation.
+        """
+        if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
+            return await self._execute_tool_unscoped(tool_call, tools, hooks, parallel_group_id, coordinator)
+        tools = self._streaming_dispatch.wrap_tools(tools)
+        with self._streaming_dispatch.call_scope(tool_call, tools, hooks, parallel_group_id):
+            return await self._execute_tool_unscoped(tool_call, tools, hooks, parallel_group_id, coordinator)
+
+    async def _execute_tool_unscoped(
         self,
         tool_call,
         tools: dict[str, Any],
@@ -6486,6 +6527,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 if not hasattr(coordinator, "_tool_dispatch_contexts"):
                     coordinator._tool_dispatch_contexts = {}
                 _dispatch_task = asyncio.current_task()
+                _previous_dispatch = coordinator._tool_dispatch_contexts.get(_dispatch_task)
                 coordinator._tool_dispatch_contexts[_dispatch_task] = {
                     "tool_call_id": tool_call.id,
                     "parallel_group_id": parallel_group_id,
@@ -6506,9 +6548,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     coordinator.cancellation.register_tool_complete(tool_call.id)
                     # Clear per-task dispatch context so completed tasks don't linger
                     if hasattr(coordinator, "_tool_dispatch_contexts"):
-                        coordinator._tool_dispatch_contexts.pop(
-                            asyncio.current_task(), None
-                        )
+                        if _previous_dispatch is None:
+                            coordinator._tool_dispatch_contexts.pop(asyncio.current_task(), None)
+                        else:
+                            coordinator._tool_dispatch_contexts[asyncio.current_task()] = _previous_dispatch
 
             # Serialize result for logging
             result_data = (
@@ -6583,7 +6626,14 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             )
             return (tool_call.id, tool_call.name, error_msg)
 
-    async def _execute_tool_with_result(
+    async def _execute_tool_with_result(self, tool_call, tools, context, hooks, coordinator=None):
+        if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
+            return await self._execute_tool_with_result_unscoped(tool_call, tools, context, hooks, coordinator)
+        tools = self._streaming_dispatch.wrap_tools(tools)
+        with self._streaming_dispatch.call_scope(tool_call, tools, hooks, None):
+            return await self._execute_tool_with_result_unscoped(tool_call, tools, context, hooks, coordinator)
+
+    async def _execute_tool_with_result_unscoped(
         self,
         tool_call,
         tools: dict[str, Any],
@@ -6647,6 +6697,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 if not hasattr(coordinator, "_tool_dispatch_contexts"):
                     coordinator._tool_dispatch_contexts = {}
                 _dispatch_task = asyncio.current_task()
+                _previous_dispatch = coordinator._tool_dispatch_contexts.get(_dispatch_task)
                 coordinator._tool_dispatch_contexts[_dispatch_task] = {
                     "tool_call_id": tool_call.id,
                     "parallel_group_id": None,
@@ -6664,9 +6715,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             finally:
                 # Clear per-task dispatch context so completed tasks don't linger
                 if coordinator and hasattr(coordinator, "_tool_dispatch_contexts"):
-                    coordinator._tool_dispatch_contexts.pop(
-                        asyncio.current_task(), None
-                    )
+                    if _previous_dispatch is None:
+                        coordinator._tool_dispatch_contexts.pop(asyncio.current_task(), None)
+                    else:
+                        coordinator._tool_dispatch_contexts[asyncio.current_task()] = _previous_dispatch
 
             # Serialize result for logging
             result_data = (
