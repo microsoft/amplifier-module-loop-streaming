@@ -21,6 +21,10 @@ a model. Explicit host `programmatic_dispatch: false` disables it; an explicit
 caller list constrains it; a host tool allowlist intersects it. Removing the
 declaration revokes it. A module cleans up only the declaration it owns. Nested
 delegation, background execution and recursive controllers remain unavailable.
+Automatic enablement admits only registered callers; it does not enable an
+unregistered `tool_exec`. That legacy caller still requires the host's explicit
+`programmatic_dispatch: true`, or inclusion in a host caller list when dispatch
+is enabled.
 
 `model.complete(ChatRequest)` accepts a stateless tool-free request only during
 such an active call. The selected ordinary provider and its account are reused;

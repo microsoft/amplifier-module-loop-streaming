@@ -34,6 +34,7 @@ allow-direct-references = true
 [dependency-groups]
 dev = [
     "amplifier-core",
+    "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.0.0",
 ]
@@ -45,4 +46,3 @@ amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch =
 testpaths = ["tests"]
 addopts = "--import-mode=importlib"
 asyncio_mode = "strict"
-

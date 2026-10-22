@@ -299,10 +299,12 @@ class ApprovedDispatch:
 
     @property
     def callers(self):
-        """Host-selected controllers; ordinary configuration permits only tool_exec."""
+        """Admit declared controllers, or the explicitly enabled legacy caller."""
         names = self.owner.config.get("programmatic_callers")
         if names is None:
-            names = ["tool_exec", *self.registrations]
+            names = list(self.registrations)
+            if self.owner.config.get("programmatic_dispatch") is True:
+                names.append("tool_exec")
         if not isinstance(names, list) or any(
             not isinstance(name, str) for name in names
         ):

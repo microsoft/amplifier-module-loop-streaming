@@ -497,6 +497,27 @@ async def test_portable_registration_requires_no_orchestrator_configuration(
     assert client.lease is None and echo.calls == 1
 
 
+async def test_portable_registration_does_not_enable_an_unregistered_legacy_caller(environment):
+    _, coordinator, loop, _ = environment
+    loop.config.pop("programmatic_dispatch")
+    coordinator.register_capability(
+        "tools.dispatch.registrations", {"ui_use": {"tools": ["read"]}}
+    )
+    dispatch = loop.approved_dispatch
+    with dispatch.run_scope(coordinator):
+        with dispatch.call_scope(
+            ToolCall(id="legacy", name="tool_exec", arguments={}),
+            coordinator.get("tools"), coordinator.hooks, None,
+        ):
+            with pytest.raises(RuntimeError, match="authorized"):
+                dispatch.bind()
+            # Preserve the existing host's explicit legacy opt-in.
+            loop.config["programmatic_dispatch"] = True
+            lease = dispatch.bind()
+            assert lease.tools == ("read",)
+            lease.close()
+
+
 async def test_nested_inference_reuses_selection_counts_and_enforces_policy(
     environment,
 ):
@@ -641,3 +662,44 @@ async def test_host_validity_callback_revokes_without_live_dependency(environmen
         return {'revoked': True}
     result, _ = await call_client(environment, Client(coordinator, program))
     assert result['revoked'] and echo.calls == 0
+
+
+@pytest.mark.parametrize("path", ["finite-turn", "parallel-tool", "serial-tool"])
+async def test_legacy_subclass_dispatcher_keeps_ownership_of_its_pipeline(environment, path):
+    """Existing loop-live replaces this field and supplies its own wrappers.
+
+    That legacy interface has no model-budget method. The base engine must not
+    call or wrap the replacement: doing so both breaks ordinary finite turns
+    and can discard the legacy lease's post-approval authority check.
+    """
+    session, coordinator, loop, echo = environment
+    loop.approved_dispatch = SimpleNamespace(enabled=True)
+    context = coordinator.get("context")
+    if path == "finite-turn":
+        class Provider:
+            name = "fixture"
+            config = {}
+
+            def get_info(self):
+                return SimpleNamespace(defaults={"model": "fixture"})
+
+            async def complete(self, request, **kwargs):
+                return ChatResponse(content=[TextBlock(text="ordinary result")])
+
+            def parse_tool_calls(self, response):
+                return []
+
+        await coordinator.mount("providers", Provider(), name="fixture")
+        assert await session.execute("ordinary turn") == "ordinary result"
+    elif path == "parallel-tool":
+        await loop._execute_tool_only(
+            ToolCall(id="legacy", name="read", arguments={}),
+            coordinator.get("tools"), coordinator.hooks, None, coordinator,
+        )
+        assert echo.calls == 1
+    else:
+        await loop._execute_tool_with_result(
+            ToolCall(id="legacy", name="read", arguments={}),
+            coordinator.get("tools"), context, coordinator.hooks, coordinator,
+        )
+        assert echo.calls == 1

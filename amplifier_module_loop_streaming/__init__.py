@@ -1094,6 +1094,7 @@ class StreamingOrchestrator:
         self.config = config
         from .dispatch import ApprovedDispatch
         self.approved_dispatch = ApprovedDispatch(self)
+        self._streaming_dispatch = self.approved_dispatch
         # -1 means unlimited iterations (default)
         max_iter_config = config.get("max_iterations", -1)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
@@ -1388,10 +1389,22 @@ class StreamingOrchestrator:
     async def execute(self, prompt, context, providers, tools, hooks, coordinator=None):
         # One execution authority is shared by foreground and nested tools.
         # The lease expires even when the turn fails or is cancelled.
-        with self.approved_dispatch.run_scope(coordinator):
+        if not self._owns_dispatch_pipeline:
             return await self._execute_with_goals(
                 prompt, context, providers, tools, hooks, coordinator
             )
+        with self._streaming_dispatch.run_scope(coordinator):
+            return await self._execute_with_goals(
+                prompt, context, providers, tools, hooks, coordinator
+            )
+
+    @property
+    def _owns_dispatch_pipeline(self):
+        # Older loop-live versions replace the public dispatcher and already
+        # establish their own scopes and guarded tools. Preserve that extension
+        # boundary during independent module upgrades: never double-wrap their
+        # pipeline or call new dispatcher methods on their legacy instance.
+        return self.approved_dispatch is self._streaming_dispatch
 
     async def _execute_with_goals(
         self,
@@ -1823,7 +1836,8 @@ class StreamingOrchestrator:
         self._tool_calls_this_turn = 0
         self._goal_turn_evidence = {"tools": []} if coordinator is not None else None
         self._llm_calls_this_turn = 0
-        self.approved_dispatch.reset_model_budget()
+        if self._owns_dispatch_pipeline:
+            self._streaming_dispatch.reset_model_budget()
         # Layer 1 call-budget bookkeeping, reset per turn alongside
         # _tool_calls_this_turn above (spec: 298-replacement).
         self._budget_exhausted = False
@@ -6415,10 +6429,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         Tool errors become results; asyncio.CancelledError still propagates so
         the caller can preserve completed sibling results during cancellation.
         """
-        if not self.approved_dispatch.enabled:
+        if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
             return await self._execute_tool_unscoped(tool_call, tools, hooks, parallel_group_id, coordinator)
-        tools = self.approved_dispatch.wrap_tools(tools)
-        with self.approved_dispatch.call_scope(tool_call, tools, hooks, parallel_group_id):
+        tools = self._streaming_dispatch.wrap_tools(tools)
+        with self._streaming_dispatch.call_scope(tool_call, tools, hooks, parallel_group_id):
             return await self._execute_tool_unscoped(tool_call, tools, hooks, parallel_group_id, coordinator)
 
     async def _execute_tool_unscoped(
@@ -6613,10 +6627,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
             return (tool_call.id, tool_call.name, error_msg)
 
     async def _execute_tool_with_result(self, tool_call, tools, context, hooks, coordinator=None):
-        if not self.approved_dispatch.enabled:
+        if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
             return await self._execute_tool_with_result_unscoped(tool_call, tools, context, hooks, coordinator)
-        tools = self.approved_dispatch.wrap_tools(tools)
-        with self.approved_dispatch.call_scope(tool_call, tools, hooks, None):
+        tools = self._streaming_dispatch.wrap_tools(tools)
+        with self._streaming_dispatch.call_scope(tool_call, tools, hooks, None):
             return await self._execute_tool_with_result_unscoped(tool_call, tools, context, hooks, coordinator)
 
     async def _execute_tool_with_result_unscoped(
