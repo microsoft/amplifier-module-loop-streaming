@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
-from .suspension import NestedExecutionHeld, ToolExecutionSuspended
+from .suspension import NestedExecutionHeld, ResumingTool, ToolExecutionSuspended
 
 _RUN = ContextVar("approved_dispatch_run", default=None)
 _CALL = ContextVar("approved_dispatch_call", default=None)
@@ -560,7 +560,13 @@ class ApprovedDispatch:
             ):
                 wrapped[name] = raw
                 continue
-            lock = self.locks.setdefault(id(raw), asyncio.Lock())
+            # Continuations are per call; execution serialization is per mounted
+            # tool. Unwrap only our known adapters for identity, not execution:
+            # replacing raw would replay execute() instead of resume_execution().
+            lock_owner = raw
+            while isinstance(lock_owner, (GuardedTool, ResumingTool)):
+                lock_owner = lock_owner.tool
+            lock = self.locks.setdefault(id(lock_owner), asyncio.Lock())
             wrapped[name] = GuardedTool(
                 raw,
                 lock,
