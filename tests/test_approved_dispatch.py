@@ -818,3 +818,76 @@ async def test_pause_during_nested_inference_policy_prevents_provider_send(envir
         return {"held": True}
     result, _ = await call_client(environment, Client(coordinator, program))
     assert result["held"] and loop._llm_calls_this_turn == 0
+
+
+@pytest.mark.parametrize("serial", [False, True])
+async def test_uncaught_nested_hold_keeps_structured_parent_outcome(environment, serial):
+    _, coordinator, loop, echo = environment
+    owner = SimpleNamespace(hold=False)
+    owner.requested = lambda: owner.hold
+    coordinator.register_capability("execution.suspension", owner)
+    observed = []
+    async def capture(event, data):
+        observed.append((event, data))
+        return HookResult()
+    coordinator.hooks.register("tool:dispatch_suspended", capture)
+    coordinator.hooks.register("tool:post", capture)
+    async def program(lease):
+        await lease.call("read", {}, request_id="settled")
+        owner.hold = True
+        return await lease.call("read", {}, request_id="held")
+    client = Client(coordinator, program)
+    await coordinator.mount("tools", client, name="tool_exec")
+    with loop.approved_dispatch.run_scope(coordinator):
+        call = ToolCall(id="parent", name="tool_exec", arguments={})
+        if serial:
+            await loop._execute_tool_with_result(call, coordinator.get("tools"),
+                coordinator.get("context"), coordinator.hooks, coordinator)
+        else:
+            await loop._execute_tool_only(call, coordinator.get("tools"),
+                coordinator.hooks, "group", coordinator)
+    parent, = [data["result"] for event, data in observed
+               if event == "tool:post" and data["tool_name"] == "tool_exec"]
+    assert parent["success"] is False
+    assert parent["error"]["retryable"] is False
+    assert parent["output"]["status"] == "held"
+    assert parent["output"]["effects"] == "not_rolled_back"
+    held, = [data for event, data in observed if event == "tool:dispatch_suspended"]
+    assert held["source"]["parent_tool_call_id"] == "parent"
+    assert held["source"]["request_id"] == "held"
+    assert echo.calls == 1
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "restore"])
+async def test_budget_boundary_outside_owned_run_refuses(environment, operation):
+    _, coordinator, loop, _ = environment
+    release = asyncio.Event()
+    saved = []
+    async def checkpoint(frame):
+        saved.append(frame)
+        return True
+    coordinator.register_capability("execution.suspension",
+        SimpleNamespace(requested=lambda: True, checkpoint=checkpoint))
+    async def outside():
+        await release.wait()
+        if operation == "restore":
+            loop._restore_turn_continuation({"turn": {}, "dispatch_model_calls": 1})
+        else:
+            await loop._suspend_at_boundary("provider", 0, coordinator.get("context"), coordinator)
+    # This task captures no dispatch context even though it runs later.
+    task = asyncio.create_task(outside())
+    with loop.approved_dispatch.run_scope(coordinator):
+        release.set()
+        with pytest.raises(RuntimeError, match="active dispatch run"):
+            await task
+    assert saved == []
+
+
+async def test_legacy_dispatch_owner_cannot_borrow_streaming_model_capability(environment):
+    from amplifier_core.message_models import ChatRequest, Message
+    _, coordinator, loop, _ = environment
+    loop.approved_dispatch = SimpleNamespace(enabled=True)
+    loop._restore_turn_continuation({"turn": {}, "dispatch_model_calls": 2})
+    with pytest.raises(RuntimeError, match="authorized"):
+        await coordinator.get_capability("model.complete")(
+            ChatRequest(messages=[Message(role="user", content="not admitted")]))
