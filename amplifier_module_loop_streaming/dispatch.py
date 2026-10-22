@@ -7,13 +7,14 @@ unchecked tool execution path.
 
 import asyncio
 import json
+import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
-from .suspension import ToolExecutionSuspended
+from .suspension import NestedExecutionHeld, ToolExecutionSuspended
 
 _RUN = ContextVar("approved_dispatch_run", default=None)
 _CALL = ContextVar("approved_dispatch_call", default=None)
@@ -215,8 +216,15 @@ class DispatchLease:
             # The nested invocation is not the enclosing controller. Propagating
             # its "not_started" frame would replay a controller that may already
             # have performed effects. Controllers have no portable stack here.
-            raise RuntimeError(
-                "Nested tool suspended; the enclosing controller already started. "
+            try:
+                await self.scope.hooks.emit("tool:dispatch_suspended", {
+                    "source": source, "outcome": "held", "effects": "not_rolled_back",
+                })
+            except Exception as error:
+                logging.getLogger(__name__).warning(
+                    "Nested suspension observer failed: %s", type(error).__name__)
+            raise NestedExecutionHeld(
+                source, "Nested tool suspended; the enclosing controller already started. "
                 "Inspect retained effects; do not replay the controller."
             ) from suspended
         except asyncio.CancelledError:
@@ -330,18 +338,23 @@ class ApprovedDispatch:
         return set(declared) if host is None else set(declared).intersection(host)
 
     def reset_model_budget(self):
-        self.restore_model_budget(0)
+        run = _RUN.get()
+        if run and run.owner is self:
+            run.model_calls = 0
+
+    def _budget_run(self):
+        run = _RUN.get()
+        if run is None or run.owner is not self or not run.active:
+            raise RuntimeError("Nested inference budget requires an active dispatch run")
+        return run
 
     def model_budget_used(self):
-        run = _RUN.get()
-        return run.model_calls if run and run.owner is self else 0
+        return self._budget_run().model_calls
 
     def restore_model_budget(self, used):
         if type(used) is not int or used < 0:
             raise ValueError("Invalid nested inference continuation budget")
-        run = _RUN.get()
-        if run and run.owner is self:
-            run.model_calls = used
+        self._budget_run().model_calls = used
 
     @contextmanager
     def run_scope(self, coordinator):
@@ -487,7 +500,7 @@ class ApprovedDispatch:
                 lease._valid()
                 suspension = coordinator.get_capability("execution.suspension")
                 if suspension is not None and suspension.requested():
-                    raise RuntimeError("Nested inference is held for execution suspension")
+                    raise NestedExecutionHeld(source, "Nested inference is held for execution suspension")
                 scope.run.model_calls += 1
                 self.owner._llm_calls_this_turn += 1
                 pending = asyncio.create_task(provider.complete(request, **options))

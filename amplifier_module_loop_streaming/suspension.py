@@ -47,6 +47,23 @@ class ResumingTool:
         return await self.tool.resume_execution(self.continuation)
 
 
+class NestedExecutionHeld(RuntimeError):
+    """An active controller cannot be reconstructed from its nested boundary."""
+
+    def __init__(self, source, message):
+        super().__init__(message)
+        self.source = canonical_copy(source)
+
+    def tool_result(self):
+        from amplifier_core import ToolResult
+        return ToolResult(
+            success=False,
+            output={"status": "held", "effects": "not_rolled_back",
+                    "retryable": False, "message": str(self), "source": self.source},
+            error={"message": str(self), "code": "nested_execution_held", "retryable": False},
+        )
+
+
 def canonical_copy(value: Any) -> Any:
     """Fail rather than silently discard nonportable continuation state."""
     return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))

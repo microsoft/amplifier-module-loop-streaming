@@ -851,6 +851,7 @@ async def test_uncaught_nested_hold_keeps_structured_parent_outcome(environment,
     assert parent["success"] is False
     assert parent["error"]["retryable"] is False
     assert parent["output"]["status"] == "held"
+    assert parent["output"]["retryable"] is False
     assert parent["output"]["effects"] == "not_rolled_back"
     held, = [data for event, data in observed if event == "tool:dispatch_suspended"]
     assert held["source"]["parent_tool_call_id"] == "parent"

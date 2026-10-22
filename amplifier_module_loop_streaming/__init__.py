@@ -44,7 +44,7 @@ from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from ._text_estimate import estimate_messages
 from .steering import SteeringQueue
-from .suspension import (ExecutionSuspended, ToolExecutionSuspended, ResumingTool,
+from .suspension import (ExecutionSuspended, ToolExecutionSuspended, NestedExecutionHeld, ResumingTool,
                          canonical_copy, fingerprint, validate as validate_continuation)
 
 logger = logging.getLogger(__name__)
@@ -766,6 +766,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "orchestrator:provider_overflow_recovery",  # Bounded provider-authorized input-overflow retry
             "model:complete",  # Attributed stateless inference by an approved caller
             "tool:dispatch_cancelled",  # Nested execution outcome may be unknown
+            "tool:dispatch_suspended",  # Parent controller started; no replay
         ],
     )
 
@@ -6856,6 +6857,8 @@ class StreamingOrchestrator:
                 self._tool_calls_this_turn += 1
             try:
                 result = await tool.execute(tool_call.arguments)
+            except NestedExecutionHeld as e:
+                result = e.tool_result()
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
             finally:
@@ -7026,6 +7029,8 @@ class StreamingOrchestrator:
             self._tool_calls_this_turn += 1
             try:
                 result = await tool.execute(tool_call.arguments)
+            except NestedExecutionHeld as e:
+                result = e.tool_result()
             except Exception as e:
                 result = ToolResult(success=False, error={"message": str(e)})
             finally:
