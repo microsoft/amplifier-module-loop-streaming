@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
+from .suspension import ToolExecutionSuspended
 
 _RUN = ContextVar("approved_dispatch_run", default=None)
 _CALL = ContextVar("approved_dispatch_call", default=None)
@@ -210,6 +211,14 @@ class DispatchLease:
                     self.scope.parallel_group_id or self.scope.call.id,
                     coordinator,
                 )
+        except ToolExecutionSuspended as suspended:
+            # The nested invocation is not the enclosing controller. Propagating
+            # its "not_started" frame would replay a controller that may already
+            # have performed effects. Controllers have no portable stack here.
+            raise RuntimeError(
+                "Nested tool suspended; the enclosing controller already started. "
+                "Inspect retained effects; do not replay the controller."
+            ) from suspended
         except asyncio.CancelledError:
             await self.scope.hooks.emit(
                 "tool:dispatch_cancelled",
@@ -321,9 +330,18 @@ class ApprovedDispatch:
         return set(declared) if host is None else set(declared).intersection(host)
 
     def reset_model_budget(self):
+        self.restore_model_budget(0)
+
+    def model_budget_used(self):
+        run = _RUN.get()
+        return run.model_calls if run and run.owner is self else 0
+
+    def restore_model_budget(self, used):
+        if type(used) is not int or used < 0:
+            raise ValueError("Invalid nested inference continuation budget")
         run = _RUN.get()
         if run and run.owner is self:
-            run.model_calls = 0
+            run.model_calls = used
 
     @contextmanager
     def run_scope(self, coordinator):
@@ -467,6 +485,9 @@ class ApprovedDispatch:
                                 "Nested inference exceeds provider input budget"
                             )
                 lease._valid()
+                suspension = coordinator.get_capability("execution.suspension")
+                if suspension is not None and suspension.requested():
+                    raise RuntimeError("Nested inference is held for execution suspension")
                 scope.run.model_calls += 1
                 self.owner._llm_calls_this_turn += 1
                 pending = asyncio.create_task(provider.complete(request, **options))

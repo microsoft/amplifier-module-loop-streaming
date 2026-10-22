@@ -702,6 +702,7 @@ async def test_legacy_subclass_dispatcher_keeps_ownership_of_its_pipeline(enviro
             ToolCall(id="legacy", name="read", arguments={}),
             coordinator.get("tools"), context, coordinator.hooks, coordinator,
         )
+        assert echo.calls == 1
 
 
 async def test_nested_pause_does_not_make_started_controller_replayable(environment):
@@ -791,4 +792,29 @@ async def test_resume_retains_nested_model_budget_and_expires_old_lease(environm
     assert len(utility_calls) == 1
     assert len(controller_calls) == 2 and len(root_calls) == 3
     assert restored._llm_calls_this_turn == 4
-        assert echo.calls == 1
+
+
+async def test_pause_during_nested_inference_policy_prevents_provider_send(environment):
+    from amplifier_core.message_models import ChatRequest, Message
+    _, coordinator, loop, _ = environment
+    owner = SimpleNamespace(hold=False)
+    owner.requested = lambda: owner.hold
+    coordinator.register_capability("execution.suspension", owner)
+    class Provider:
+        name = "fixture"
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+        async def complete(self, request, **kwargs):
+            pytest.fail("pause during policy must prevent a new provider send")
+    await coordinator.mount("providers", Provider(), name="fixture")
+    async def pause(event, data):
+        owner.hold = True
+        return HookResult()
+    coordinator.hooks.register("provider:request", pause)
+    async def program(lease):
+        with pytest.raises(RuntimeError, match="held for execution suspension"):
+            await coordinator.get_capability("model.complete")(
+                ChatRequest(messages=[Message(role="user", content="utility")]))
+        return {"held": True}
+    result, _ = await call_client(environment, Client(coordinator, program))
+    assert result["held"] and loop._llm_calls_this_turn == 0

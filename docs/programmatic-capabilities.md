@@ -40,3 +40,14 @@ zero disables them). It is separate from the existing foreground iteration cap,
 not a claim that routing, goal evaluation, decision endpoints and financial
 budgets are already governed by a single meter. A broader inference service can
 be extracted later without putting that policy in a UI controller.
+
+Cooperative suspension expires the old run/call leases. Explicit resume starts
+new scopes while retaining the turn's spent nested-inference allowance; it does
+not grant another allowance or make the old lease usable. A hold observed after
+nested inference policy/budget preparation refuses the send before provider use.
+
+A running controller has no serialized Python stack. If one of its nested tool
+calls suspends, dispatch fails that nested call explicitly rather than treating
+the enclosing controller as unstarted. Earlier effects remain evidence and the
+controller must not be replayed. Ordinary controllers settle before the engine
+acknowledges its next safe suspension boundary.

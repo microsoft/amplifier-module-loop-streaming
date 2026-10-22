@@ -70,6 +70,9 @@ def validate(continuation: dict[str, Any], messages: list, config: dict) -> dict
         raise ValueError("Execution configuration changed; inspect before resuming")
     if not isinstance(frame.get("iteration"), int) or frame["iteration"] < 0:
         raise ValueError("Invalid execution continuation iteration")
+    model_calls = frame.get("dispatch_model_calls", 0)
+    if type(model_calls) is not int or model_calls < 0:
+        raise ValueError("Invalid nested inference continuation budget")
     if frame["phase"] in {"tools", "settling_tools"} and not frame.get("tool_calls"):
         raise ValueError("Tool continuation has no pending calls")
     if frame["phase"] == "settling_tools" and (

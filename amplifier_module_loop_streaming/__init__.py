@@ -1445,6 +1445,8 @@ class StreamingOrchestrator:
             "goal": coordinator.session_state.get("goal"),
             "response": self._suspension_response,
             "settled_tools": settled_tools,
+            "dispatch_model_calls": (self._streaming_dispatch.model_budget_used()
+                                     if self._owns_dispatch_pipeline else 0),
             "prepared_request": prepared_request,
             "goal_loop": self._goal_loop_state,
             "goal_utility": self._goal_utility_prepared,
@@ -1916,6 +1918,8 @@ class StreamingOrchestrator:
             full_response = await run_turn(reason, goal_turn=goal["turns_used"] + 1)
 
     def _restore_turn_continuation(self, resume):
+        if self._owns_dispatch_pipeline:
+            self._streaming_dispatch.restore_model_budget(resume.get("dispatch_model_calls", 0))
         for name, value in resume["turn"].items():
             if name not in {
                 "_tool_calls_this_turn", "_goal_turn_evidence", "_llm_calls_this_turn",
