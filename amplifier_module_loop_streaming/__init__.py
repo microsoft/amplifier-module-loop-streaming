@@ -3595,7 +3595,7 @@ class StreamingOrchestrator:
                     error={"code": "resume_dispatch_failed", "message": str(error),
                            "retryable": False},
                 )
-                return call.id, call.name, result.get_serialized_output()
+                return call.id, call.name, json.dumps(result.model_dump())
 
         tool_tasks = [asyncio.ensure_future(dispatch(index, call))
                       for index, call in enumerate(tool_calls)]
