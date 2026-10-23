@@ -703,3 +703,270 @@ async def test_legacy_subclass_dispatcher_keeps_ownership_of_its_pipeline(enviro
             coordinator.get("tools"), context, coordinator.hooks, coordinator,
         )
         assert echo.calls == 1
+
+
+async def test_nested_pause_does_not_make_started_controller_replayable(environment):
+    """The second nested call did not start; its parent already made an effect."""
+    _, coordinator, _, echo = environment
+    owner = SimpleNamespace(hold=False)
+    owner.requested = lambda: owner.hold
+    coordinator.register_capability("execution.suspension", owner)
+
+    async def program(lease):
+        first = await lease.call("read", {}, request_id="settled")
+        assert first["status"] == "completed"
+        owner.hold = True
+        with pytest.raises(RuntimeError, match="not replay"):
+            await lease.call("read", {}, request_id="held")
+        return {"first": first, "held": True}
+
+    result, client = await call_client(environment, Client(coordinator, program))
+    assert result["held"] and echo.calls == 1
+    assert coordinator._tool_dispatch_contexts == {}
+    with pytest.raises(RuntimeError):
+        await client.lease.call("read", {})
+
+
+async def test_resume_retains_nested_model_budget_and_expires_old_lease(environment):
+    from amplifier_core.message_models import ChatRequest, Message
+    from amplifier_module_loop_streaming import ExecutionSuspended, StreamingOrchestrator
+
+    _, coordinator, loop, _ = environment
+    context = coordinator.get("context")
+    loop.config.update(programmatic_max_model_calls=1, max_iterations=4)
+    owner = SimpleNamespace(hold=False, saved=None)
+    owner.requested = lambda: owner.hold
+    async def checkpoint(frame):
+        owner.saved = frame
+        return True
+    owner.checkpoint = checkpoint
+    coordinator.register_capability("execution.suspension", owner)
+    coordinator.register_capability("execution.resume", lambda frame: True)
+    root_calls, utility_calls, controller_calls = [], [], []
+
+    class Provider:
+        name, config = "fixture", {}
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+        def parse_tool_calls(self, response):
+            return response.tool_calls or []
+        async def complete(self, request, **kwargs):
+            if any(message.content == "utility" for message in request.messages):
+                utility_calls.append(request)
+                return ChatResponse(content=[TextBlock(text="selected")])
+            root_calls.append(request)
+            if len(root_calls) <= 2:
+                return ChatResponse(content=[], tool_calls=[
+                    ToolCall(id=f"controller-{len(root_calls)}", name="tool_exec", arguments={})
+                ])
+            return ChatResponse(content=[TextBlock(text="done")])
+
+    provider = Provider()
+    await coordinator.mount("providers", provider, name="fixture")
+    request = ChatRequest(messages=[Message(role="user", content="utility")])
+    async def program(lease):
+        controller_calls.append(lease)
+        complete = coordinator.get_capability("model.complete")
+        if len(controller_calls) == 1:
+            await complete(request)
+            owner.hold = True
+        else:
+            with pytest.raises(RuntimeError, match="budget exhausted"):
+                await complete(request)
+        return {"settled": True}
+    client = Client(coordinator, program)
+    await coordinator.mount("tools", client, name="tool_exec")
+    with pytest.raises(ExecutionSuspended) as held:
+        await loop.execute("original", context, {"fixture": provider},
+                           coordinator.get("tools"), coordinator.hooks, coordinator)
+    assert len(utility_calls) == 1 and len(controller_calls) == 1
+    first_lease = controller_calls[0]
+    with pytest.raises(RuntimeError):
+        await first_lease.call("read", {})
+    owner.hold = False
+    restored = StreamingOrchestrator(dict(loop.config))
+    coordinator.register_capability("tools.dispatch", restored.approved_dispatch)
+    coordinator.register_capability("model.complete", restored.approved_dispatch.complete)
+    assert await restored.resume(held.value.continuation, context, {"fixture": provider},
+                                 coordinator.get("tools"), coordinator.hooks, coordinator) == "done"
+    assert len(utility_calls) == 1
+    assert len(controller_calls) == 2 and len(root_calls) == 3
+    assert restored._llm_calls_this_turn == 4
+
+
+async def test_pause_during_nested_inference_policy_prevents_provider_send(environment):
+    from amplifier_core.message_models import ChatRequest, Message
+    _, coordinator, loop, _ = environment
+    owner = SimpleNamespace(hold=False)
+    owner.requested = lambda: owner.hold
+    coordinator.register_capability("execution.suspension", owner)
+    class Provider:
+        name = "fixture"
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+        async def complete(self, request, **kwargs):
+            pytest.fail("pause during policy must prevent a new provider send")
+    await coordinator.mount("providers", Provider(), name="fixture")
+    async def pause(event, data):
+        owner.hold = True
+        return HookResult()
+    coordinator.hooks.register("provider:request", pause)
+    async def program(lease):
+        with pytest.raises(RuntimeError, match="held for execution suspension"):
+            await coordinator.get_capability("model.complete")(
+                ChatRequest(messages=[Message(role="user", content="utility")]))
+        return {"held": True}
+    result, _ = await call_client(environment, Client(coordinator, program))
+    assert result["held"] and loop._llm_calls_this_turn == 0
+
+
+@pytest.mark.parametrize("serial", [False, True])
+async def test_uncaught_nested_hold_keeps_structured_parent_outcome(environment, serial):
+    _, coordinator, loop, echo = environment
+    owner = SimpleNamespace(hold=False)
+    owner.requested = lambda: owner.hold
+    coordinator.register_capability("execution.suspension", owner)
+    observed = []
+    async def capture(event, data):
+        observed.append((event, data))
+        return HookResult()
+    coordinator.hooks.register("tool:dispatch_suspended", capture)
+    coordinator.hooks.register("tool:post", capture)
+    async def program(lease):
+        await lease.call("read", {}, request_id="settled")
+        owner.hold = True
+        return await lease.call("read", {}, request_id="held")
+    client = Client(coordinator, program)
+    await coordinator.mount("tools", client, name="tool_exec")
+    with loop.approved_dispatch.run_scope(coordinator):
+        call = ToolCall(id="parent", name="tool_exec", arguments={})
+        if serial:
+            await loop._execute_tool_with_result(call, coordinator.get("tools"),
+                coordinator.get("context"), coordinator.hooks, coordinator)
+        else:
+            await loop._execute_tool_only(call, coordinator.get("tools"),
+                coordinator.hooks, "group", coordinator)
+    parent, = [data["result"] for event, data in observed
+               if event == "tool:post" and data["tool_name"] == "tool_exec"]
+    assert parent["success"] is False
+    assert parent["error"]["retryable"] is False
+    assert parent["output"]["status"] == "held"
+    assert parent["output"]["retryable"] is False
+    assert parent["output"]["effects"] == "not_rolled_back"
+    held, = [data for event, data in observed if event == "tool:dispatch_suspended"]
+    assert held["source"]["parent_tool_call_id"] == "parent"
+    assert held["source"]["request_id"] == "held"
+    assert echo.calls == 1
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "restore"])
+async def test_budget_boundary_outside_owned_run_refuses(environment, operation):
+    _, coordinator, loop, _ = environment
+    release = asyncio.Event()
+    saved = []
+    async def checkpoint(frame):
+        saved.append(frame)
+        return True
+    coordinator.register_capability("execution.suspension",
+        SimpleNamespace(requested=lambda: True, checkpoint=checkpoint))
+    async def outside():
+        await release.wait()
+        if operation == "restore":
+            loop._restore_turn_continuation({"turn": {}, "dispatch_model_calls": 1})
+        else:
+            await loop._suspend_at_boundary("provider", 0, coordinator.get("context"), coordinator)
+    # This task captures no dispatch context even though it runs later.
+    task = asyncio.create_task(outside())
+    with loop.approved_dispatch.run_scope(coordinator):
+        release.set()
+        with pytest.raises(RuntimeError, match="active dispatch run"):
+            await task
+    assert saved == []
+
+
+async def test_legacy_dispatch_owner_cannot_borrow_streaming_model_capability(environment):
+    from amplifier_core.message_models import ChatRequest, Message
+    _, coordinator, loop, _ = environment
+    loop.approved_dispatch = SimpleNamespace(enabled=True)
+    loop._restore_turn_continuation({"turn": {}, "dispatch_model_calls": 2})
+    with pytest.raises(RuntimeError, match="authorized"):
+        await coordinator.get_capability("model.complete")(
+            ChatRequest(messages=[Message(role="user", content="not admitted")]))
+
+
+@pytest.mark.parametrize("second_kind", ["resumed", "not_started"])
+@pytest.mark.parametrize("alias", [False, True])
+async def test_resumed_batch_keeps_mounted_tool_lock(environment, second_kind, alias, record_property):
+    _, coordinator, loop, _ = environment
+    class ContinuingTool:
+        name = "read"
+        description = "Fixture with per-call continuations"
+        input_schema = {"type": "object", "properties": {}}
+        def __init__(self):
+            self.active = self.peak = 0
+            self.resumed, self.executed = [], []
+        async def effect(self, value):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                # Both dispatched tasks have an opportunity to enter execution.
+                await asyncio.sleep(0.01)
+                return ToolResult(success=True, output={"value": value})
+            finally:
+                self.active -= 1
+        async def execute(self, arguments):
+            self.executed.append(dict(arguments))
+            return await self.effect(arguments["value"])
+        async def resume_execution(self, continuation):
+            self.resumed.append(dict(continuation))
+            return await self.effect(continuation["value"])
+    tool = ContinuingTool()
+    await coordinator.mount("tools", tool, name="read")
+    if alias:
+        await coordinator.mount("tools", tool, name="same-instance")
+    calls = [
+        ToolCall(id="original-a", name="read", arguments={"value": "must-not-replay-a"}),
+        ToolCall(id="original-b", name="same-instance" if alias else "read",
+                 arguments={"value": "fresh-b" if second_kind == "not_started" else "must-not-replay-b"}),
+    ]
+    first = {"kind": "cooperating", "value": "continued-a", "token": "a"}
+    second = ({"kind": "not_started"} if second_kind == "not_started" else
+              {"kind": "cooperating", "value": "continued-b", "token": "b"})
+    with loop.approved_dispatch.run_scope(coordinator):
+        assert await loop._settle_tool_batch(
+            calls, coordinator.get("context"), coordinator.get("tools"),
+            coordinator.hooks, coordinator, 1,
+            settled=[{"continuation": first}, {"continuation": second}])
+    rows = [row for row in await coordinator.get("context").get_messages()
+            if row.get("role") == "tool"]
+    values = [json.loads(row["content"])["output"]["value"] for row in rows]
+    observed = {"peak": tool.peak, "resumed": tool.resumed, "executed": tool.executed,
+                "call_ids": [row["tool_call_id"] for row in rows], "values": values}
+    record_property("execution_counters", json.dumps(observed, sort_keys=True))
+    assert observed["call_ids"] == ["original-a", "original-b"]
+    assert values == ["continued-a", "fresh-b" if second_kind == "not_started" else "continued-b"]
+    # Concurrent approval paths may acquire the shared lock in either order.
+    # Each continuation is consumed once; only result publication is ordered.
+    assert sorted(tool.resumed, key=lambda row: row["token"]) == (
+        [first] if second_kind == "not_started" else [first, second])
+    assert tool.executed == ([{"value": "fresh-b"}] if second_kind == "not_started" else [])
+    assert tool.active == 0
+    assert tool.peak == 1, observed
+
+
+async def test_resume_wrapper_lock_identity_is_not_the_execution_adapter(environment):
+    from amplifier_module_loop_streaming.dispatch import GuardedTool
+    from amplifier_module_loop_streaming.suspension import ResumingTool
+    _, _, loop, _ = environment
+    raw = SimpleNamespace(name="read", resume_execution=lambda continuation: None)
+    first = ResumingTool(raw, {"token": "first"})
+    second = ResumingTool(GuardedTool(raw, asyncio.Lock()), {"token": "second"})
+    wrapped = loop.approved_dispatch.wrap_tools({"first": first, "second": second, "raw": raw})
+    assert wrapped["first"].tool is first and wrapped["second"].tool is second
+    assert wrapped["first"].lock is wrapped["second"].lock is wrapped["raw"].lock
+    # Rewrapping must preserve both lock identity and the per-call adapter.
+    again = loop.approved_dispatch.wrap_tools(wrapped)
+    assert again["first"].tool is first and again["first"].lock is wrapped["raw"].lock
+    for name in ("delegate", "task", "live_job"):
+        excluded = ResumingTool(SimpleNamespace(name=name, resume_execution=lambda c: None), {})
+        assert loop.approved_dispatch.wrap_tools({name: excluded})[name] is excluded
