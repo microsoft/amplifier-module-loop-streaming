@@ -44,6 +44,19 @@ versioned continuation. Its mounted tool implements
 owner instead of `execute(arguments)`. There is no redispatch fallback. The tool
 owns child/session/result attribution and timeout/admission checks.
 
+Resumed batches validate every required completion owner before scheduling any
+sibling. A refusal after host admission does not release or reuse that claim.
+An unexpected ordinary dispatch failure during a resumed batch is an unknown,
+non-retryable outcome; started siblings still settle and retain their known
+results. Cancellation remains distinct from this failure path.
+
+True-stream input-overflow recovery checks for suspension after recovery,
+preflight and rate-limit waits, before sending the replacement request. Its
+prepared checkpoint retains that exact request, spent one-shot recovery
+allowance and accounting. Authorized resume does not repeat preparation or grant
+another recovery attempt. Any provider chunk, including a non-text chunk, still
+forbids overflow recovery.
+
 This interface does not undo remote effects, make opaque provider-native
 execution suspendable, or authorize serialization of custom private component
 state. Hosts must report unsupported or unconfirmed cases honestly.

@@ -3556,6 +3556,17 @@ class StreamingOrchestrator:
 
         parallel_group_id = str(uuid.uuid4())
 
+        # Validate every completion owner before scheduling any resumed sibling.
+        # Admission may already be consumed; refusal never releases/reuses it.
+        mounted_by_call = [tools] * len(tool_calls)
+        if settled:
+            for index, call in enumerate(tool_calls):
+                prior = settled[index]
+                if prior and "result" not in prior and prior["continuation"].get("kind") != "not_started":
+                    mounted_by_call[index] = {
+                        **tools, call.name: ResumingTool(tools.get(call.name), prior["continuation"])
+                    }
+
         # Execute all tools in parallel (no context updates inside).
         # Materialized as Tasks rather than bare coroutines so the
         # cancellation handler below can ask each one INDIVIDUALLY
@@ -3566,12 +3577,25 @@ class StreamingOrchestrator:
                 prior = settled[index] if settled else None
                 if prior and "result" in prior:
                     return tuple(prior["result"])
-                mounted = tools
-                if prior and prior["continuation"].get("kind") != "not_started":
-                    mounted = {**tools, call.name: ResumingTool(tools.get(call.name), prior["continuation"])}
-                return await self._execute_tool_only(call, mounted, hooks, parallel_group_id, coordinator)
+                return await self._execute_tool_only(
+                    call, mounted_by_call[index], hooks, parallel_group_id, coordinator)
             except ToolExecutionSuspended as suspended:
                 return suspended
+            except Exception as error:
+                if settled is None:
+                    raise
+                # A resumed dispatch failure does not establish whether its
+                # effect ran. Observe all other started siblings via gather and
+                # publish their known results, never replay this uncertain call.
+                logger.error("Resumed tool dispatch failed: %s", type(error).__name__)
+                result = ToolResult(
+                    success=False,
+                    output={"status": "unknown", "retryable": False,
+                            "effects": "not_rolled_back"},
+                    error={"code": "resume_dispatch_failed", "message": str(error),
+                           "retryable": False},
+                )
+                return call.id, call.name, result.get_serialized_output()
 
         tool_tasks = [asyncio.ensure_future(dispatch(index, call))
                       for index, call in enumerate(tool_calls)]
@@ -5492,7 +5516,7 @@ class StreamingOrchestrator:
                     if callable(recorder):
                         recorder(input_tokens=measured_stream_count)
                 self._llm_calls_this_turn += 1
-                if get_context_overflow_recovery() is not None:
+                if not overflow_retried and get_context_overflow_recovery() is not None:
                     response_stream = self._stream_with_overflow_recovery(
                         provider,
                         chat_request,
@@ -5517,6 +5541,9 @@ class StreamingOrchestrator:
                             ),
                         ),
                         on_unconfirmed_stream=record_unavailable_stream_usage,
+                        before_retry=lambda request: self._suspend_at_boundary(
+                            "prepared_request", iteration, context, coordinator,
+                            prepared_request=lambda: prepared_dispatch(request, retried=True)),
                     )
                 else:
                     response_stream = self._stream_from_provider(
@@ -6500,6 +6527,7 @@ class StreamingOrchestrator:
         provider_name=None,
         recover_overflow=None,
         on_unconfirmed_stream=None,
+        before_retry=None,
     ) -> AsyncIterator[str]:
         """Forward a stream, retrying exactly once before its first SDK chunk."""
         while True:
@@ -6530,10 +6558,12 @@ class StreamingOrchestrator:
                 recovered_request = await recover_overflow(error)
                 if recovered_request is None:
                     raise
-                self._llm_calls_this_turn += 1
                 chat_request = recovered_request
                 # A prospective outbound generation has one recovery allowance.
                 recover_overflow = None
+                if before_retry is not None:
+                    await before_retry(recovered_request)
+                self._llm_calls_this_turn += 1
             finally:
                 await self._close_async_iterator(
                     stream, description="provider stream wrapper"
