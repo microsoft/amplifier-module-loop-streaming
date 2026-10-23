@@ -31,7 +31,10 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 
 - Token-level streaming from provider
 - Real-time response delivery
-- **Parallel tool execution**: Multiple tool calls execute concurrently
+- **Parallel tool execution by default**: Multiple ordinary tool calls execute
+  concurrently. A provider-marked native-toolset batch executes in response
+  order and stops after an error, so stateful native computer actions cannot
+  race.
 - Deterministic context updates: Results added in original order
 - Progressive rendering
 - Interruptible generation
