@@ -1511,6 +1511,12 @@ class StreamingOrchestrator:
         goal is active this is a single pass-through call: zero behavior
         change from the pre-goal implementation.
         """
+        # loop-live inherits this execution path without mounting this module.
+        # Advertise before tools can create a host-reserved successor goal.
+        register = getattr(coordinator, "register_capability", None)
+        if callable(register):
+            register("goal.reserved_turn_accounting", 1)
+
         # Reset the per-run model-role resolution cache (see
         # `_resolve_goal_model`'s CRITICAL PERF note) so each execute() call
         # re-resolves the goal-loop model role exactly once, not once per
@@ -1690,7 +1696,17 @@ class StreamingOrchestrator:
                 return full_response
 
             if goal_resume is None:
-                goal["turns_used"] += 1
+                # A host can durably charge an input before admitting effects,
+                # then install a successor goal during that same input. Its
+                # synchronous witness must be idempotent for the exact turn,
+                # and false for later continuations. Errors are not permission
+                # to charge again or to silently discard a reservation.
+                charged = coordinator.get_capability("goal.turn_already_charged")
+                already_charged = charged(goal) if callable(charged) else False
+                if type(already_charged) is not bool:
+                    raise TypeError("goal.turn_already_charged must return a synchronous boolean")
+                if not already_charged:
+                    goal["turns_used"] += 1
             # cap is optional: None/0/absent means unlimited (parity default).
             # A positive int is a hard, Python-enforced mechanical cap. This
             # is only a *flag* here -- checked further down, AFTER

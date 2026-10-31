@@ -275,3 +275,48 @@ async def test_utility_cancellation_preserves_cancellation_when_diagnostics_fail
     assert raised.value is cancellation
     assert coordinator.session_state["goal"] is None
     assert hooks.goal_progress_events()[-1]["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reservation', [True, False])
+async def test_host_reserved_midturn_goal_counts_first_input_once_and_later_turn_normally(reservation):
+    coordinator, provider = MockCoordinator(), ChangingProvider()
+    active = goal(task_id='successor', task_revision=2, turns_used=1, continuations=0, cap=2)
+    witness = dict(task_id='successor', turns_used=1, continuations=0)
+    seen = []
+
+    def already_charged(current):
+        seen.append((current['turns_used'], current['continuations']))
+        return reservation and all(current[key] == value for key, value in witness.items())
+
+    coordinator._capabilities['goal.turn_already_charged'] = already_charged
+    coordinator.register_capability = coordinator._capabilities.__setitem__
+    provider.callbacks['turn'] = lambda: coordinator.session_state.update(goal=active)
+    provider.turn_queue.extend([MockTurnResponse(text='first'), MockTurnResponse(text='second')])
+    provider.eval_queue.extend([(False, 'one more step'), (True, 'done')])
+    _, hooks, _ = await run(provider, coordinator)
+    assert coordinator.get_capability('goal.reserved_turn_accounting') == 1
+    assert active['turns_used'] == 2
+    if reservation:
+        assert seen == [(1, 0), (1, 1)]
+        assert provider.calls.count('turn') == 2
+        assert hooks.goal_progress_events()[-1]['state'] == 'achieved'
+    else:
+        assert seen == [(1, 0)]
+        assert provider.calls.count('turn') == 1
+        assert hooks.goal_progress_events()[-1]['state'] == 'cap_hit'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [OSError('witness unavailable'), asyncio.CancelledError()])
+async def test_reserved_turn_witness_failure_is_not_an_extra_charge_or_evaluation(failure):
+    coordinator, provider = MockCoordinator(), ChangingProvider()
+    active = goal(task_id='successor', turns_used=1, continuations=0, cap=2)
+    coordinator.session_state['goal'] = active
+    def unavailable(current):
+        raise failure
+    coordinator._capabilities['goal.turn_already_charged'] = unavailable
+    provider.turn_queue.append(MockTurnResponse(text='saved'))
+    with pytest.raises(type(failure)):
+        await run(provider, coordinator)
+    assert active['turns_used'] == 1 and provider.calls == ['turn']
