@@ -43,6 +43,7 @@ from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from ._text_estimate import estimate_messages
+from ._request_refit import RefitProvider
 from .steering import SteeringQueue
 from .suspension import (ExecutionSuspended, ToolExecutionSuspended, NestedExecutionHeld, ResumingTool,
                          canonical_copy, fingerprint, validate as validate_continuation)
@@ -4214,6 +4215,7 @@ class StreamingOrchestrator:
             base_view: list[dict[str, Any]],
             *,
             request_options: Mapping[str, Any] | None,
+            refit_error: Exception | None = None,
         ) -> dict[str, Any] | None:
             """Count one frozen provider-facing request for the Context contract.
 
@@ -4222,7 +4224,7 @@ class StreamingOrchestrator:
             progression.  Retaining the old envelope validation here keeps a
             malformed advertised provider budget fail-closed.
             """
-            request_budget = getattr(provider, "request_budget", None)
+            request_budget = getattr(provider, "refit_request" if refit_error is not None else "request_budget", None)
             if not callable(request_budget):
                 await emit_budget_unavailable(
                     mode="measured", reason="capability_missing"
@@ -4230,13 +4232,16 @@ class StreamingOrchestrator:
                 return None
             context_estimate = estimate_messages(base_view).tokens
             kwargs: dict[str, Any] = {"context_estimate": context_estimate}
+            if refit_error is not None:
+                kwargs["error"] = refit_error
             if accepts_named_request_options(request_budget):
                 kwargs["request_options"] = request_options
             decision = request_budget(request, **kwargs)
             if inspect.isawaitable(decision):
                 decision = await decision
             if decision is None:
-                await emit_budget_unavailable(mode="measured", reason="no_decision")
+                if refit_error is None:
+                    await emit_budget_unavailable(mode="measured", reason="no_decision")
                 return None
             required = (
                 "estimated_input_tokens",
@@ -4787,6 +4792,40 @@ class StreamingOrchestrator:
         # canonical history, not just in the request view.
         if continuation is None:
             await context.add_message({"role": "user", "content": prompt})
+
+        async def refit_pretransport(request, error, options, *, streaming):
+            if coordinator and coordinator.cancellation.is_cancelled:
+                raise asyncio.CancelledError
+            try:
+                # Reuse explicit measurement and hard-fit validation. Do not
+                # rerun context compaction, hooks or completed tools.
+                decision = await count_measured_request(
+                    request, dispatch_base_messages,
+                    request_options=request_options if streaming else options,
+                    refit_error=error,
+                )
+                if decision is None:
+                    return False
+                count = validate_measured_budget_decision(decision, require_hard_fit=True)
+                cap = decision.get('max_output_tokens')
+                if cap is not None and request.max_output_tokens is not None and request.max_output_tokens > cap:
+                    return False  # Never mutate output options after measuring.
+            except ContextLengthError:
+                # A refused local refit cannot enter sent-request overflow recovery.
+                return False
+            if coordinator and coordinator.cancellation.is_cancelled:
+                raise asyncio.CancelledError
+            if streaming:
+                recorder = foreground_usage_recorder()
+                if callable(recorder):
+                    recorder(input_tokens=count)
+            await hooks.emit('orchestrator:request_refit', {
+                'attempt': 1, 'phase': 'before_transport', 'result': 'refitted',
+            })
+            return True
+
+        if callable(getattr(provider, 'refit_request', None)):
+            provider = RefitProvider(provider, refit_pretransport)
 
         iteration = continuation["iteration"] if continuation else 0
         # A bounded loop needs a finalization call only when the final

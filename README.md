@@ -192,6 +192,23 @@ preflights: they do not resend a provider request or omit input. At caps below
 10,000 tokens, a view-only system reminder asks the model to tell the user that
 the session is degraded and to recommend a new session for substantial work.
 
+### Refitting a locally refused request
+
+A host provider wrapper may expose `refit_request(request, *, error,
+context_estimate, request_options=None)`. It must return `None` unless it owns
+that exact exception/request pair and can prove the refusal occurred before
+transport, with the original native authority still valid. It may explicitly
+prepare and measure that request again, returning the normal `request_budget`
+decision. Named `request_options` remains optional under the existing negotiation.
+
+The loop checks that decision using its normal hard-fit validator, then repeats
+only the prepared dispatch once. It does not rerun tools, request hooks, context
+compaction or the user input. A second refusal, invalid/unavailable/oversized
+decision, cancellation or any prior stream event prevents recovery. Provider
+errors are never classified by exception text; sent or unknown requests must
+not be approved by this capability. Existing providers without it are unchanged.
+`orchestrator:request_refit` records only attempt, phase and result metadata.
+
 ## Configuration
 
 ```toml
