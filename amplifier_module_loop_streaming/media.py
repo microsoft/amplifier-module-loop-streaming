@@ -91,7 +91,7 @@ def origin_for(coordinator, call):
     return {"kind": "tool", "session_id": session_id, "id": call.id}
 
 
-def text_only_messages(messages, *, reason=UNAVAILABLE):
+def text_only_messages(messages, *, reason=UNAVAILABLE, images=False):
     """Request-local unavailable projection at the original message position.
 
     Used on paths with no installed media handler, or by explicitly text-only
@@ -100,14 +100,26 @@ def text_only_messages(messages, *, reason=UNAVAILABLE):
     projected = []
     for message in messages:
         metadata = message.get("metadata")
-        if not isinstance(metadata, Mapping) or NAMESPACE not in metadata:
+        has_refs = isinstance(metadata, Mapping) and NAMESPACE in metadata
+        content = message.get("content")
+        has_images = images and isinstance(content, list) and any(
+            isinstance(block, Mapping) and block.get("type") in {"image", "image_url", "input_image"}
+            for block in content
+        )
+        if not has_refs and not has_images:
             projected.append(message)
             continue
         message = deepcopy(message)
-        message["metadata"] = {k: v for k, v in metadata.items() if k != NAMESPACE}
-        content = message.get("content")
+        if has_refs:
+            message["metadata"] = {k: v for k, v in metadata.items() if k != NAMESPACE}
         if isinstance(content, list):
-            message["content"] = [*content, {"type": "text", "text": reason}]
+            message["content"] = [
+                {"type": "text", "text": reason}
+                if images and isinstance(block, Mapping) and block.get("type") in {"image", "image_url", "input_image"}
+                else block for block in content
+            ]
+            if has_refs:
+                message["content"].append({"type": "text", "text": reason})
         else:
             message["content"] = (content or "") + "\n" + reason
         projected.append(message)

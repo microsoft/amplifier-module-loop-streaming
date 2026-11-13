@@ -2158,6 +2158,8 @@ class StreamingOrchestrator:
         for tool_call, settled in zip(tool_calls, tool_results):
             settled = SettledToolResult.from_legacy(settled)
             tool_name, result = settled.tool_name, settled.content
+            if settled.metadata.get("experimental.media.v1"):
+                result += "\n[Image unavailable in text-only goal evidence; no pixels supplied.]"
             try:
                 arguments = json.dumps(tool_call.arguments, default=str)
             except (TypeError, ValueError):
@@ -2785,6 +2787,7 @@ class StreamingOrchestrator:
         request.messages = [Message(**message) for message in text_only_messages(
             [message.model_dump(exclude_none=True) for message in request.messages],
             reason="[Image unavailable in text-only utility; no pixels supplied.]",
+            images=True,
         )]
         owner = coordinator.get_capability("execution.suspension") if coordinator else None
         if owner is not None and owner.requested():

@@ -438,6 +438,14 @@ async def test_utility_boundary_keeps_requests_text_only_before_saving_or_adapte
     await loop._goal_utility_boundary("evaluate", "main", request, {}, coordinator)
     assert "Image unavailable in text-only utility" in request.messages[0].content
     assert request.messages[0].metadata == {"other": 3}
+    request = ChatRequest(messages=[Message(role="user", content=[
+        {"type": "text", "text": "caption"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PIXELS}},
+    ])])
+    await loop._goal_utility_boundary("judge", "main", request, {}, coordinator)
+    assert PIXELS not in request.model_dump_json()
+    assert "caption" in request.model_dump_json()
+    assert "no pixels supplied" in request.model_dump_json()
 
 
 @pytest.mark.parametrize("case", ["null", "missing", "string", "list"])
