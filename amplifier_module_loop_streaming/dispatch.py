@@ -6,7 +6,6 @@ unchecked tool execution path.
 """
 
 import asyncio
-import json
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -14,6 +13,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
+from .media import SettledToolResult, effective_result, capability, text_only_messages
 from .suspension import NestedExecutionHeld, ResumingTool, ToolExecutionSuspended
 
 _RUN = ContextVar("approved_dispatch_run", default=None)
@@ -75,10 +75,7 @@ class AttributedHooks:
         result = await self.hooks.emit(event, enriched)
         if event == "tool:post":
             self.observation["post_seen"] = True
-            returned = result.data.get("result") if result and result.data else None
-            self.observation["post_result"] = (
-                returned if returned is not None else data.get("result")
-            )
+            self.observation["post_result"] = effective_result(result, enriched.get("result"))
         elif event == "tool:error":
             self.observation["engine_error"] = True
         return result
@@ -205,13 +202,13 @@ class DispatchLease:
                     observation=observation,
                     authority=lambda: still_authorized(child_scope),
                 )
-                _, _, content = await self.dispatcher.owner._execute_tool_unscoped(
+                settled = SettledToolResult.from_legacy(await self.dispatcher.owner._execute_tool_unscoped(
                     call,
                     tools,
                     hooks,
                     self.scope.parallel_group_id or self.scope.call.id,
                     coordinator,
-                )
+                ))
         except ToolExecutionSuspended as suspended:
             # The nested invocation is not the enclosing controller. Propagating
             # its "not_started" frame would replay a controller that may already
@@ -248,7 +245,9 @@ class DispatchLease:
                 "Tool execution denied by host policy",
             )
         else:
-            post = observation.get("post_result")
+            # The engine's processed final result, not an earlier post-hook
+            # observer or JSON parsed from text, owns structured delivery.
+            post = settled.result
             confirmed = post.get("success") if isinstance(post, dict) else None
             if observation.get("engine_error"):
                 status, success = "failed", False
@@ -258,19 +257,11 @@ class DispatchLease:
                 status, success = "failed", False
             else:
                 status, success = "unknown", None
-            try:
-                output = json.loads(content)
-                # The core hook transport may copy result dictionaries, making
-                # the ordinary engine serialize the full post-hook ToolResult.
-                # Unwrap only when it is exactly the captured confirmed envelope.
-                if (
-                    isinstance(post, dict)
-                    and isinstance(post.get("success"), bool)
-                    and output == post
-                ):
-                    output = post.get("output")
-            except (ValueError, TypeError):
-                output = content
+            output = post
+            if isinstance(post, dict) and isinstance(post.get("success"), bool):
+                output = post.get("output")
+            elif post is None and not observation.get("post_seen"):
+                output = settled.content
         return {
             "status": status,
             "success": success,
@@ -448,6 +439,11 @@ class ApprovedDispatch:
                     },
                     deep=True,
                 )
+                if capability(coordinator) is None:
+                    from amplifier_core.message_models import Message
+                    request.messages = [Message(**message) for message in text_only_messages(
+                        [message.model_dump(exclude_none=True) for message in request.messages]
+                    )]
                 source = {
                     **lease.context,
                     "caller": scope.call.name,

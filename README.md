@@ -76,6 +76,61 @@ this does not add a cancellation-recovery policy. A missing capability preserves
 the behavior of existing hosts. The Loop itself does not write transcripts.
 This checkpoint is not the earlier `tool:post` event, which precedes result append.
 
+### Reference-only tool media (integration candidate)
+
+The optional, session-bound `experimental.media.v1` capability is a structural
+interface with `version == 1` and six callable operations: `ingest`, `publish`,
+`validate`, `resolve`, `prepare_request`, and `report`. The loop imports only
+Core types; it does not import Foundation or a host/provider implementation.
+
+Canonical rich `ToolResult` images are ingested **before** `tool:post`
+serialization. Only refs surviving the final processed result's actual
+`output["experimental.media.v1"]["refs"]` are published under the actual
+session/tool-call origin, then attached to the corresponding tool message's
+metadata. Explicit null, a missing result in final chained data, removal,
+replacement, denial, and surfaced dispatch exceptions do not restore earlier
+refs. JSON-looking strings are text, never an alternate media transport.
+Absent or incompatible media handling replaces canonical image transport with
+an explicit unavailable/no-pixels warning while preserving useful output.
+
+`SettledToolResult` is exported for extensions such as loop-live. Its
+`model_dump()` is detached JSON with `version: 1`, `tool_call_id`, `tool_name`,
+`content`, `metadata`, `result` (the effective structured post-hook result), and
+`success` (boolean or null). `from_legacy()` accepts an instance, that mapping,
+or historical `[id, name, text]` records without parsing the text. Metadata
+survives ordered append, completed cancellation siblings, and settled-tool
+continuations. Historical triple reads remain supported, but new extensions
+must persist `model_dump()`, not `list(result)`, to avoid discarding metadata.
+
+`media.checkpoint_settled_results(coordinator, *, has_media=False)` awaits the
+existing zero-argument host checkpoint. Media-bearing settled appends require
+that capability. Its return is **not** interpreted as a media commit receipt:
+the host must save and verify the exact canonical prefix/content/source,
+bind its acknowledgment to the media store, and refuse private request
+preparation until that acceptance exists. Assets-only publication and
+consumer-ready reports do not grant durable reachability.
+
+Requests, measured views, prepared dispatch/finalization continuations, and
+canonical context remain reference-only. The selected host/provider adapter
+owns private hydration and the same projection for count/refit/send; the loop
+never calls `resolve` or `prepare_request`. Ref-bearing metadata marks the
+local text estimate as containing unmeasured images, not a cheap image fit.
+Goal utilities are text-only and show explicit unavailable image evidence.
+Unsupported restored refs receive request-local unavailable text at their
+original position without rewriting history.
+
+**Activation holds:** this candidate requires exact accepted media-store,
+checkpoint, provider-adapter, and nested-origin integration qualification.
+The installed Core hook registry returns final chained data with
+`action="continue"` even after `modify`; the loop handles final-field presence.
+Core also copies handler input and logs/continues after individual handler
+exceptions. Mutation without returning modified data is not an effective
+Core hook replacement, and those swallowed exceptions are not observable
+through its public `emit` result. A host requiring fail-closed per-handler
+redaction needs a qualified hook boundary/error witness before enabling media;
+passing mock-hook tests is not that qualification. No native/background,
+provider wire, durable crash-recovery, or live-session parity is implied.
+
 ### Provider budget preflight
 
 When a provider exposes the optional `request_budget` capability, the loop

@@ -15,6 +15,7 @@ import re
 import time
 import weakref
 from collections.abc import AsyncIterator, Mapping
+from copy import deepcopy
 from functools import partial
 from typing import Any, ClassVar
 
@@ -44,6 +45,9 @@ from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from ._text_estimate import estimate_messages
 from ._request_refit import RefitProvider
+from .media import (SettledToolResult, stage_result, settle_result, text_only_messages,
+                    checkpoint_settled_results, report_consumer_ready,
+                    capability as media_capability, post_result as media_post_result)
 from .steering import SteeringQueue
 from .suspension import (ExecutionSuspended, ToolExecutionSuspended, NestedExecutionHeld, ResumingTool,
                          canonical_copy, fingerprint, validate as validate_continuation)
@@ -189,6 +193,8 @@ def _flatten_message_for_evaluator(
             btype = block.get("type")
             if btype == "text":
                 parts.append(block.get("text", ""))
+            elif btype in {"image", "image_url", "input_image"}:
+                parts.append("[Image unavailable in text-only evaluation; no pixels supplied.]")
             elif btype == "tool_call":
                 name = block.get("name", "?")
                 # `input` is the tool-call-argument dict per ToolCallBlock's
@@ -211,6 +217,9 @@ def _flatten_message_for_evaluator(
         text = "\n".join(p for p in parts if p)
     else:
         text = str(content)
+    media = (msg.get("metadata") or {}).get("experimental.media.v1")
+    if isinstance(media, dict) and media.get("refs"):
+        text += "\n[Image unavailable in text-only evaluation; no pixels supplied.]"
     return f"{role}: {text}" if text else ""
 
 
@@ -783,6 +792,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_capability(
         "conversation.provider_pin", ConversationProviderPin(orchestrator, coordinator)
     )
+    await report_consumer_ready(coordinator)
     logger.info(
         "Mounted StreamingOrchestrator with steering and "
         "conversation-provider-pin capabilities"
@@ -2145,7 +2155,9 @@ class StreamingOrchestrator:
             return
         entries = self._goal_turn_evidence["tools"]
         captured = 0
-        for tool_call, (_, tool_name, result) in zip(tool_calls, tool_results):
+        for tool_call, settled in zip(tool_calls, tool_results):
+            settled = SettledToolResult.from_legacy(settled)
+            tool_name, result = settled.tool_name, settled.content
             try:
                 arguments = json.dumps(tool_call.arguments, default=str)
             except (TypeError, ValueError):
@@ -2768,6 +2780,12 @@ class StreamingOrchestrator:
         }
 
     async def _goal_utility_boundary(self, kind, provider_name, request, kwargs, coordinator):
+        # Utilities are intentionally text-only, including saved utility
+        # requests. Never let a provider wrapper interpret refs as visual input.
+        request.messages = [Message(**message) for message in text_only_messages(
+            [message.model_dump(exclude_none=True) for message in request.messages],
+            reason="[Image unavailable in text-only utility; no pixels supplied.]",
+        )]
         owner = coordinator.get_capability("execution.suspension") if coordinator else None
         if owner is not None and owner.requested():
             self._goal_utility_prepared = canonical_copy({
@@ -3593,9 +3611,12 @@ class StreamingOrchestrator:
             try:
                 prior = settled[index] if settled else None
                 if prior and "result" in prior:
-                    return tuple(prior["result"])
-                return await self._execute_tool_only(
-                    call, mounted_by_call[index], hooks, parallel_group_id, coordinator)
+                    result = SettledToolResult.from_legacy(prior["result"])
+                    if result.tool_call_id != call.id or result.tool_name != call.name:
+                        raise ValueError("Settled tool identity does not match call")
+                    return result
+                return SettledToolResult.from_legacy(await self._execute_tool_only(
+                    call, mounted_by_call[index], hooks, parallel_group_id, coordinator))
             except ToolExecutionSuspended as suspended:
                 return suspended
             except Exception as error:
@@ -3612,7 +3633,8 @@ class StreamingOrchestrator:
                     error={"code": "resume_dispatch_failed", "message": str(error),
                            "retryable": False},
                 )
-                return call.id, call.name, json.dumps(result.model_dump())
+                return SettledToolResult(call.id, call.name, json.dumps(result.model_dump()),
+                                         result=result.model_dump(), success=False)
 
         tool_tasks = [asyncio.ensure_future(dispatch(index, call))
                       for index, call in enumerate(tool_calls)]
@@ -3642,6 +3664,7 @@ class StreamingOrchestrator:
             preserved = 0
             for tc, task in zip(tool_calls, tool_tasks):
                 content: str | None = None
+                metadata = {}
                 if task.done() and not task.cancelled():
                     task_exc = task.exception()
                     if task_exc is None:
@@ -3651,7 +3674,8 @@ class StreamingOrchestrator:
                             content = json.dumps({"status": "cancelled", "outcome": "suspended",
                                                   "effects": "not_rolled_back"})
                         else:
-                            _done_id, _done_name, content = result
+                            result = SettledToolResult.from_legacy(result)
+                            content, metadata = result.content, result.metadata
                             preserved += 1
                     else:
                         # Finished by raising something that is not a
@@ -3669,6 +3693,7 @@ class StreamingOrchestrator:
                         "name": tc.name,
                         "tool_call_id": tc.id,
                         "content": content,
+                        **({"metadata": metadata} if metadata else {}),
                     }
                 )
             logger.info(
@@ -3719,7 +3744,8 @@ class StreamingOrchestrator:
             # All admitted siblings settled. Preserve successful results without
             # representing a suspended delegate as a completed tool result.
             outcomes = [({"continuation": result.continuation}
-                         if isinstance(result, ToolExecutionSuspended) else {"result": list(result)})
+                         if isinstance(result, ToolExecutionSuspended) else
+                         {"result": SettledToolResult.from_legacy(result).model_dump()})
                         for result in tool_results]
             await self._suspend_at_boundary("settling_tools", iteration, context, coordinator,
                                             tool_calls, settled_tools=outcomes)
@@ -3731,15 +3757,8 @@ class StreamingOrchestrator:
             # MUST add tool results to context before returning
             # Otherwise we leave orphaned tool_calls without matching tool_results
             # which violates provider API contracts (Anthropic, OpenAI)
-            for tool_call_id, tool_name, content in tool_results:
-                await context.add_message(
-                    {
-                        "role": "tool",
-                        "name": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "content": content,
-                    }
-                )
+            for result in tool_results:
+                await context.add_message(SettledToolResult.from_legacy(result).message())
             # Emit cancel:requested on first detection and trigger cleanup callbacks
             if not self._cancel_requested_emitted:
                 self._cancel_requested_emitted = True
@@ -3781,38 +3800,17 @@ class StreamingOrchestrator:
 
         # Add all results to context in original order (sequential, deterministic)
         # Note: Context manager handles compaction internally when get_messages_for_request() is called
-        for tool_call_id, tool_name, content in tool_results:
-            await context.add_message(
-                {
-                    "role": "tool",
-                    "name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "content": content,
-                }
-            )
+        for result in tool_results:
+            await context.add_message(SettledToolResult.from_legacy(result).message())
 
         # tool:post precedes this ordered append. Only now is the
         # settled batch ready for a host-owned durable checkpoint.
         # Keep older hosts compatible, but do not dispatch again when
         # a host that promises persistence cannot complete its write.
-        checkpoint = (
-            coordinator.get_capability("session.durable_checkpoint")
-            if coordinator
-            else None
-        )
-        if checkpoint is not None:
-            try:
-                if not callable(checkpoint):
-                    raise TypeError("session.durable_checkpoint is not callable")
-                checkpoint_result = checkpoint()
-                if inspect.isawaitable(checkpoint_result):
-                    checkpoint_result = await checkpoint_result
-                if checkpoint_result is False:
-                    raise RuntimeError("session.durable_checkpoint returned False")
-            except Exception as exc:
-                raise RuntimeError(
-                    "Durable session checkpoint failed; refusing further provider dispatch"
-                ) from exc
+        await checkpoint_settled_results(coordinator, has_media=any(
+            SettledToolResult.from_legacy(result).metadata.get("experimental.media.v1")
+            for result in tool_results
+        ))
         return True
 
     async def _execute_stream(
@@ -4050,7 +4048,10 @@ class StreamingOrchestrator:
         ) -> ChatRequest:
             tools_list = [_build_tool_spec(tool) for tool in tools.values()] if tools else None
             kwargs: dict[str, Any] = {
-                "messages": [Message(**message) for message in message_dicts],
+                "messages": [Message(**message) for message in (
+                    message_dicts if media_capability(coordinator) is not None
+                    else text_only_messages(message_dicts)
+                )],
                 "tools": tools_list,
                 "reasoning_effort": self.config.get("reasoning_effort"),
             }
@@ -6874,7 +6875,7 @@ class StreamingOrchestrator:
                     pre_result, "tool:pre", tool_call.name
                 )
                 if pre_result.action == "deny":
-                    return (
+                    return SettledToolResult(
                         tool_call.id,
                         tool_call.name,
                         f"Denied by hook: {pre_result.reason}",
@@ -6893,7 +6894,7 @@ class StreamingOrchestrator:
                         "parallel_group_id": parallel_group_id,
                     },
                 )
-                return (tool_call.id, tool_call.name, error_msg)
+                return SettledToolResult(tool_call.id, tool_call.name, error_msg)
 
             # Approval and policy hooks may await. Recheck at actual admission,
             # before recording a start or invoking any effect. This call was
@@ -6957,26 +6958,25 @@ class StreamingOrchestrator:
                         else:
                             coordinator._tool_dispatch_contexts[asyncio.current_task()] = _previous_dispatch
 
+            # Ingest rich content before any tool:post observer serializes it.
+            result, media_cap, staged_refs = await stage_result(result, coordinator, tool_call)
             # Serialize result for logging
             result_data = (
                 result.model_dump() if hasattr(result, "model_dump") else str(result)
             )
+            original_result_data = deepcopy(result_data)
 
             # Post-tool hook
-            post_result = await hooks.emit(
-                TOOL_POST,
+            post_result = await media_post_result(
+                hooks, coordinator, tool_call,
                 {
                     "tool_name": tool_call.name,
                     "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
                     "parallel_group_id": parallel_group_id,
-                },
+                }, media_cap, staged_refs,
             )
-            if coordinator:
-                await coordinator.process_hook_result(
-                    post_result, "tool:post", tool_call.name
-                )
 
             # Store ephemeral injection from tool:post for next iteration
             if (
@@ -6995,25 +6995,10 @@ class StreamingOrchestrator:
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
 
-            # Check if a hook modified the tool result.
-            # hooks.emit() chains modify actions: when a hook
-            # returns action="modify", the data dict is replaced.
-            # We detect this by checking if the returned "result"
-            # is a different object than what we originally sent.
-            modified_result = None
-            if post_result and post_result.data is not None:
-                returned_result = post_result.data.get("result")
-                if returned_result is not None and returned_result is not result_data:
-                    modified_result = returned_result
-
-            if modified_result is not None:
-                if isinstance(modified_result, (dict, list)):
-                    content = json.dumps(modified_result)
-                else:
-                    content = str(modified_result)
-            else:
-                content = result.get_serialized_output()
-            return (tool_call.id, tool_call.name, content)
+            return await settle_result(
+                tool_call, result, result_data, original_result_data, post_result,
+                media_cap, staged_refs, coordinator,
+            )
 
         except Exception as e:
             # Safety net: errors become error messages
@@ -7028,7 +7013,7 @@ class StreamingOrchestrator:
                     "parallel_group_id": parallel_group_id,
                 },
             )
-            return (tool_call.id, tool_call.name, error_msg)
+            return SettledToolResult(tool_call.id, tool_call.name, error_msg)
 
     async def _execute_tool_with_result(self, tool_call, tools, context, hooks, coordinator=None):
         if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
@@ -7126,25 +7111,23 @@ class StreamingOrchestrator:
                     else:
                         coordinator._tool_dispatch_contexts[asyncio.current_task()] = _previous_dispatch
 
+            result, media_cap, staged_refs = await stage_result(result, coordinator, tool_call)
             # Serialize result for logging
             result_data = (
                 result.model_dump() if hasattr(result, "model_dump") else str(result)
             )
+            original_result_data = deepcopy(result_data)
 
             # Post-tool hook
-            post_result = await hooks.emit(
-                TOOL_POST,
+            post_result = await media_post_result(
+                hooks, coordinator, tool_call,
                 {
                     "tool_name": tool_call.name,
                     "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
-                },
+                }, media_cap, staged_refs,
             )
-            if coordinator:
-                await coordinator.process_hook_result(
-                    post_result, "tool:post", tool_call.name
-                )
 
             # Store ephemeral injection from tool:post for next iteration
             if (
@@ -7163,41 +7146,26 @@ class StreamingOrchestrator:
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
 
-            # Check if a hook modified the tool result.
-            # hooks.emit() chains modify actions: when a hook
-            # returns action="modify", the data dict is replaced.
-            # We detect this by checking if the returned "result"
-            # is a different object than what we originally sent.
-            modified_result = None
-            if post_result and post_result.data is not None:
-                returned_result = post_result.data.get("result")
-                if returned_result is not None and returned_result is not result_data:
-                    modified_result = returned_result
-
-            if modified_result is not None:
-                if isinstance(modified_result, (dict, list)):
-                    tool_content = json.dumps(modified_result)
-                else:
-                    tool_content = str(modified_result)
-            else:
-                tool_content = result.get_serialized_output()
-
-            await context.add_message(
-                {
-                    "role": "tool",
-                    "name": tool_call.name,
-                    "tool_call_id": tool_call.id,
-                    "content": tool_content,
-                }
+            settled = await settle_result(
+                tool_call, result, result_data, original_result_data, post_result,
+                media_cap, staged_refs, coordinator,
             )
+            await context.add_message(settled.message())
             response_added = True
+            await checkpoint_settled_results(
+                coordinator, has_media=bool(settled.metadata.get("experimental.media.v1"))
+            )
 
             return {
-                "success": result.success,
-                "error": result.error if not result.success else None,
+                "success": settled.success,
+                "error": settled.result.get("error") if isinstance(settled.result, dict) else None,
             }
 
         except Exception as e:
+            if response_added:
+                # The effect/result already settled. Checkpoint failure must
+                # stop subsequent dispatch, not become an ordinary tool error.
+                raise
             # Safety net: Ensure a tool response is ALWAYS added to prevent orphaned tool calls
             logger.error(
                 f"Unexpected error executing tool {tool_call.name}: {e}", exc_info=True
