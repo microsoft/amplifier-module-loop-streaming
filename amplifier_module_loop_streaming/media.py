@@ -268,6 +268,11 @@ def without_images(value, *, strip_refs=False):
 
 async def stage_result(result, coordinator, call):
     cap = capability(coordinator)
+    # A host may install its compatible reader/consumer before enabling image
+    # producers. Disabled ingestion must not break ordinary text tools or
+    # serialize inline fallback pixels.
+    if getattr(cap, "enabled", None) is False:
+        cap = None
     if cap is None:
         if isinstance(result, ToolResult):
             data = result.model_dump()

@@ -226,6 +226,26 @@ async def test_absent_capability_keeps_rich_caption_and_ordinary_output_semantic
     assert PIXELS not in result.content
 
 
+async def test_registered_but_disabled_media_preserves_text_and_warns_for_images():
+    coordinator, media, loop = setup()
+    media.enabled = False
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Disabled producer must not ingest")
+    media.ingest = forbidden
+    hooks = MutatingHooks(lambda data: HookResult())
+    call = ToolCall(id="call", name="image", arguments={})
+    result = await loop._execute_tool_unscoped(
+        call, {"image": ImageTool()}, hooks, "group", coordinator)
+    assert not result.metadata and UNAVAILABLE in result.content
+    assert not media.publications and PIXELS not in json.dumps(hooks.emitted)
+    class Text:
+        async def execute(self, arguments):
+            return ToolResult(success=True, output="ordinary text")
+    result = await loop._execute_tool_unscoped(
+        call, {"image": Text()}, hooks, "group", coordinator)
+    assert result.content == "ordinary text" and result.success is True
+
+
 async def test_coordinator_processed_result_is_authoritative():
     coordinator, media, loop = setup()
     async def process(result, event, name):
