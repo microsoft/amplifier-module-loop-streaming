@@ -97,7 +97,7 @@ Promotion additionally requires a host-installed `session.media.tool_post`
 callable with this structural signature:
 
 ```python
-await boundary(event_data, *, hooks, coordinator, tool_name)
+await boundary(event_data, *, hooks=None, coordinator=None)
 # -> {"hook_result": actual_core_hook_result,
 #     "result": final_effective_value, "complete": True}
 ```

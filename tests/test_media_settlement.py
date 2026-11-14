@@ -96,10 +96,10 @@ class MutatingHooks(ScriptedHooks):
         return await super().emit(event, payload)
 
 
-async def fixture_boundary(event_data, *, hooks, coordinator, tool_name):
+async def fixture_boundary(event_data, *, hooks=None, coordinator=None):
     """Synthetic trustworthy hook boundary, NOT a qualified host adapter."""
     hook_result = await hooks.emit("tool:post", event_data)
-    hook_result = await coordinator.process_hook_result(hook_result, "tool:post", tool_name)
+    hook_result = await coordinator.process_hook_result(hook_result, "tool:post", event_data["tool_name"])
     return {"hook_result": hook_result, "result": effective_result(hook_result, event_data["result"]),
             "complete": True}
 
@@ -315,10 +315,10 @@ async def test_lossy_real_registry_without_witness_never_promotes_media(site, ca
 async def test_boundary_ambiguous_or_failed_witness_drops_staging_without_duplicate_hooks(failure):
     coordinator, media, loop = setup()
     hooks = MutatingHooks(lambda data: HookResult())
-    async def boundary(data, *, hooks, coordinator, tool_name):
-        assert tool_name == "image"
+    async def boundary(data, *, hooks=None, coordinator=None):
+        assert data["tool_name"] == "image"
         post = await hooks.emit("tool:post", data)
-        post = await coordinator.process_hook_result(post, "tool:post", tool_name)
+        post = await coordinator.process_hook_result(post, "tool:post", data["tool_name"])
         if failure == "exception":
             raise RuntimeError("hook boundary failed")
         receipt = {"hook_result": post, "result": data["result"], "complete": True}
@@ -361,10 +361,10 @@ async def test_boundary_witness_preserves_final_null_and_nested_attribution():
         process_calls.append(args)
         return await original_process(result, *args)
     coordinator.process_hook_result = process
-    async def boundary(data, *, hooks, coordinator, tool_name):
+    async def boundary(data, *, hooks=None, coordinator=None):
         assert hooks is attributed and coordinator is attributed_coordinator
         post = await hooks.emit("tool:post", data)
-        post = await coordinator.process_hook_result(post, "tool:post", tool_name)
+        post = await coordinator.process_hook_result(post, "tool:post", data["tool_name"])
         # This fixture's trusted witness observes final result from the last
         # handler; production must install its facade before registration.
         return {"hook_result": post, "result": seen[-1], "complete": True}

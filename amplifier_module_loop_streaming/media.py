@@ -273,7 +273,7 @@ async def post_result(hooks, coordinator, call, data, cap, staged):
         boundary = tool_post_boundary(coordinator) if cap is not None else None
         if boundary is not None:
             receipt = await _await(boundary(
-                data, hooks=hooks, coordinator=coordinator, tool_name=call.name
+                data, hooks=hooks, coordinator=coordinator
             ))
             if (not isinstance(receipt, Mapping) or receipt.get("complete") is not True
                     or "result" not in receipt
