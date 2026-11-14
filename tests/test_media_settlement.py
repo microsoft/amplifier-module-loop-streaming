@@ -6,7 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from amplifier_core import HookRegistry, HookResult, ToolResult
+from amplifier_core import ContextLengthError, HookRegistry, HookResult, ToolResult
 from amplifier_core.message_models import ChatRequest, Message, ToolCall
 
 from amplifier_module_loop_streaming import ExecutionSuspended, SettledToolResult, StreamingOrchestrator
@@ -544,8 +544,9 @@ async def test_settled_media_checkpoint_precedes_next_count_send_and_finalizatio
 
 @pytest.mark.parametrize("finalization", [False, True])
 @pytest.mark.parametrize("lost_capability", [False, True])
+@pytest.mark.parametrize("resume_budget", ["fit", "unavailable", "oversized", "output-cap"])
 async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reexecute(
-    tmp_path, finalization, lost_capability
+    tmp_path, finalization, lost_capability, resume_budget,
 ):
     from tests.test_durable_checkpoint import BatchProvider
     coordinator, media, loop = setup()
@@ -558,6 +559,16 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
         def __init__(self):
             super().__init__(count=1)
             self.requests = []
+            self.counted = []
+            self.resuming = False
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            self.counted.append(request)
+            if self.resuming and resume_budget == "unavailable":
+                return None
+            return {"estimated_input_tokens": 10, "context_token_budget": 10000,
+                    "input_limit_tokens": 1 if self.resuming and resume_budget == "oversized" else 10000,
+                    **({"max_output_tokens": 1} if self.resuming and resume_budget == "output-cap" else {}),
+                    "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10}}
         async def complete(self, request, **kwargs):
             self.requests.append(request)
             return await super().complete(request, **kwargs)
@@ -588,14 +599,24 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
     assert saved_rows[0]["metadata"] == {NAMESPACE: {"refs": [ref()]}}
     before = copy.deepcopy(media.publications)
     owner.hold = False
+    provider.resuming = True
     if lost_capability:
         coordinator.register_capability(NAMESPACE, None)
         with pytest.raises(RuntimeError, match="Prepared media request lost compatible handling"):
             await StreamingOrchestrator(loop.config).resume(frame, *args)
         assert media.publications == before and provider.calls == 1
         return
+    if resume_budget != "fit":
+        if finalization and resume_budget == "unavailable":
+            assert await StreamingOrchestrator(loop.config).resume(frame, *args) == ""
+        else:
+            with pytest.raises((RuntimeError, ContextLengthError)):
+                await StreamingOrchestrator(loop.config).resume(frame, *args)
+        assert media.publications == before and provider.calls == 1 and hooks.provider_hooks == 2
+        return
     assert await StreamingOrchestrator(loop.config).resume(frame, *args) == "done"
     assert media.publications == before and hooks.provider_hooks == 2
+    assert provider.counted[-1] is provider.requests[-1]
     media_rows = [m for m in provider.requests[-1].messages if (m.metadata or {}).get(NAMESPACE)]
     assert media_rows[0].metadata[NAMESPACE]["refs"] == [ref()]
     assert PIXELS not in provider.requests[-1].model_dump_json()

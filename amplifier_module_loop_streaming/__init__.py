@@ -4365,6 +4365,34 @@ class StreamingOrchestrator:
                 decision, require_hard_fit=True
             )
 
+        async def revalidate_prepared_media_budget(request, request_options):
+            """Rebind a restored canonical object to a fresh private count.
+
+            A continuation can save refs/options, never a process-local adapter
+            association. Do not replay request hooks, context assembly or tools,
+            and do not change the already selected output cap to obtain a fit.
+            """
+            if not any(
+                (message.metadata or {}).get("experimental.media.v1", {}).get("refs")
+                for message in request.messages
+                if isinstance((message.metadata or {}).get("experimental.media.v1"), dict)
+            ):
+                return None
+            decision = await count_measured_request(
+                request, [message.model_dump(mode="json") for message in request.messages],
+                request_options=request_options,
+            )
+            count = (validate_measured_budget_decision(decision, require_hard_fit=True)
+                     if decision is not None else None)
+            if count is None:
+                raise RuntimeError("Prepared media request requires a fresh provider count")
+            output_cap = decision.get("max_output_tokens")
+            if output_cap is not None and (
+                request.max_output_tokens is None or request.max_output_tokens > output_cap
+            ):
+                raise ContextLengthError("Prepared media request output cap changed; refit required")
+            return count
+
         def foreground_usage_recorder() -> Any | None:
             """Claim one Context's foreground meter immediately before dispatch."""
             if foreground_usage_claim is None:
@@ -4961,6 +4989,9 @@ class StreamingOrchestrator:
                 original_output_cap = prepared["original_output_cap"]
                 measured_stream_count = prepared["measured_stream_count"]
                 overflow_retried = prepared.get("overflow_retried", False)
+                restored_count = await revalidate_prepared_media_budget(chat_request, request_options)
+                if restored_count is not None:
+                    measured_stream_count = restored_count
                 prepared = None
             else:
                 await self._suspend_at_boundary("provider", iteration, context, coordinator)
@@ -6193,6 +6224,7 @@ class StreamingOrchestrator:
                     original_output_cap = final_prepared["original_output_cap"]
                     final_overflow_retried = final_prepared["overflow_retried"]
                     final_measured_transaction = None
+                    await revalidate_prepared_media_budget(max_iter_chat_request, request_options)
                 else:
                     # Preserve the normal declarations, including provider-native
                     # specifications, so any assistant tool call and paired tool

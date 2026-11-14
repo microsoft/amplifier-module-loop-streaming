@@ -179,6 +179,12 @@ Unsupported restored refs receive request-local unavailable text at their
 original position without rewriting history. A previously fitted prepared
 continuation that loses compatible media handling instead refuses locally
 before count/send: changing its fitted payload requires an authorized refit.
+Media-bearing prepared resumes obtain a fresh provider count for the exact
+restored canonical object and saved options. Adapter-private associations
+cannot be serialized or reused by object identity across suspension. This
+revalidation does not replay hooks, tools, context assembly or compaction; an
+unavailable count, oversized request or newly reduced output allowance refuses
+locally rather than altering the saved fitted request.
 
 **Activation holds:** this candidate requires exact accepted media-store,
 checkpoint, provider-adapter, and nested-origin integration qualification.
@@ -198,6 +204,17 @@ Foundation source first on `PYTHONPATH` and Pillow available. It exercises real
 store publication, partial suppression, source-sealed checkpoint acceptance,
 private projection, and nested provenance. Its synthetic witnessed post
 boundary does **not** qualify a host registration facade or vendor wire path.
+
+`integration/test_media_positive_profile.py` selects an immutable public bridge
+with `MEDIA_HOOK_BRIDGE_SOURCE` and its exact `MEDIA_HOOK_BRIDGE_SHA256`. Its
+bounded cooperative graph names the actual loop/context modules and a late host
+participant, initializes through the actual loader, and seals only after late
+registrations. PNG/JPEG checks join final witnessed refs, source-sealed canonical
+checkpoint refs, and private count/send pixels, including nested leases and
+prepared/settled resume. These controlled public-API checks are candidate-graph
+evidence, not universal raw-registry mutation proof, accepted host activation,
+or vendor inference/wire qualification. Default unqualified graphs stay
+incomplete; the earlier negative-only profile remains separate.
 
 ### Provider budget preflight
 
