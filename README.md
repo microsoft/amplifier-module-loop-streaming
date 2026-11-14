@@ -93,6 +93,25 @@ refs. JSON-looking strings are text, never an alternate media transport.
 Absent or incompatible media handling replaces canonical image transport with
 an explicit unavailable/no-pixels warning while preserving useful output.
 
+Promotion additionally requires a host-installed `session.media.tool_post`
+callable with this structural signature:
+
+```python
+await boundary(event_data, *, hooks, coordinator, tool_name)
+# -> {"hook_result": actual_core_hook_result,
+#     "result": final_effective_value, "complete": True}
+```
+
+The boundary must execute the **supplied current** hooks and coordinator's
+`tool:post` emit/process chain exactly once, preserving nested dispatch
+attribution, policy processing, final data and failure observations. A missing
+`result` member, nonliteral `complete=True`, wrong HookResult type, or exception
+refuses media; explicit `result=None` is authoritative. The loop preserves
+ephemeral injections from `hook_result` separately. An absent boundary keeps
+the ordinary hook path, drops staging, freezes unavailable text, and does not
+advertise `consumer-ready`. Merely wrapping raw Core `emit` and asserting
+`complete=True` is not a qualified implementation of this interface.
+
 `SettledToolResult` is exported for extensions such as loop-live. Its
 `model_dump()` is detached JSON with `version: 1`, `tool_call_id`, `tool_name`,
 `content`, `metadata`, `result` (the effective structured post-hook result), and
@@ -117,7 +136,9 @@ never calls `resolve` or `prepare_request`. Ref-bearing metadata marks the
 local text estimate as containing unmeasured images, not a cheap image fit.
 Goal utilities are text-only and show explicit unavailable image evidence.
 Unsupported restored refs receive request-local unavailable text at their
-original position without rewriting history.
+original position without rewriting history. A previously fitted prepared
+continuation that loses compatible media handling instead refuses locally
+before count/send: changing its fitted payload requires an authorized refit.
 
 **Activation holds:** this candidate requires exact accepted media-store,
 checkpoint, provider-adapter, and nested-origin integration qualification.
@@ -126,8 +147,8 @@ The installed Core hook registry returns final chained data with
 Core also copies handler input and logs/continues after individual handler
 exceptions. Mutation without returning modified data is not an effective
 Core hook replacement, and those swallowed exceptions are not observable
-through its public `emit` result. A host requiring fail-closed per-handler
-redaction needs a qualified hook boundary/error witness before enabling media;
+through its public `emit` result. Media promotion therefore requires the
+qualified host hook boundary/error witness above before enabling media;
 passing mock-hook tests is not that qualification. No native/background,
 provider wire, durable crash-recovery, or live-session parity is implied.
 

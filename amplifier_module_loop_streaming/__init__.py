@@ -47,6 +47,7 @@ from ._text_estimate import estimate_messages
 from ._request_refit import RefitProvider
 from .media import (SettledToolResult, stage_result, settle_result, text_only_messages,
                     checkpoint_settled_results, report_consumer_ready,
+                    validate_prepared_media,
                     capability as media_capability, post_result as media_post_result)
 from .steering import SteeringQueue
 from .suspension import (ExecutionSuspended, ToolExecutionSuspended, NestedExecutionHeld, ResumingTool,
@@ -4888,6 +4889,9 @@ class StreamingOrchestrator:
                     and continuation["phase"] == "prepared_request" else None)
         final_prepared = (continuation.get("prepared_request") if continuation
                           and continuation["phase"] == "prepared_finalization" else None)
+        for saved in (prepared, final_prepared):
+            if saved is not None:
+                validate_prepared_media(ChatRequest(**saved["request"]), coordinator)
         while prepared is not None or self.max_iterations == -1 or iteration < self.max_iterations:
             # Check for cancellation at iteration start
             if coordinator and coordinator.cancellation.is_cancelled:
@@ -6970,7 +6974,7 @@ class StreamingOrchestrator:
             original_result_data = deepcopy(result_data)
 
             # Post-tool hook
-            post_result = await media_post_result(
+            post_state = await media_post_result(
                 hooks, coordinator, tool_call,
                 {
                     "tool_name": tool_call.name,
@@ -6980,6 +6984,7 @@ class StreamingOrchestrator:
                     "parallel_group_id": parallel_group_id,
                 }, media_cap, staged_refs,
             )
+            post_result = post_state.hook_result
 
             # Store ephemeral injection from tool:post for next iteration
             if (
@@ -6999,7 +7004,7 @@ class StreamingOrchestrator:
                 )
 
             return await settle_result(
-                tool_call, result, result_data, original_result_data, post_result,
+                tool_call, result, result_data, original_result_data, post_state,
                 media_cap, staged_refs, coordinator,
             )
 
@@ -7122,7 +7127,7 @@ class StreamingOrchestrator:
             original_result_data = deepcopy(result_data)
 
             # Post-tool hook
-            post_result = await media_post_result(
+            post_state = await media_post_result(
                 hooks, coordinator, tool_call,
                 {
                     "tool_name": tool_call.name,
@@ -7131,6 +7136,7 @@ class StreamingOrchestrator:
                     "result": result_data,
                 }, media_cap, staged_refs,
             )
+            post_result = post_state.hook_result
 
             # Store ephemeral injection from tool:post for next iteration
             if (
@@ -7150,7 +7156,7 @@ class StreamingOrchestrator:
                 )
 
             settled = await settle_result(
-                tool_call, result, result_data, original_result_data, post_result,
+                tool_call, result, result_data, original_result_data, post_state,
                 media_cap, staged_refs, coordinator,
             )
             await context.add_message(settled.message())

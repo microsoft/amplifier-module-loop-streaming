@@ -13,7 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from amplifier_core import ToolResult
+from amplifier_core import HookResult, ToolResult
 
 NAMESPACE = "experimental.media.v1"
 UNAVAILABLE = (
@@ -82,6 +82,29 @@ def capability(coordinator):
     return cap if all(callable(getattr(cap, name, None)) for name in (
         "ingest", "publish", "validate", "resolve", "prepare_request", "report"
     )) else None
+
+
+def tool_post_boundary(coordinator):
+    getter = getattr(coordinator, "get_capability", None)
+    boundary = getter("session.media.tool_post") if callable(getter) else None
+    return boundary if callable(boundary) else None
+
+
+@dataclass
+class ToolPostResult:
+    hook_result: Any
+    result: Any
+    complete: bool
+
+
+def validate_prepared_media(request, coordinator):
+    if capability(coordinator) is None and any(
+        NAMESPACE in (message.metadata or {}) for message in request.messages
+    ):
+        # This candidate was already fitted before suspension. Rewriting it
+        # now would invalidate its count; only an authorized refit can replace
+        # it. A local refusal is safe and never replays settled tools.
+        raise RuntimeError("Prepared media request lost compatible handling; refit required")
 
 
 def origin_for(coordinator, call):
@@ -156,7 +179,7 @@ async def checkpoint_settled_results(coordinator, *, has_media=False):
 
 async def report_consumer_ready(coordinator):
     cap = capability(coordinator)
-    if cap is not None:
+    if cap is not None and tool_post_boundary(coordinator) is not None:
         await _await(cap.report(
             {"kind": "host", "session_id": coordinator.session_id, "id": "loop-streaming"},
             event="consumer-ready", outcome="ready", details={"contract": 1, "role": "loop"},
@@ -247,11 +270,23 @@ async def stage_result(result, coordinator, call):
 
 async def post_result(hooks, coordinator, call, data, cap, staged):
     try:
+        boundary = tool_post_boundary(coordinator) if cap is not None else None
+        if boundary is not None:
+            receipt = await _await(boundary(
+                data, hooks=hooks, coordinator=coordinator, tool_name=call.name
+            ))
+            if (not isinstance(receipt, Mapping) or receipt.get("complete") is not True
+                    or "result" not in receipt
+                    or not isinstance(receipt.get("hook_result"), HookResult)):
+                raise ValueError("Media tool post boundary did not attest the complete chain")
+            post = receipt["hook_result"]
+            value = None if post.action == "deny" else receipt["result"]
+            return ToolPostResult(post, value, True)
         post = await hooks.emit("tool:post", data)
         if coordinator:
             post = await coordinator.process_hook_result(post, "tool:post", call.name)
-        return post
-    except BaseException:
+        return ToolPostResult(post, effective_result(post, data["result"]), False)
+    except BaseException as error:
         if cap is not None and staged:
             # Disposal failure leaves a host-owned staging orphan, never
             # accepted canonical reachability.
@@ -261,15 +296,17 @@ async def post_result(hooks, coordinator, call, data, cap, staged):
                 ))
             except Exception:
                 pass
+        if cap is not None and isinstance(error, Exception):
+            raise RuntimeError("Media tool post boundary failed; no media was accepted") from None
         raise
 
 
 async def settle_result(call, result, current, original, post, cap, staged, coordinator):
-    value = effective_result(post, current)
+    value = post.result
     unchanged_text = value is current and value == original
     # Hooks may redact/replace, but may not introduce inline pixels into durable
     # state. Only the pre-hook canonical ingest can stage image content.
-    value = without_images(value, strip_refs=cap is None)
+    value = without_images(value, strip_refs=cap is None or not post.complete)
     refs = _refs(value)
     metadata = {}
     if cap is not None:

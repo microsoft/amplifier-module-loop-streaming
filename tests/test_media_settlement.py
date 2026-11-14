@@ -11,6 +11,7 @@ from amplifier_core.message_models import ChatRequest, Message, ToolCall
 
 from amplifier_module_loop_streaming import ExecutionSuspended, SettledToolResult, StreamingOrchestrator
 from amplifier_module_loop_streaming.media import NAMESPACE, UNAVAILABLE
+from amplifier_module_loop_streaming.media import effective_result, report_consumer_ready
 from amplifier_module_loop_streaming.suspension import ToolExecutionSuspended
 from tests.test_durable_checkpoint import MockContext
 from tests.test_ephemeral_cache_persist_mode import MockCoordinator, ScriptedHooks
@@ -95,12 +96,22 @@ class MutatingHooks(ScriptedHooks):
         return await super().emit(event, payload)
 
 
-def setup(cap=True):
+async def fixture_boundary(event_data, *, hooks, coordinator, tool_name):
+    """Synthetic trustworthy hook boundary, NOT a qualified host adapter."""
+    hook_result = await hooks.emit("tool:post", event_data)
+    hook_result = await coordinator.process_hook_result(hook_result, "tool:post", tool_name)
+    return {"hook_result": hook_result, "result": effective_result(hook_result, event_data["result"]),
+            "complete": True}
+
+
+def setup(cap=True, boundary=True):
     coordinator = MockCoordinator()
     coordinator.session_id = "session"
     media = Media()
     if cap:
         coordinator.register_capability(NAMESPACE, media)
+    if boundary:
+        coordinator.register_capability("session.media.tool_post", fixture_boundary)
     return coordinator, media, StreamingOrchestrator({})
 
 
@@ -183,6 +194,37 @@ async def test_unsupported_capability_has_truthful_text_and_no_pixels():
     assert NAMESPACE not in result.content
 
 
+@pytest.mark.parametrize("failure", ["exception", "pixels-left", "mapping-not-toolresult"])
+async def test_ingest_failure_never_exposes_raw_result_to_hooks(failure):
+    coordinator, media, loop = setup()
+    async def invalid(value, **kwargs):
+        if failure == "exception":
+            raise ValueError(PIXELS)
+        return {"value": value if failure == "pixels-left" else value.model_dump(), "staged_refs": []}
+    media.ingest = invalid
+    hooks = MutatingHooks(lambda data: HookResult())
+    result = await loop._execute_tool_unscoped(
+        ToolCall(id="call", name="image", arguments={}),
+        {"image": ImageTool()}, hooks, "group", coordinator)
+    assert result.metadata == {}
+    assert not any(event == "tool:post" for event, _ in hooks.emitted)
+    assert PIXELS not in json.dumps(hooks.emitted)
+    assert PIXELS not in result.content and not media.publications
+
+
+async def test_absent_capability_keeps_rich_caption_and_ordinary_output_semantics():
+    coordinator, _, loop = setup(cap=False)
+    class Caption(ImageTool):
+        async def execute(self, arguments):
+            value = await super().execute(arguments)
+            return ToolResult(content=value.content)
+    result = await loop._execute_tool_unscoped(
+        ToolCall(id="call", name="image", arguments={}),
+        {"image": Caption()}, MutatingHooks(lambda data: HookResult()), "group", coordinator)
+    assert "caption" in result.content and UNAVAILABLE in result.content
+    assert PIXELS not in result.content
+
+
 async def test_coordinator_processed_result_is_authoritative():
     coordinator, media, loop = setup()
     async def process(result, event, name):
@@ -220,6 +262,120 @@ async def test_real_core_registry_final_chained_data_is_authoritative(case):
         ToolCall(id="call", name="image", arguments={}),
         {"image": ImageTool()}, hooks, "group", coordinator)
     assert result.metadata == {}
+    assert media.publications[-1][2] == "drop"
+
+
+@pytest.mark.parametrize("site", ["parallel", "sequential", "nested"])
+@pytest.mark.parametrize("case", ["none", "null-inject", "missing-inject", "exception", "inplace"])
+async def test_lossy_real_registry_without_witness_never_promotes_media(site, case):
+    from amplifier_module_loop_streaming.dispatch import AttributedHooks
+    coordinator, media, loop = setup(boundary=False)
+    hooks = HookRegistry()
+    posts = []
+    async def mutate(event, data):
+        posts.append(copy.deepcopy(data))
+        if case == "exception":
+            raise ValueError("privacy policy failed")
+        if case == "inplace":
+            data["result"]["output"].pop(NAMESPACE)
+            return HookResult()
+        if case == "null-inject":
+            data["result"] = None
+        elif case == "missing-inject":
+            data.pop("result")
+        return HookResult(action="modify", data=data) if case != "none" else HookResult()
+    async def inject(event, data):
+        return HookResult(action="inject_context", context_injection="ordinary reminder", ephemeral=True)
+    hooks.register("tool:post", mutate, priority=10)
+    if case.endswith("inject"):
+        hooks.register("tool:post", inject, priority=20)
+    if site == "nested":
+        hooks = AttributedHooks(hooks, {"parent_tool_call_id": "outer"}, {})
+    call = ToolCall(id="call", name="image", arguments={})
+    if site == "sequential":
+        context = MockContext()
+        await loop._execute_tool_with_result_unscoped(
+            call, {"image": ImageTool()}, context, hooks, coordinator)
+        result = context._messages[0]
+        content, metadata = result["content"], result.get("metadata", {})
+    else:
+        result = await loop._execute_tool_unscoped(
+            call, {"image": ImageTool()}, hooks, "group", coordinator)
+        content, metadata = result.content, result.metadata
+    assert len(posts) == 1 and PIXELS not in json.dumps(posts)
+    assert not metadata
+    assert not any(disposition == "retain" for _, _, disposition in media.publications)
+    assert media.publications[-1][2] == "drop"
+    assert UNAVAILABLE in content or content == "null"
+    await report_consumer_ready(coordinator)
+    assert media.reports == []
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "missing-result", "wrong-hook", "exception"])
+async def test_boundary_ambiguous_or_failed_witness_drops_staging_without_duplicate_hooks(failure):
+    coordinator, media, loop = setup()
+    hooks = MutatingHooks(lambda data: HookResult())
+    async def boundary(data, *, hooks, coordinator, tool_name):
+        assert tool_name == "image"
+        post = await hooks.emit("tool:post", data)
+        post = await coordinator.process_hook_result(post, "tool:post", tool_name)
+        if failure == "exception":
+            raise RuntimeError("hook boundary failed")
+        receipt = {"hook_result": post, "result": data["result"], "complete": True}
+        if failure == "incomplete":
+            receipt["complete"] = 1
+        elif failure == "missing-result":
+            receipt.pop("result")
+        else:
+            receipt["hook_result"] = {"action": "continue"}
+        return receipt
+    coordinator.register_capability("session.media.tool_post", boundary)
+    result = await loop._execute_tool_unscoped(
+        ToolCall(id="call", name="image", arguments={}),
+        {"image": ImageTool()}, hooks, "group", coordinator)
+    assert not result.metadata
+    assert len([event for event, _ in hooks.emitted if event == "tool:post"]) == 1
+    assert media.publications[-1][2] == "drop"
+
+
+async def test_boundary_witness_preserves_final_null_and_nested_attribution():
+    from amplifier_module_loop_streaming.dispatch import AttributedHooks, AttributedCoordinator
+    coordinator, media, loop = setup()
+    hooks = HookRegistry()
+    post_calls, process_calls, seen = [], [], []
+    async def redact(event, data):
+        post_calls.append(data)
+        assert data["parent_tool_call_id"] == "outer"
+        data["result"] = None
+        return HookResult(action="modify", data=data)
+    async def inject(event, data):
+        seen.append(data["result"])
+        return HookResult(action="inject_context", context_injection="keep reminder", ephemeral=True)
+    hooks.register("tool:post", redact, priority=10)
+    hooks.register("tool:post", inject, priority=20)
+    observation = {}
+    attributed = AttributedHooks(hooks, {"parent_tool_call_id": "outer"}, observation)
+    attributed_coordinator = AttributedCoordinator(coordinator, observation)
+    original_process = coordinator.process_hook_result
+    async def process(result, *args):
+        process_calls.append(args)
+        return await original_process(result, *args)
+    coordinator.process_hook_result = process
+    async def boundary(data, *, hooks, coordinator, tool_name):
+        assert hooks is attributed and coordinator is attributed_coordinator
+        post = await hooks.emit("tool:post", data)
+        post = await coordinator.process_hook_result(post, "tool:post", tool_name)
+        # This fixture's trusted witness observes final result from the last
+        # handler; production must install its facade before registration.
+        return {"hook_result": post, "result": seen[-1], "complete": True}
+    coordinator.register_capability("session.media.tool_post", boundary)
+    result = await loop._execute_tool_unscoped(
+        ToolCall(id="call", name="image", arguments={}), {"image": ImageTool()},
+        attributed, "group", attributed_coordinator)
+    assert result.result is None and result.content == "null" and not result.metadata
+    assert len(post_calls) == 1
+    assert len([row for row in process_calls if row[0] == "tool:post"]) == 1
+    assert loop._pending_ephemeral_injections[0]["content"] == "keep reminder"
     assert media.publications[-1][2] == "drop"
 
 
@@ -366,7 +522,10 @@ async def test_settled_media_checkpoint_precedes_next_count_send_and_finalizatio
 
 
 @pytest.mark.parametrize("finalization", [False, True])
-async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reexecute(tmp_path, finalization):
+@pytest.mark.parametrize("lost_capability", [False, True])
+async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reexecute(
+    tmp_path, finalization, lost_capability
+):
     from tests.test_durable_checkpoint import BatchProvider
     coordinator, media, loop = setup()
     context = MockContext()
@@ -408,6 +567,12 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
     assert saved_rows[0]["metadata"] == {NAMESPACE: {"refs": [ref()]}}
     before = copy.deepcopy(media.publications)
     owner.hold = False
+    if lost_capability:
+        coordinator.register_capability(NAMESPACE, None)
+        with pytest.raises(RuntimeError, match="Prepared media request lost compatible handling"):
+            await StreamingOrchestrator(loop.config).resume(frame, *args)
+        assert media.publications == before and provider.calls == 1
+        return
     assert await StreamingOrchestrator(loop.config).resume(frame, *args) == "done"
     assert media.publications == before and hooks.provider_hooks == 2
     media_rows = [m for m in provider.requests[-1].messages if (m.metadata or {}).get(NAMESPACE)]
