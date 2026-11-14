@@ -705,3 +705,56 @@ async def test_nested_verifier_binds_only_returned_effective_refs_to_active_pare
     assert not loop.approved_dispatch.media_refs(
         {"kind": "tool", "session_id": sid, "id": "parent"}, actual_refs[0])
     assert client.lease.scope.media_refs == []
+
+
+@pytest.mark.parametrize("case", ["refs", "inline", "forged"])
+async def test_nested_inference_is_text_only_before_selected_adapter_count_and_send(environment, case):
+    from tests.test_approved_dispatch import Client
+    from amplifier_core.message_models import ChatResponse, TextBlock
+    _, coordinator, _, _ = environment
+    media = Media()
+    validations, requests, counts = [], [], []
+    async def ingest(value, **kwargs):
+        return {"value": value, "staged_refs": []}
+    media.ingest = ingest
+    def validate(value, *, purpose):
+        validations.append((value, purpose))
+        if case == "forged":
+            raise ValueError("forged reference")
+        return {"valid": True}
+    media.validate = validate
+    coordinator.register_capability(NAMESPACE, media)
+    class Provider:
+        name = "fixture"
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            counts.append(request)
+            assert NAMESPACE not in request.model_dump_json()
+            assert PIXELS not in request.model_dump_json()
+            assert "no pixels supplied" in request.model_dump_json()
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 1000}
+        async def complete(self, request, **kwargs):
+            assert counts[-1] is request
+            requests.append(request)
+            return ChatResponse(content=[TextBlock(text="text answer")])
+    provider = Provider()
+    await coordinator.mount("providers", provider, name="fixture")
+    request = ChatRequest(messages=[Message(role="user", content=[
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PIXELS}}
+    ] if case == "inline" else "caption", metadata=None if case == "inline" else {
+        NAMESPACE: {"refs": [ref()]}, "owner": 7,
+    })])
+    before = request.model_dump_json()
+    async def handler(lease):
+        complete = coordinator.get_capability("model.complete")
+        if case == "forged":
+            with pytest.raises(ValueError, match="forged"):
+                await complete(request)
+        else:
+            await complete(request)
+        return {"done": True}
+    await call_client(environment, Client(coordinator, handler))
+    assert request.model_dump_json() == before
+    assert len(requests) == (0 if case == "forged" else 1)
+    assert bool(validations) is (case != "inline")

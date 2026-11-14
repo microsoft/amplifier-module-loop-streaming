@@ -149,6 +149,28 @@ def text_only_messages(messages, *, reason=UNAVAILABLE, images=False):
     return projected
 
 
+def text_only_request(request, coordinator, *, reason):
+    """Validate known refs, then freeze a utility's no-pixels candidate."""
+    from amplifier_core.message_models import Message
+    cap = capability(coordinator)
+    if cap is not None:
+        for message in request.messages:
+            metadata = message.metadata or {}
+            if NAMESPACE not in metadata:
+                continue
+            media = metadata[NAMESPACE]
+            if (not isinstance(media, dict) or set(media) != {"refs"}
+                    or not isinstance(media["refs"], list)):
+                raise ValueError("Invalid utility media envelope")
+            cap.validate(media["refs"], purpose="reference")
+    request = request.model_copy(deep=True)
+    request.messages = [Message(**message) for message in text_only_messages(
+        [message.model_dump(exclude_none=True) for message in request.messages],
+        reason=reason, images=True,
+    )]
+    return request
+
+
 async def _await(value):
     return await value if inspect.isawaitable(value) else value
 

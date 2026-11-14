@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
-from .media import SettledToolResult, effective_result, capability, text_only_messages
+from .media import SettledToolResult, effective_result, text_only_request
 from .suspension import NestedExecutionHeld, ResumingTool, ToolExecutionSuspended
 
 _RUN = ContextVar("approved_dispatch_run", default=None)
@@ -481,11 +481,10 @@ class ApprovedDispatch:
                     },
                     deep=True,
                 )
-                if capability(coordinator) is None:
-                    from amplifier_core.message_models import Message
-                    request.messages = [Message(**message) for message in text_only_messages(
-                        [message.model_dump(exclude_none=True) for message in request.messages]
-                    )]
+                request = text_only_request(
+                    request, coordinator,
+                    reason="[Image unavailable in text-only nested inference; no pixels supplied.]",
+                )
                 source = {
                     **lease.context,
                     "caller": scope.call.name,

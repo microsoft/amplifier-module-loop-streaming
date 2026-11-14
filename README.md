@@ -145,6 +145,9 @@ owns private hydration and the same projection for count/refit/send; the loop
 never calls `resolve` or `prepare_request`. Ref-bearing metadata marks the
 local text estimate as containing unmeasured images, not a cheap image fit.
 Goal utilities are text-only and show explicit unavailable image evidence.
+Approved nested `model.complete` likewise freezes no-pixels placeholders before
+the selected adapter's budget/send and validates ref identity when available;
+forged refs refuse rather than becoming a text-only approval.
 Unsupported restored refs receive request-local unavailable text at their
 original position without rewriting history. A previously fitted prepared
 continuation that loses compatible media handling instead refuses locally
