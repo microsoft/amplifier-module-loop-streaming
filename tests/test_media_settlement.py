@@ -844,3 +844,44 @@ async def test_proposed_nested_route_enrollment_is_exact_scoped_and_not_authorit
             assert result["status"] == ("denied" if outcome == "denied" else "completed")
     assert active == [] and len(records) == 1
     assert echo.calls == (1 if outcome == "success" else 0)
+
+
+@pytest.mark.parametrize("tools_present", [False, True])
+@pytest.mark.parametrize("claim", ["canonical", "legacy", "malformed", "changed"])
+async def test_stream_tools_contract_uses_one_frozen_channel(tools_present, claim):
+    from tests.test_durable_checkpoint import BatchProvider
+    context, coordinator = MockContext(), MockCoordinator()
+    counts, sends, support_calls = [], [], []
+    class Provider(BatchProvider):
+        def get_stream_request_support(self, *, model, request_options=None):
+            support_calls.append((model, copy.deepcopy(request_options)))
+            if claim == "changed" and counts:
+                return {"v": 1, "tools": "different"}
+            if claim in {"canonical", "changed"}:
+                return {"v": 1, "tools": "chat_request"}
+            return {"v": True, "tools": "chat_request"} if claim == "malformed" else None
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            counts.append((request, copy.deepcopy(request_options)))
+            assert "tools" not in request_options
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+                    "context_token_budget": 10000}
+        async def stream(self, request, **kwargs):
+            sends.append((request, kwargs))
+            assert request is counts[-1][0]
+            if claim == "canonical":
+                assert kwargs == counts[-1][1] == {}
+            else:
+                assert kwargs == {"tools": list(tools.values())}
+            yield {"content": "done"}
+    provider = Provider(count=0)
+    tools = {"image": ImageTool()} if tools_present else {}
+    operation = StreamingOrchestrator({}).execute(
+        "work", context, {"main": provider}, tools, ScriptedHooks({}), coordinator)
+    if claim == "changed":
+        with pytest.raises(RuntimeError, match="contract changed"):
+            await operation
+        assert not sends
+    else:
+        assert await operation == "done"
+        assert bool(sends[0][0].tools) is tools_present
+    assert len(support_calls) >= 2

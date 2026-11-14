@@ -163,6 +163,14 @@ Measured `count_view` and accepted `fit_output` envelopes include a detached
 returned final envelope's options drive dispatch; legacy contexts that omit
 the additive field retain their existing calling contract. Context must not
 infer or merge options from a provider's ambient state to validate a witness.
+An actual provider may expose synchronous
+`get_stream_request_support(*, model, request_options=None)` returning exactly
+`{"v": 1, "tools": "chat_request"}`. Only that qualified route consumes
+`ChatRequest.tools` as the sole schema channel and omits the legacy duplicate
+runtime `tools=` argument. The loop freezes this choice before fitting and
+rechecks it before dispatch; a changed claim refuses locally. Missing or
+malformed support preserves legacy streaming behavior. Runtime tool objects
+are never put into count options or serialized continuations.
 Goal utilities are text-only and show explicit unavailable image evidence.
 Approved nested `model.complete` likewise freezes no-pixels placeholders before
 the selected adapter's budget/send and validates ref identity when available;

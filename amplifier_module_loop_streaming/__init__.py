@@ -60,6 +60,16 @@ class _MeasuredOutputFitCancelled(BaseException):
     """Unwind Context's staged fit into Loop's cooperative cancellation path."""
 
 
+def _canonical_stream_tools(provider, model, request_options):
+    support = getattr(provider, "get_stream_request_support", None)
+    if not callable(support):
+        return False
+    value = support(model=model, request_options=deepcopy(request_options))
+    return (isinstance(value, dict) and set(value) == {"v", "tools"}
+            and type(value["v"]) is int and value["v"] == 1
+            and value["tools"] == "chat_request")
+
+
 def _build_tool_spec(tool: Any) -> ToolSpec:
     """Build a `ToolSpec` for one mounted tool, preserving model-native form.
 
@@ -4910,6 +4920,7 @@ class StreamingOrchestrator:
                 if stream_provider != prepared["stream"]:
                     raise ValueError("Prepared request transport changed")
                 request_options = prepared["request_options"]
+                canonical_stream_tools = prepared.get("canonical_stream_tools", False)
                 dispatch_base_messages = prepared["dispatch_base_messages"]
                 retained_contents = prepared["retained_contents"]
                 replay_turn_start_block = prepared["replay_turn_start_block"]
@@ -5308,6 +5319,8 @@ class StreamingOrchestrator:
                     if self.extended_thinking and not stream_provider
                     else {}
                 )
+                canonical_stream_tools = stream_provider and _canonical_stream_tools(
+                    provider, self._provider_default_model(provider), request_options)
                 measured_transaction = None
                 measured_stream_count = None
                 if measured_compaction_capable:
@@ -5567,6 +5580,7 @@ class StreamingOrchestrator:
                     "request": request.model_dump(mode="json"),
                     "overflow_retried": retried,
                     "request_options": request_options,
+                    "canonical_stream_tools": canonical_stream_tools,
                     "dispatch_base_messages": dispatch_base_messages,
                     "retained_contents": retained_contents,
                     "replay_turn_start_block": replay_turn_start_block,
@@ -5600,6 +5614,8 @@ class StreamingOrchestrator:
                         hooks,
                         coordinator,
                         provider_name=provider_name,
+                        canonical_stream_tools=canonical_stream_tools,
+                        request_options=request_options,
                         recover_overflow=partial(
                             recover_context_overflow,
                             chat_request,
@@ -5629,6 +5645,8 @@ class StreamingOrchestrator:
                         hooks,
                         coordinator,
                         provider_name=provider_name,
+                        canonical_stream_tools=canonical_stream_tools,
+                        request_options=request_options,
                         on_stream_error=record_unavailable_stream_usage,
                     )
                 async for chunk in response_stream:
@@ -6611,6 +6629,8 @@ class StreamingOrchestrator:
         recover_overflow=None,
         on_unconfirmed_stream=None,
         before_retry=None,
+        canonical_stream_tools=False,
+        request_options=None,
     ) -> AsyncIterator[str]:
         """Forward a stream, retrying exactly once before its first SDK chunk."""
         while True:
@@ -6628,6 +6648,8 @@ class StreamingOrchestrator:
                 hooks,
                 coordinator,
                 provider_name=provider_name,
+                canonical_stream_tools=canonical_stream_tools,
+                request_options=request_options,
                 on_provider_chunk=mark_provider_chunk,
                 on_stream_error=on_unconfirmed_stream,
             )
@@ -6663,6 +6685,8 @@ class StreamingOrchestrator:
         provider_name=None,
         on_provider_chunk=None,
         on_stream_error=None,
+        canonical_stream_tools=False,
+        request_options=None,
     ) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming.
 
@@ -6683,7 +6707,14 @@ class StreamingOrchestrator:
         # Convert tools dict to list for provider
         tools_list = list(tools.values()) if tools else []
         try:
-            stream_iter = provider.stream(chat_request, tools=tools_list)
+            if _canonical_stream_tools(
+                provider, chat_request.model or self._provider_default_model(provider),
+                request_options or {},
+            ) != canonical_stream_tools:
+                raise RuntimeError("Stream tool-input contract changed after fitting; replan required")
+            stream_iter = (provider.stream(chat_request, **(request_options or {}))
+                           if canonical_stream_tools
+                           else provider.stream(chat_request, tools=tools_list))
         except ContextLengthError:
             if on_stream_error is not None:
                 on_stream_error()
