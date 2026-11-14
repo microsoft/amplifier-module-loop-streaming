@@ -540,6 +540,71 @@ async def test_public_positive_exact_abandonment_after_private_count(
         assert base64.b64encode(tool.raw).decode() not in json.dumps(await context.get_messages())
 
 
+@pytest.mark.parametrize("outcome", ["revoke", "hold", "cancel"])
+async def test_public_positive_nested_count_refusal_exact_cleanup(tmp_path, outcome):
+    from amplifier_core import ToolResult
+    from amplifier_module_loop_streaming.suspension import NestedExecutionHeld
+    owned = {}
+
+    async def setup(host, loop, context, cap):
+        owner = Owner(tmp_path / "nested-continuation.json", context)
+        host.register_capability("execution.suspension", owner)
+        sink = host.get_capability("profile.offline_transport")
+        provider = host.get("providers", "main")
+
+        async def after_count(canonical, options):
+            owned["witness"] = provider.media_budget_witness(canonical, request_options=options)
+            if outcome == "revoke":
+                loop.approved_dispatch.validate_context = lambda coordinator: False
+            elif outcome == "hold":
+                owner.hold = True
+            else:
+                host.cancellation.request_immediate()
+
+        sink.after_count = after_count
+
+        class Client:
+            name, description, input_schema = "tool_exec", "nested cleanup fixture", {"type": "object"}
+
+            async def execute(self, arguments):
+                lease = host.get_capability("tools.dispatch").bind()
+                try:
+                    complete = host.get_capability("model.complete")
+                    expected = NestedExecutionHeld if outcome == "hold" else RuntimeError
+                    with pytest.raises(expected):
+                        await complete(ChatRequest(messages=[Message(role="user", content=[
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                       "data": "aW1hZ2U="}},
+                        ])]))
+                    owned["refused"] = True
+                finally:
+                    lease.close()
+                    if outcome == "revoke":
+                        loop.approved_dispatch.validate_context = None
+                return ToolResult(success=True, output={"refused": True})
+
+        await host.mount("tools", Client(), name="tool_exec")
+
+    async with profile(tmp_path, setup=setup) as state:
+        _, coordinator, loop, context, tool, store, cap, bridge, graph, calls, staged = state
+        sink = coordinator.get_capability("profile.offline_transport")
+        with loop.approved_dispatch.run_scope(coordinator):
+            await loop._execute_tool_only(
+                ToolCall(id="nested-count-parent", name="tool_exec", arguments={}),
+                coordinator.get("tools"), coordinator.hooks, "group", coordinator)
+        assert owned["refused"] and owned["witness"]["validated"] is True
+        assert len(sink.counted) == 1 and not sink.sent
+        assert not private_image_blocks(sink.counted_views[0])
+        assert "no pixels supplied" in json.dumps(sink.counted_views[0])
+        canonical, options = sink.canonical_counts[0]
+        assert options == {"extended_thinking": False, "model": "fixture"}
+        assert sink.releases == [(canonical, options, True)]
+        assert sink.releases[0][0] is canonical
+        assert sink.counted[0].messages == []
+        assert coordinator.get("providers", "main").release_media_request(
+            canonical, request_options=options) is False
+
+
 @pytest.mark.parametrize("mime", ["image/png", "image/jpeg"])
 async def test_public_positive_full_goal_evaluator_stall_judge_and_summary(tmp_path, mime):
     config = {"goal_provider_preferences": [{"provider": "main", "model": "fixture"}]}

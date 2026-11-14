@@ -24,6 +24,7 @@ class OfflineTransport:
         self.image_call = True
         self.canonical_counts, self.releases = [], []
         self.live_count_options = []
+        self.after_count = None
 
     def get_info(self):
         return SimpleNamespace(
@@ -83,7 +84,10 @@ async def mount(coordinator, config):
     async def count(canonical, *, context_estimate, request_options=None):
         sink.canonical_counts.append((canonical, copy.deepcopy(request_options)))
         sink.live_count_options.append(request_options)
-        return await budget(canonical, context_estimate=context_estimate, request_options=request_options)
+        decision = await budget(canonical, context_estimate=context_estimate, request_options=request_options)
+        if sink.after_count is not None:
+            await sink.after_count(canonical, request_options)
+        return decision
 
     provider.request_budget = count
     await coordinator.mount("providers", provider, name=sink.name)

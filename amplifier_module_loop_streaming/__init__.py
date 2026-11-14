@@ -3883,7 +3883,7 @@ class StreamingOrchestrator:
             finally:
                 try:
                     lifetime.close()
-                except Exception:
+                except BaseException:
                     if not failed:
                         raise
                     # Do not replace the original refusal/cancellation or log

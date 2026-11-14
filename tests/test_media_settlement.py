@@ -756,6 +756,29 @@ async def test_fresh_count_lifetime_releases_exact_original_options(streaming, o
         assert provider.iterator_closed
 
 
+@pytest.mark.parametrize("case", ["suspended", "cleanup-cancel", "success-cleanup-error"])
+async def test_root_cleanup_preserves_primary_baseexception_identity(case):
+    from tests.test_ephemeral_cache_persist_mode import RequestCapturingProvider
+    coordinator, _, _ = setup()
+    primary = ExecutionSuspended({"fixture": True}) if case == "suspended" else RuntimeError("primary")
+    cleanup = asyncio.CancelledError() if case == "cleanup-cancel" else ValueError("cleanup-private")
+
+    class Provider(RequestCapturingProvider):
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            if case != "success-cleanup-error":
+                raise primary
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 100,
+                    "context_token_budget": 0}
+
+        def release_media_request(self, request, *, request_options=None):
+            raise cleanup
+
+    with pytest.raises(BaseException) as caught:
+        await StreamingOrchestrator({}).execute(
+            "text", MockContext(), {"main": Provider()}, {}, ScriptedHooks({}), coordinator)
+    assert caught.value is (cleanup if case == "success-cleanup-error" else primary)
+
+
 @pytest.mark.parametrize("exit_kind", ["task-cancel", "consumer-close"])
 async def test_active_stream_settles_before_exact_request_cleanup(exit_kind):
     from tests.test_ephemeral_cache_persist_mode import RequestCapturingProvider
@@ -986,6 +1009,111 @@ async def test_nested_inference_is_text_only_before_selected_adapter_count_and_s
     assert request.model_dump_json() == before
     assert len(requests) == (0 if case == "forged" else 1)
     assert bool(validations) is (case != "inline")
+
+
+@pytest.mark.parametrize("case", ["suspended", "cleanup-cancel", "success-cleanup-error"])
+async def test_nested_cleanup_preserves_primary_baseexception_identity(environment, case):
+    from tests.test_approved_dispatch import Client
+    from amplifier_core.message_models import ChatResponse, TextBlock
+    _, coordinator, _, _ = environment
+    primary = ExecutionSuspended({"fixture": True}) if case == "suspended" else RuntimeError("primary")
+    cleanup = asyncio.CancelledError() if case == "cleanup-cancel" else ValueError("cleanup-private")
+    observed = []
+
+    class Provider:
+        name = "fixture"
+
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            if case != "success-cleanup-error":
+                raise primary
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 100}
+
+        def release_media_request(self, request, *, request_options=None):
+            raise cleanup
+
+        async def complete(self, request, **kwargs):
+            return ChatResponse(content=[TextBlock(text="ok")])
+
+    await coordinator.mount("providers", Provider(), name="fixture")
+
+    async def handler(lease):
+        try:
+            await coordinator.get_capability("model.complete")(
+                ChatRequest(messages=[Message(role="user", content="text")]))
+        except BaseException as error:
+            observed.append(error)
+        return {"done": True}
+
+    await call_client(environment, Client(coordinator, handler))
+    assert len(observed) == 1
+    assert observed[0] is (cleanup if case == "success-cleanup-error" else primary)
+
+
+@pytest.mark.parametrize("outcome", ["revoke", "hold", "cancel"])
+async def test_public_nested_count_refusal_releases_its_exact_owned_request(environment, outcome):
+    from tests.test_approved_dispatch import Client
+    from amplifier_module_loop_streaming.suspension import NestedExecutionHeld
+    _, coordinator, loop, _ = environment
+    observed = {}
+    hold = SimpleNamespace(requested=lambda: False)
+    coordinator.register_capability("execution.suspension", hold)
+
+    class Provider:
+        name = "fixture"
+        pending = None
+        sends = 0
+        released = False
+
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+
+        async def request_budget(self, request, *, context_estimate, request_options=None):
+            self.pending = (request, copy.deepcopy(request_options))
+            await asyncio.sleep(0)
+            if outcome == "revoke":
+                loop.approved_dispatch.validate_context = lambda coordinator: False
+            elif outcome == "hold":
+                hold.requested = lambda: True
+            else:
+                coordinator.cancellation.request_immediate()
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 100}
+
+        def release_media_request(self, request, *, request_options=None):
+            assert self.pending[0] is request and self.pending[1] == request_options
+            assert request_options == {"extended_thinking": False, "model": "fixture"}
+            self.pending = None
+            self.released = True
+            return True
+
+        async def complete(self, request, **kwargs):
+            self.sends += 1
+            pytest.fail("Revoked/held/cancelled nested request must not send")
+
+    provider = Provider()
+    await coordinator.mount("providers", provider, name="fixture")
+
+    async def handler(lease):
+        # Capture the actual public model.complete route, under the actual
+        # dispatch lease created by the standard tool path.
+        complete = coordinator.get_capability("model.complete")
+        expected = NestedExecutionHeld if outcome == "hold" else RuntimeError
+        try:
+            with pytest.raises(expected):
+                await complete(ChatRequest(messages=[Message(role="user", content="warning only")]))
+            observed["settled"] = True
+            assert provider.pending is None and provider.released
+        finally:
+            # Restore only fixture activation/cancellation for normal outer
+            # tool settlement; never retry the refused nested operation.
+            if outcome == "revoke":
+                loop.approved_dispatch.validate_context = None
+        return {"refused": True}
+
+    await call_client(environment, Client(coordinator, handler))
+    assert observed == {"settled": True} and provider.sends == 0 and provider.pending is None
 
 
 @pytest.mark.parametrize("outcome", [
