@@ -4130,7 +4130,7 @@ class StreamingOrchestrator:
             then must fail locally rather than turn an unknown result into a
             fit and send an unchecked request.
             """
-            if stream_provider and request.tool_choice != "none" and _canonical_stream_tools(
+            if request.tool_choice != "none" and stream_provider and _canonical_stream_tools(
                 provider, _effective_request_model(
                     provider, request, request_options, self._provider_default_model),
                 request_options or {},
@@ -4252,7 +4252,7 @@ class StreamingOrchestrator:
             progression.  Retaining the old envelope validation here keeps a
             malformed advertised provider budget fail-closed.
             """
-            if stream_provider and request.tool_choice != "none" and _canonical_stream_tools(
+            if request.tool_choice != "none" and stream_provider and _canonical_stream_tools(
                 provider, _effective_request_model(
                     provider, request, request_options, self._provider_default_model),
                 request_options or {},
