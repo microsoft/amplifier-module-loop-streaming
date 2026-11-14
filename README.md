@@ -184,7 +184,13 @@ restored canonical object and saved options. Adapter-private associations
 cannot be serialized or reused by object identity across suspension. This
 revalidation does not replay hooks, tools, context assembly or compaction; an
 unavailable count, oversized request or newly reduced output allowance refuses
-locally rather than altering the saved fitted request.
+locally rather than altering the saved fitted request. For requests without an
+explicit output cap, the comparison uses the effective allowance saved from the
+original count; an unchanged or larger allowance does not require a refit.
+When available, synchronous `release_media_request(request, *,
+request_options=None)` abandons only Loop's exact counted object and its original
+options on suspension, cancellation or local refusal. It never closes a shared
+provider or guesses ownership of Context-created preliminary requests.
 
 **Activation holds:** this candidate requires exact accepted media-store,
 checkpoint, provider-adapter, and nested-origin integration qualification.

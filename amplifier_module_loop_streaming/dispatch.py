@@ -467,10 +467,13 @@ class ApprovedDispatch:
         Provider-owned usage/cost hooks remain active, with streaming disabled.
         """
         from amplifier_core.message_models import ChatRequest
+        from . import _MediaRequestLifetime
 
         lease = self.bind()
         scope = lease.scope
         coordinator = scope.run.coordinator
+        lifetime = _MediaRequestLifetime()
+        failed = False
         try:
             if not isinstance(request, ChatRequest) or request.tools:
                 raise ValueError("Nested inference requires a tool-free ChatRequest")
@@ -542,6 +545,7 @@ class ApprovedDispatch:
                     }
                     if "request_options" in inspect.signature(budget).parameters:
                         kwargs["request_options"] = options
+                    lifetime.track(provider, request, kwargs.get("request_options"))
                     measured = budget(request, **kwargs)
                     if inspect.isawaitable(measured):
                         measured = await measured
@@ -586,8 +590,10 @@ class ApprovedDispatch:
                 )
                 return response
         except asyncio.CancelledError:
+            failed = True
             raise
         except Exception as exc:
+            failed = True
             await scope.hooks.emit(
                 "provider:error",
                 {
@@ -600,8 +606,21 @@ class ApprovedDispatch:
                 },
             )
             raise
+        except BaseException:
+            failed = True
+            raise
         finally:
-            lease.close()
+            try:
+                # The provider task above has settled before this exact owner
+                # releases its count association. No shared provider close.
+                lifetime.close()
+            except BaseException:
+                if not failed:
+                    raise
+                logging.getLogger(__name__).warning(
+                    "Exact nested media request cleanup failed during execution exit")
+            finally:
+                lease.close()
 
     def wrap_tools(self, tools, observed_name=None, observation=None, authority=None):
         wrapped = {}

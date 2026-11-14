@@ -56,6 +56,32 @@ from .suspension import (ExecutionSuspended, ToolExecutionSuspended, NestedExecu
 logger = logging.getLogger(__name__)
 
 
+class _MediaRequestLifetime:
+    """Own only Loop-created count associations, never Context's candidates."""
+
+    def __init__(self):
+        self.current = None
+
+    def track(self, provider, request, options):
+        release = getattr(provider, "release_media_request", None)
+        if not callable(release):
+            return
+        frozen = deepcopy(options)
+        if self.current is not None:
+            old_provider, old_request, old_options = self.current
+            if old_provider is provider and old_request is request and old_options == frozen:
+                return
+            self.close()
+        # Register before the awaited count, including its refusal/cancel paths.
+        self.current = (provider, request, frozen)
+
+    def close(self):
+        if self.current is not None:
+            provider, request, options = self.current
+            provider.release_media_request(request, request_options=options)
+            self.current = None
+
+
 class _MeasuredOutputFitCancelled(BaseException):
     """Unwind Context's staged fit into Loop's cooperative cancellation path."""
 
@@ -3835,6 +3861,36 @@ class StreamingOrchestrator:
         return True
 
     async def _execute_stream(
+        self, prompt, context, providers, tools, hooks, coordinator=None, *,
+        continuation=None,
+    ) -> AsyncIterator[tuple[str, int]]:
+        """Bound private count candidates to this exact execution lifetime."""
+        lifetime = _MediaRequestLifetime()
+        stream = self._execute_stream_scoped(
+            prompt, context, providers, tools, hooks, coordinator,
+            continuation=continuation, media_lifetime=lifetime,
+        )
+        failed = False
+        try:
+            async for item in stream:
+                yield item
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                await stream.aclose()
+            finally:
+                try:
+                    lifetime.close()
+                except BaseException:
+                    if not failed:
+                        raise
+                    # Do not replace the original refusal/cancellation or log
+                    # provider exceptions that may contain private request data.
+                    logger.warning("Exact media request cleanup failed during execution exit")
+
+    async def _execute_stream_scoped(
         self,
         prompt: str,
         context,
@@ -3842,7 +3898,7 @@ class StreamingOrchestrator:
         tools: dict[str, Any],
         hooks: HookRegistry,
         coordinator: ModuleCoordinator | None = None,
-        *, continuation: dict[str, Any] | None = None,
+        *, continuation: dict[str, Any] | None = None, media_lifetime,
     ) -> AsyncIterator[tuple[str, int]]:
         """
         Internal streaming execution.
@@ -4170,6 +4226,7 @@ class StreamingOrchestrator:
             budget_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
             if accepts_named_request_options(request_budget):
                 budget_kwargs["request_options"] = request_options
+            media_lifetime.track(provider, request, budget_kwargs.get("request_options"))
             decision = request_budget(request, **budget_kwargs)
             if inspect.isawaitable(decision):
                 decision = await decision
@@ -4270,6 +4327,7 @@ class StreamingOrchestrator:
                 kwargs["error"] = refit_error
             if accepts_named_request_options(request_budget):
                 kwargs["request_options"] = request_options
+            media_lifetime.track(provider, request, kwargs.get("request_options"))
             decision = request_budget(request, **kwargs)
             if inspect.isawaitable(decision):
                 decision = await decision
@@ -4365,7 +4423,7 @@ class StreamingOrchestrator:
                 decision, require_hard_fit=True
             )
 
-        async def revalidate_prepared_media_budget(request, request_options):
+        async def revalidate_prepared_media_budget(request, request_options, original_output_cap):
             """Rebind a restored canonical object to a fresh private count.
 
             A continuation can save refs/options, never a process-local adapter
@@ -4387,8 +4445,12 @@ class StreamingOrchestrator:
             if count is None:
                 raise RuntimeError("Prepared media request requires a fresh provider count")
             output_cap = decision.get("max_output_tokens")
+            # None on the canonical request means provider default, not an
+            # unknown allowance when the original count saved that default.
+            effective_cap = (request.max_output_tokens if request.max_output_tokens is not None
+                             else original_output_cap)
             if output_cap is not None and (
-                request.max_output_tokens is None or request.max_output_tokens > output_cap
+                effective_cap is None or effective_cap > output_cap
             ):
                 raise ContextLengthError("Prepared media request output cap changed; refit required")
             return count
@@ -4989,7 +5051,8 @@ class StreamingOrchestrator:
                 original_output_cap = prepared["original_output_cap"]
                 measured_stream_count = prepared["measured_stream_count"]
                 overflow_retried = prepared.get("overflow_retried", False)
-                restored_count = await revalidate_prepared_media_budget(chat_request, request_options)
+                restored_count = await revalidate_prepared_media_budget(
+                    chat_request, request_options, original_output_cap)
                 if coordinator and coordinator.cancellation.is_cancelled:
                     await exit_for_cancellation()
                     return
@@ -5459,6 +5522,8 @@ class StreamingOrchestrator:
                     budget_decision = measured_result.get("final_attempt", {}).get(
                         "budget_decision"
                     )
+                    if isinstance(budget_decision, dict):
+                        original_output_cap = budget_decision.get("max_output_tokens")
                     if measured_stream_count is not None and isinstance(budget_decision, dict):
                         measurement = budget_decision["measurement"]
                         estimated = budget_decision["estimated_input_tokens"]
@@ -5715,15 +5780,19 @@ class StreamingOrchestrator:
                         request_options=request_options,
                         on_stream_error=record_unavailable_stream_usage,
                     )
-                async for chunk in response_stream:
-                    # Check for immediate cancellation between chunks
-                    if coordinator and coordinator.cancellation.is_immediate:
-                        # Clear pending steers: immediate cancellation ends the turn,
-                        # and any steer queued during streaming must not leak into a
-                        # future turn — matching the other cancellation exits. (spec §5.2)
-                        self._steering_queue.clear()
-                        return
-                    yield (chunk, iteration)
+                try:
+                    async for chunk in response_stream:
+                        # Check for immediate cancellation between chunks
+                        if coordinator and coordinator.cancellation.is_immediate:
+                            # Steers cannot outlive this cancelled turn.
+                            self._steering_queue.clear()
+                            return
+                        yield (chunk, iteration)
+                finally:
+                    # Settle the owned iterator before abandoning a count
+                    # association; the provider may still have an active send.
+                    await self._close_async_iterator(
+                        response_stream, description="provider response stream")
 
                 # Update rate limit timestamp after streaming completes
                 self._last_provider_call_end = time.monotonic()
@@ -6227,7 +6296,8 @@ class StreamingOrchestrator:
                     original_output_cap = final_prepared["original_output_cap"]
                     final_overflow_retried = final_prepared["overflow_retried"]
                     final_measured_transaction = None
-                    await revalidate_prepared_media_budget(max_iter_chat_request, request_options)
+                    await revalidate_prepared_media_budget(
+                        max_iter_chat_request, request_options, original_output_cap)
                     if coordinator and coordinator.cancellation.is_cancelled:
                         await exit_for_cancellation()
                         return
@@ -6309,6 +6379,8 @@ class StreamingOrchestrator:
                         budget_decision = measured_result.get("final_attempt", {}).get(
                             "budget_decision"
                         )
+                        if isinstance(budget_decision, dict):
+                            original_output_cap = budget_decision.get("max_output_tokens")
                         if (
                             measured_final_count(measured_result) is not None
                             and isinstance(budget_decision, dict)
