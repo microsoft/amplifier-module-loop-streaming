@@ -786,6 +786,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_capability("session.steer", orchestrator.steer)
     coordinator.register_capability("tools.dispatch", orchestrator.approved_dispatch)
     coordinator.register_capability("model.complete", orchestrator.approved_dispatch.complete)
+    coordinator.register_capability("tools.dispatch.media_refs", orchestrator.approved_dispatch.media_refs)
     # Conversation-scope provider pin (see ConversationProviderPin). Registered
     # as a capability, NOT read from config, so an app can detect its absence
     # (`get_capability` -> None) under a different orchestrator and refuse

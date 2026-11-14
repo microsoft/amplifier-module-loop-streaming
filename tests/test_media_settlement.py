@@ -630,3 +630,74 @@ async def test_real_nested_dispatch_never_parses_or_resurrects_effective_result(
     result, _ = await call_client(environment)
     assert result["status"] == "unknown" and result["success"] is None
     assert result["output"] == (None if case in {"null", "missing"} else quoted if case == "string" else [quoted])
+
+
+@pytest.mark.parametrize("outcome", ["success", "failed", "unknown", "string", "redacted", "revoked"])
+async def test_nested_verifier_binds_only_returned_effective_refs_to_active_parent(environment, outcome):
+    from tests.test_approved_dispatch import Client
+    from amplifier_module_loop_streaming import mount
+    _, coordinator, loop, _ = environment
+    # Publish this exact loop's verifier as mount does, without replacing its
+    # configured dispatcher or execution owner.
+    coordinator.register_capability("tools.dispatch.media_refs", loop.approved_dispatch.media_refs)
+    sid = str(coordinator.session_id)
+    actual_refs, origins, checks = [], [], []
+    class NestedMedia(Media):
+        async def ingest(self, value, *, source_format, origin, policy):
+            if value.content:
+                reference = ref(origin["id"])
+                reference["session_id"] = reference["provenance"]["session_id"] = sid
+                actual_refs.append(reference)
+                self.staged[origin["id"]] = [reference]
+                return {"value": ToolResult(success=outcome != "failed", output={
+                    "caption": "image", NAMESPACE: {"refs": [reference]},
+                }), "staged_refs": [reference]}
+            output = value.output
+            if isinstance(output, dict) and NAMESPACE in output:
+                refs = output[NAMESPACE]["refs"]
+                assert all(loop.approved_dispatch.media_refs(origin, r) for r in refs)
+                origins.append(origin)
+            return {"value": value, "staged_refs": []}
+
+        async def publish(self, refs, *, origin, disposition):
+            if disposition == "retain" and origin["id"] == "parent":
+                assert all(loop.approved_dispatch.media_refs(origin, r) for r in refs)
+            self.publications.append((copy.deepcopy(refs), origin, disposition))
+            return {"refs": refs, "publication": {"state": "published", "durability": "assets-only"}}
+    media = NestedMedia()
+    coordinator.register_capability(NAMESPACE, media)
+    coordinator.register_capability("session.media.tool_post", fixture_boundary)
+    await coordinator.mount("tools", ImageTool(), name="read")
+    async def post(event, data):
+        if data["tool_name"] == "read" and outcome in {"unknown", "string", "redacted"}:
+            data = dict(data)
+            if outcome == "unknown":
+                data["result"] = {"output": data["result"]["output"]}
+            elif outcome == "string":
+                data["result"] = json.dumps(data["result"])
+            else:
+                data["result"] = None
+            return HookResult(action="modify", data=data)
+        return HookResult()
+    coordinator.hooks.register("tool:post", post)
+    async def handler(lease):
+        result = await lease.call("read", {})
+        origin = {"kind": "tool", "session_id": sid, "id": "parent"}
+        if outcome == "revoked":
+            loop.config["programmatic_allowed_tools"] = []
+        checks.append(loop.approved_dispatch.media_refs(origin, actual_refs[0]))
+        forged = copy.deepcopy(actual_refs[0])
+        forged["width"] += 1
+        assert not loop.approved_dispatch.media_refs(origin, forged)
+        assert not loop.approved_dispatch.media_refs({**origin, "id": "other"}, actual_refs[0])
+        if outcome == "success":
+            return result["output"]
+        return {"status": result["status"]}
+    _, client = await call_client(environment, Client(coordinator, handler))
+    assert checks == [outcome == "success"]
+    if outcome == "success":
+        assert origins[-1]["id"] == "parent"
+        assert media.publications[-1][1]["id"] == "parent"
+    assert not loop.approved_dispatch.media_refs(
+        {"kind": "tool", "session_id": sid, "id": "parent"}, actual_refs[0])
+    assert client.lease.scope.media_refs == []

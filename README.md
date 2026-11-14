@@ -121,6 +121,16 @@ survives ordered append, completed cancellation siblings, and settled-tool
 continuations. Historical triple reads remain supported, but new extensions
 must persist `model_dump()`, not `list(result)`, to avoid discarding metadata.
 
+The dispatcher exposes `tools.dispatch.media_refs(parent_origin, ref) -> bool`
+for a host's injected nested-origin verifier. It recognizes only exact detached
+refs from completed, successful effective structured inner outputs actually
+returned through the active parent's lease. It rechecks current parent
+session/run/call authority and tool allowlist, refuses forged/stale/failed/
+unknown/redacted/text-only results, and clears its call-local evidence when
+that parent finishes. It neither rewrites inner provenance/expiry nor grants
+cross-session access. Programmatic runners separately own confirmation that
+their consumer received the result before selecting refs for outer output.
+
 `media.checkpoint_settled_results(coordinator, *, has_media=False)` awaits the
 existing zero-argument host checkpoint. Media-bearing settled appends require
 that capability. Its return is **not** interpreted as a media commit receipt:

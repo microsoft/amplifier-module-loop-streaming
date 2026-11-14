@@ -6,10 +6,11 @@ unchecked tool execution path.
 """
 
 import asyncio
+import json
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
@@ -38,6 +39,7 @@ class CallScope:
     hooks: object
     parallel_group_id: str | None
     active: bool = True
+    media_refs: list = field(default_factory=list)
 
 
 class GuardedTool:
@@ -262,6 +264,15 @@ class DispatchLease:
                 output = post.get("output")
             elif post is None and not observation.get("post_seen"):
                 output = settled.content
+        if status == "completed" and success is True and isinstance(output, dict):
+            media = output.get("experimental.media.v1")
+            if isinstance(media, dict) and set(media) == {"refs"} and isinstance(media["refs"], list):
+                # Save only what this active lease actually returns, detached
+                # from mutable caller data. Tool-exec separately owns receiver
+                # delivery acknowledgment before its outer aggregation.
+                for ref in media["refs"]:
+                    frozen = json.dumps(ref, sort_keys=True, allow_nan=False)
+                    self.scope.media_refs.append((name, frozen))
         return {
             "status": status,
             "success": success,
@@ -381,6 +392,7 @@ class ApprovedDispatch:
         finally:
             if scope:
                 scope.active = False
+                scope.media_refs.clear()
             _CALL.reset(token)
 
     def bind(self):
@@ -398,6 +410,33 @@ class ApprovedDispatch:
         lease = DispatchLease(self, scope)
         lease._valid()
         return lease
+
+    def media_refs(self, parent_origin, ref):
+        """Host-injected nested verifier; possession is never authority.
+
+        Valid only while the real parent call is active, including its ingest
+        and publication. No global registry, provenance rewrite or TTL renewal.
+        """
+        try:
+            lease = self.bind()
+            try:
+                scope = lease.scope
+                if parent_origin != {
+                    "kind": "tool", "session_id": str(scope.run.coordinator.session_id),
+                    "id": scope.call.id,
+                }:
+                    return False
+                frozen = json.dumps(ref, sort_keys=True, allow_nan=False)
+                allowed = self.allowed_tools(scope.call.name)
+                return any(
+                    candidate == frozen and name in lease.tools
+                    and (allowed is None or name in allowed)
+                    for name, candidate in scope.media_refs
+                )
+            finally:
+                lease.close()
+        except (RuntimeError, ValueError, TypeError):
+            return False
 
     async def complete(self, request):
         """A bounded, attributed ordinary inference call for an active caller.
