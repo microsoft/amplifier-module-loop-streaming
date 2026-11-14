@@ -116,6 +116,10 @@ bridge is installed. A valid `complete=False` receipt supplies processed
 non-media hook semantics, not an authoritative media/result replacement;
 useful text survives while refs are stripped and staging dropped. Readiness
 is reported only after an actual complete witnessed media chain.
+When Core's special injection/approval aggregate omits final data, an
+unwitnessed media-installed path cannot safely restore earlier text: it uses
+null rather than resurrect a possible prior redaction. A qualified boundary
+is required to preserve both useful text and exact redaction in that case.
 
 `SettledToolResult` is exported for extensions such as loop-live. Its
 `model_dump()` is detached JSON with `version: 1`, `tool_call_id`, `tool_name`,
@@ -135,6 +139,11 @@ unknown/redacted/text-only results, and clears its call-local evidence when
 that parent finishes. It neither rewrites inner provenance/expiry nor grants
 cross-session access. Programmatic runners separately own confirmation that
 their consumer received the result before selecting refs for outer output.
+Draft cooperative route adapters may expose `enroll_attributed_route` on the
+host boundary. The dispatcher supplies exact current and parent hook/coordinator
+tokens, source and observation, plus `MEDIA_ROUTE_SOURCE`; its context manager
+spans nested execution through settlement and revokes on exit. This source
+descriptor is not proof of accepted code or permission to enable a graph.
 
 `media.checkpoint_settled_results(coordinator, *, has_media=False)` awaits the
 existing zero-argument host checkpoint. Media-bearing settled appends require

@@ -778,3 +778,69 @@ async def test_nested_inference_is_text_only_before_selected_adapter_count_and_s
     assert request.model_dump_json() == before
     assert len(requests) == (0 if case == "forged" else 1)
     assert bool(validations) is (case != "inline")
+
+
+@pytest.mark.parametrize("outcome", ["success", "denied", "cancelled", "registration-refusal"])
+async def test_proposed_nested_route_enrollment_is_exact_scoped_and_not_authority(environment, outcome):
+    from contextlib import contextmanager
+    from tests.test_approved_dispatch import Client
+    from amplifier_module_loop_streaming.dispatch import (
+        AttributedHooks, AttributedCoordinator, MEDIA_ROUTE_SOURCE,
+    )
+    _, coordinator, _, echo = environment
+    records, active = [], []
+    class Boundary:
+        async def __call__(self, *args, **kwargs):
+            pytest.fail("Text-only dispatch must not require media witness")
+        @contextmanager
+        def enroll_attributed_route(self, **descriptor):
+            records.append(descriptor)
+            assert isinstance(descriptor["hooks"], AttributedHooks)
+            assert isinstance(descriptor["coordinator"], AttributedCoordinator)
+            assert descriptor["parent_hooks"] is coordinator.hooks
+            assert descriptor["parent_coordinator"] is coordinator
+            assert descriptor["source_identity"] == MEDIA_ROUTE_SOURCE
+            assert descriptor["source_identity"] is not MEDIA_ROUTE_SOURCE
+            assert descriptor["source"]["session_id"] == str(coordinator.session_id)
+            assert descriptor["source"]["parent_tool_call_id"] == "parent"
+            assert descriptor["source"]["tool_name"] == "read"
+            if outcome == "registration-refusal":
+                raise RuntimeError("Source route is not enrolled by host")
+            active.append(True)
+            try:
+                yield
+            finally:
+                active.pop()
+    coordinator.register_capability("session.media.tool_post", Boundary())
+    async def observe(event, data):
+        if data["tool_name"] == "read":
+            assert active == [True]
+            assert data["dispatch_source"] == records[-1]["source"]
+            assert data["parent_tool_call_id"] == "parent"
+            if outcome == "denied":
+                return HookResult(action="deny", reason="no")
+        return HookResult()
+    coordinator.hooks.register("tool:pre", observe)
+    coordinator.hooks.register("tool:post", observe)
+    original = echo.execute
+    async def execute(arguments):
+        assert active == [True]
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+        return await original(arguments)
+    echo.execute = execute
+    async def handler(lease):
+        if outcome == "registration-refusal":
+            with pytest.raises(RuntimeError, match="not enrolled"):
+                await lease.call("read", {})
+            return {"refused": True}
+        return await lease.call("read", {})
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await call_client(environment, Client(coordinator, handler))
+    else:
+        result, _ = await call_client(environment, Client(coordinator, handler))
+        if outcome != "registration-refusal":
+            assert result["status"] == ("denied" if outcome == "denied" else "completed")
+    assert active == [] and len(records) == 1
+    assert echo.calls == (1 if outcome == "success" else 0)

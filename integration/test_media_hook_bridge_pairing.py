@@ -33,7 +33,9 @@ def bridge_module():
 
 
 @pytest.mark.parametrize("site", ["parallel", "sequential", "nested"])
-@pytest.mark.parametrize("kind", ["image", "success", "failed", "null", "hook-refs"])
+@pytest.mark.parametrize("kind", [
+    "image", "success", "failed", "null", "hook-refs", "null-inject", "image-null-inject",
+])
 async def test_safe_public_incomplete_bridge_never_promotes_or_reports_ready(tmp_path, site, kind):
     session = AmplifierSession({"session": {
         "orchestrator": {"module": "loop-streaming"}, "context": {"module": "context-simple"},
@@ -48,7 +50,7 @@ async def test_safe_public_incomplete_bridge_never_promotes_or_reports_ready(tmp
     post_calls = []
     async def observe(event, data):
         post_calls.append(data)
-        if kind == "null":
+        if kind in {"null", "null-inject", "image-null-inject"}:
             return HookResult(action="modify", data={**data, "result": None})
         if kind == "hook-refs":
             return HookResult(action="modify", data={
@@ -58,13 +60,19 @@ async def test_safe_public_incomplete_bridge_never_promotes_or_reports_ready(tmp
             })
         return HookResult()
     bridge.hooks.register("tool:post", observe, name="fixture")
+    if kind.endswith("inject"):
+        async def inject(event, data):
+            assert data["result"] is None
+            return HookResult(action="inject_context", ephemeral=True,
+                              context_injection="preserve reminder")
+        bridge.hooks.register("tool:post", inject, name="injection", priority=20)
     # The rich fixture uses a base64 sentinel rather than real image bytes;
     # this negative check needs valid pixels to reach the actual bridge.
     from integration.test_media_store_pairing import Images
     from amplifier_core import ToolResult
     class Tool:
         async def execute(self, arguments):
-            if kind == "image":
+            if kind in {"image", "image-null-inject"}:
                 return await Images().execute(arguments)
             if kind == "failed":
                 return ToolResult(success=False, output="useful failure", error={"message": "failed"})
@@ -89,7 +97,7 @@ async def test_safe_public_incomplete_bridge_never_promotes_or_reports_ready(tmp
                 call, {"image": Tool()}, context, hooks, current_coordinator)
             assert not context._messages[0].get("metadata")
             content = context._messages[0]["content"]
-        if kind == "null":
+        if kind in {"null", "null-inject", "image-null-inject"}:
             assert content == "null"
         elif kind == "image":
             assert "preserved" in content and "Image unavailable" in content
@@ -101,7 +109,7 @@ async def test_safe_public_incomplete_bridge_never_promotes_or_reports_ready(tmp
         records = list(store.journal())
         # Staging journal can retain recovery entries; they are not accepted
         # reachability. The owning record is dropped and no asset is published.
-        assert bool(records) is (kind == "image")
+        assert bool(records) is (kind in {"image", "image-null-inject"})
         assert not any(record.get("state") in {"published", "committed"} for record in records)
     finally:
         store.close()

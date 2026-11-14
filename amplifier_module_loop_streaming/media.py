@@ -221,6 +221,15 @@ def effective_result(hook_result, current):
     return None if action == "modify" else current
 
 
+def unwitnessed_result(hook_result, current, *, media_installed):
+    if (media_installed and getattr(hook_result, "data", None) is None
+            and getattr(hook_result, "action", None) in {"inject_context", "ask_user"}):
+        # Core's special aggregate can hide an earlier explicit null/removal.
+        # No final-data witness means we cannot restore pre-hook text either.
+        return None
+    return effective_result(hook_result, current)
+
+
 def _refs(value):
     if not isinstance(value, Mapping):
         return []
@@ -312,14 +321,16 @@ async def post_result(hooks, coordinator, call, data, cap, staged):
                 # An incomplete witness is not a result replacement. Preserve
                 # ordinary processed text semantics without a second emit;
                 # settlement will strip refs/drop staging, never promote them.
-                return ToolPostResult(post, effective_result(post, data["result"]), False)
+                return ToolPostResult(post, unwitnessed_result(
+                    post, data["result"], media_installed=True), False)
             value = None if post.action == "deny" else receipt["result"]
             await report_consumer_ready(coordinator, post_complete=True)
             return ToolPostResult(post, value, True)
         post = await hooks.emit("tool:post", data)
         if coordinator:
             post = await coordinator.process_hook_result(post, "tool:post", call.name)
-        return ToolPostResult(post, effective_result(post, data["result"]), False)
+        return ToolPostResult(post, unwitnessed_result(
+            post, data["result"], media_installed=cap is not None), False)
     except BaseException as error:
         if cap is not None and staged:
             # Disposal failure leaves a host-owned staging orphan, never

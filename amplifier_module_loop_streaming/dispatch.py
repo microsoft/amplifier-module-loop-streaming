@@ -8,7 +8,7 @@ unchecked tool execution path.
 import asyncio
 import json
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from uuid import uuid4
@@ -19,6 +19,10 @@ from .suspension import NestedExecutionHeld, ResumingTool, ToolExecutionSuspende
 
 _RUN = ContextVar("approved_dispatch_run", default=None)
 _CALL = ContextVar("approved_dispatch_call", default=None)
+MEDIA_ROUTE_SOURCE = {
+    "component": "loop-streaming", "adapter": "attributed-v1", "contract": 1,
+    "module": "amplifier_module_loop_streaming.dispatch",
+}
 FORBIDDEN = frozenset({"tool_exec", "delegate", "task", "live_job"})
 
 
@@ -192,25 +196,38 @@ class DispatchLease:
         )
         hooks = AttributedHooks(self.scope.hooks, source, observation)
         coordinator = AttributedCoordinator(self.scope.run.coordinator, observation)
+        boundary = self.scope.run.coordinator.get_capability("session.media.tool_post")
+        enroll = getattr(boundary, "enroll_attributed_route", None)
         # Always take the existing ordinary engine path. In particular, never
         # call a mounted tool directly when hooks or authority are unavailable.
         try:
             with self.dispatcher.call_scope(
                 call, tools, hooks, self.scope.parallel_group_id
             ) as child_scope:
-                tools = self.dispatcher.wrap_tools(
-                    tools,
-                    observed_name=name,
-                    observation=observation,
-                    authority=lambda: still_authorized(child_scope),
-                )
-                settled = SettledToolResult.from_legacy(await self.dispatcher.owner._execute_tool_unscoped(
-                    call,
-                    tools,
-                    hooks,
-                    self.scope.parallel_group_id or self.scope.call.id,
-                    coordinator,
-                ))
+                # Proposed cooperative host route enrollment. This descriptor
+                # is not a source proof or activation grant. The host owns
+                # exact endpoint/source qualification and may refuse it.
+                route = enroll(
+                    hooks=hooks, coordinator=coordinator,
+                    parent_hooks=self.scope.hooks,
+                    parent_coordinator=self.scope.run.coordinator,
+                    source=dict(source), observation=observation,
+                    source_identity=dict(MEDIA_ROUTE_SOURCE),
+                ) if callable(enroll) else nullcontext()
+                with route:
+                    tools = self.dispatcher.wrap_tools(
+                        tools,
+                        observed_name=name,
+                        observation=observation,
+                        authority=lambda: still_authorized(child_scope),
+                    )
+                    settled = SettledToolResult.from_legacy(await self.dispatcher.owner._execute_tool_unscoped(
+                        call,
+                        tools,
+                        hooks,
+                        self.scope.parallel_group_id or self.scope.call.id,
+                        coordinator,
+                    ))
         except ToolExecutionSuspended as suspended:
             # The nested invocation is not the enclosing controller. Propagating
             # its "not_started" frame would replay a controller that may already
