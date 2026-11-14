@@ -18,6 +18,12 @@ def estimate_messages(messages: list[dict[str, Any]]) -> TextEstimate:
     tokens = 0
     has_images = False
     for message in messages:
+        metadata = message.get("metadata")
+        media = metadata.get("experimental.media.v1") if isinstance(metadata, dict) else None
+        if isinstance(media, dict) and media.get("refs"):
+            # Ref envelopes contain no pixels and cannot price them. The
+            # selected provider's private projection/count owns that cost.
+            has_images = True
         content = message.get("content")
         if isinstance(content, list):
             content, found = _content_without_image_payloads(content)

@@ -8,16 +8,21 @@ unchecked tool execution path.
 import asyncio
 import json
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
+from .media import SettledToolResult, effective_result, text_only_request
 from .suspension import NestedExecutionHeld, ResumingTool, ToolExecutionSuspended
 
 _RUN = ContextVar("approved_dispatch_run", default=None)
 _CALL = ContextVar("approved_dispatch_call", default=None)
+MEDIA_ROUTE_SOURCE = {
+    "component": "loop-streaming", "adapter": "attributed-v1", "contract": 1,
+    "module": "amplifier_module_loop_streaming.dispatch",
+}
 FORBIDDEN = frozenset({"tool_exec", "delegate", "task", "live_job"})
 
 
@@ -38,6 +43,7 @@ class CallScope:
     hooks: object
     parallel_group_id: str | None
     active: bool = True
+    media_refs: list = field(default_factory=list)
 
 
 class GuardedTool:
@@ -75,10 +81,7 @@ class AttributedHooks:
         result = await self.hooks.emit(event, enriched)
         if event == "tool:post":
             self.observation["post_seen"] = True
-            returned = result.data.get("result") if result and result.data else None
-            self.observation["post_result"] = (
-                returned if returned is not None else data.get("result")
-            )
+            self.observation["post_result"] = effective_result(result, enriched.get("result"))
         elif event == "tool:error":
             self.observation["engine_error"] = True
         return result
@@ -193,25 +196,39 @@ class DispatchLease:
         )
         hooks = AttributedHooks(self.scope.hooks, source, observation)
         coordinator = AttributedCoordinator(self.scope.run.coordinator, observation)
+        boundary = self.scope.run.coordinator.get_capability("session.media.tool_post")
+        enroll = getattr(boundary, "enroll_attributed_route", None)
         # Always take the existing ordinary engine path. In particular, never
         # call a mounted tool directly when hooks or authority are unavailable.
         try:
             with self.dispatcher.call_scope(
                 call, tools, hooks, self.scope.parallel_group_id
             ) as child_scope:
-                tools = self.dispatcher.wrap_tools(
-                    tools,
-                    observed_name=name,
-                    observation=observation,
-                    authority=lambda: still_authorized(child_scope),
-                )
-                _, _, content = await self.dispatcher.owner._execute_tool_unscoped(
-                    call,
-                    tools,
-                    hooks,
-                    self.scope.parallel_group_id or self.scope.call.id,
-                    coordinator,
-                )
+                # Proposed cooperative host route enrollment. This descriptor
+                # is not a source proof or activation grant. The host owns
+                # exact endpoint/source qualification and may refuse it.
+                route = enroll(
+                    hooks=hooks, coordinator=coordinator,
+                    parent_hooks=self.scope.hooks,
+                    parent_coordinator=self.scope.run.coordinator,
+                    source=dict(source), observation=observation,
+                    source_identity=dict(MEDIA_ROUTE_SOURCE),
+                ) if callable(enroll) else nullcontext()
+                with route:
+                    still_authorized(child_scope)
+                    tools = self.dispatcher.wrap_tools(
+                        tools,
+                        observed_name=name,
+                        observation=observation,
+                        authority=lambda: still_authorized(child_scope),
+                    )
+                    settled = SettledToolResult.from_legacy(await self.dispatcher.owner._execute_tool_unscoped(
+                        call,
+                        tools,
+                        hooks,
+                        self.scope.parallel_group_id or self.scope.call.id,
+                        coordinator,
+                    ))
         except ToolExecutionSuspended as suspended:
             # The nested invocation is not the enclosing controller. Propagating
             # its "not_started" frame would replay a controller that may already
@@ -248,7 +265,9 @@ class DispatchLease:
                 "Tool execution denied by host policy",
             )
         else:
-            post = observation.get("post_result")
+            # The engine's processed final result, not an earlier post-hook
+            # observer or JSON parsed from text, owns structured delivery.
+            post = settled.result
             confirmed = post.get("success") if isinstance(post, dict) else None
             if observation.get("engine_error"):
                 status, success = "failed", False
@@ -258,19 +277,20 @@ class DispatchLease:
                 status, success = "failed", False
             else:
                 status, success = "unknown", None
-            try:
-                output = json.loads(content)
-                # The core hook transport may copy result dictionaries, making
-                # the ordinary engine serialize the full post-hook ToolResult.
-                # Unwrap only when it is exactly the captured confirmed envelope.
-                if (
-                    isinstance(post, dict)
-                    and isinstance(post.get("success"), bool)
-                    and output == post
-                ):
-                    output = post.get("output")
-            except (ValueError, TypeError):
-                output = content
+            output = post
+            if isinstance(post, dict) and isinstance(post.get("success"), bool):
+                output = post.get("output")
+            elif post is None and not observation.get("post_seen"):
+                output = settled.content
+        if status == "completed" and success is True and isinstance(output, dict):
+            media = output.get("experimental.media.v1")
+            if isinstance(media, dict) and set(media) == {"refs"} and isinstance(media["refs"], list):
+                # Save only what this active lease actually returns, detached
+                # from mutable caller data. Tool-exec separately owns receiver
+                # delivery acknowledgment before its outer aggregation.
+                for ref in media["refs"]:
+                    frozen = json.dumps(ref, sort_keys=True, allow_nan=False)
+                    self.scope.media_refs.append((name, frozen))
         return {
             "status": status,
             "success": success,
@@ -390,6 +410,7 @@ class ApprovedDispatch:
         finally:
             if scope:
                 scope.active = False
+                scope.media_refs.clear()
             _CALL.reset(token)
 
     def bind(self):
@@ -407,6 +428,36 @@ class ApprovedDispatch:
         lease = DispatchLease(self, scope)
         lease._valid()
         return lease
+
+    def media_refs(self, parent_origin, ref):
+        """Host-injected nested verifier; possession is never authority.
+
+        Valid only while the real parent call is active, including its ingest
+        and publication. No global registry, provenance rewrite or TTL renewal.
+        """
+        try:
+            if not isinstance(parent_origin, dict):
+                return False
+            lease = self.bind()
+            try:
+                scope = lease.scope
+                identity = {key: parent_origin.get(key) for key in ("kind", "session_id", "id")}
+                if identity != {
+                    "kind": "tool", "session_id": str(scope.run.coordinator.session_id),
+                    "id": scope.call.id,
+                }:
+                    return False
+                frozen = json.dumps(ref, sort_keys=True, allow_nan=False)
+                allowed = self.allowed_tools(scope.call.name)
+                return any(
+                    candidate == frozen and name in lease.tools
+                    and (allowed is None or name in allowed)
+                    for name, candidate in scope.media_refs
+                )
+            finally:
+                lease.close()
+        except (RuntimeError, ValueError, TypeError):
+            return False
 
     async def complete(self, request):
         """A bounded, attributed ordinary inference call for an active caller.
@@ -447,6 +498,10 @@ class ApprovedDispatch:
                         ),
                     },
                     deep=True,
+                )
+                request = text_only_request(
+                    request, coordinator,
+                    reason="[Image unavailable in text-only nested inference; no pixels supplied.]",
                 )
                 source = {
                     **lease.context,
@@ -557,7 +612,7 @@ class ApprovedDispatch:
                 name in FORBIDDEN
                 or getattr(raw, "name", name) in FORBIDDEN
                 or (allowlist is not None and name not in allowlist)
-            ):
+            ) and not (name == observed_name and authority is not None):
                 wrapped[name] = raw
                 continue
             # Continuations are per call; execution serialization is per mounted
