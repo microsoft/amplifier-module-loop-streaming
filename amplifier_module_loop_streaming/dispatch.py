@@ -418,10 +418,13 @@ class ApprovedDispatch:
         and publication. No global registry, provenance rewrite or TTL renewal.
         """
         try:
+            if not isinstance(parent_origin, dict):
+                return False
             lease = self.bind()
             try:
                 scope = lease.scope
-                if parent_origin != {
+                identity = {key: parent_origin.get(key) for key in ("kind", "session_id", "id")}
+                if identity != {
                     "kind": "tool", "session_id": str(scope.run.coordinator.session_id),
                     "id": scope.call.id,
                 }:

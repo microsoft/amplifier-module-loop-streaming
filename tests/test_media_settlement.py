@@ -68,6 +68,7 @@ class Media:
         pytest.fail("Loop may not prepare/hydrate")
 
     def report(self, *args, **kwargs):
+        assert isinstance(args[0], str)
         self.reports.append((args, kwargs))
 
 
@@ -686,6 +687,9 @@ async def test_nested_verifier_binds_only_returned_effective_refs_to_active_pare
         if outcome == "revoked":
             loop.config["programmatic_allowed_tools"] = []
         checks.append(loop.approved_dispatch.media_refs(origin, actual_refs[0]))
+        assert loop.approved_dispatch.media_refs(
+            {**origin, "created_at": "2026-01-01T00:00:00+00:00", "expires_at": None},
+            actual_refs[0]) is (outcome == "success")
         forged = copy.deepcopy(actual_refs[0])
         forged["width"] += 1
         assert not loop.approved_dispatch.media_refs(origin, forged)

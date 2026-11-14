@@ -181,7 +181,7 @@ async def report_consumer_ready(coordinator):
     cap = capability(coordinator)
     if cap is not None and tool_post_boundary(coordinator) is not None:
         await _await(cap.report(
-            {"kind": "host", "session_id": coordinator.session_id, "id": "loop-streaming"},
+            "loop-streaming",
             event="consumer-ready", outcome="ready", details={"contract": 1, "role": "loop"},
         ))
 
@@ -317,9 +317,8 @@ async def settle_result(call, result, current, original, post, cap, staged, coor
                 refs = receipt["refs"]
                 metadata[NAMESPACE] = {"refs": deepcopy(refs)}
                 value["output"][NAMESPACE] = {"refs": deepcopy(refs)}
-            removed = [ref for ref in staged if ref not in refs]
-            if removed:
-                await _await(cap.publish(removed, origin=origin, disposition="drop"))
+            elif staged:
+                await _await(cap.publish(staged, origin=origin, disposition="drop"))
         except Exception:
             raise RuntimeError("Media publication refused; tool effects were not rolled back") from None
     if unchanged_text and value == original:

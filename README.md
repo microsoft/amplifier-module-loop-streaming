@@ -162,6 +162,13 @@ qualified host hook boundary/error witness above before enabling media;
 passing mock-hook tests is not that qualification. No native/background,
 provider wire, durable crash-recovery, or live-session parity is implied.
 
+`integration/test_media_store_pairing.py` is an explicitly selected candidate-
+graph check, outside the Core-only default suite. Run it with the exact selected
+Foundation source first on `PYTHONPATH` and Pillow available. It exercises real
+store publication, partial suppression, source-sealed checkpoint acceptance,
+private projection, and nested provenance. Its synthetic witnessed post
+boundary does **not** qualify a host registration facade or vendor wire path.
+
 ### Provider budget preflight
 
 When a provider exposes the optional `request_budget` capability, the loop
