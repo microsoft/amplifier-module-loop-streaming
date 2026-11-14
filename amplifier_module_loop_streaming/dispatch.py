@@ -215,6 +215,7 @@ class DispatchLease:
                     source_identity=dict(MEDIA_ROUTE_SOURCE),
                 ) if callable(enroll) else nullcontext()
                 with route:
+                    still_authorized(child_scope)
                     tools = self.dispatcher.wrap_tools(
                         tools,
                         observed_name=name,
@@ -611,7 +612,7 @@ class ApprovedDispatch:
                 name in FORBIDDEN
                 or getattr(raw, "name", name) in FORBIDDEN
                 or (allowlist is not None and name not in allowlist)
-            ):
+            ) and not (name == observed_name and authority is not None):
                 wrapped[name] = raw
                 continue
             # Continuations are per call; execution serialization is per mounted

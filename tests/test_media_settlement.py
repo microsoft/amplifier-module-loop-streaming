@@ -780,14 +780,16 @@ async def test_nested_inference_is_text_only_before_selected_adapter_count_and_s
     assert bool(validations) is (case != "inline")
 
 
-@pytest.mark.parametrize("outcome", ["success", "denied", "cancelled", "registration-refusal"])
+@pytest.mark.parametrize("outcome", [
+    "success", "denied", "cancelled", "registration-refusal", "route-revoked",
+])
 async def test_proposed_nested_route_enrollment_is_exact_scoped_and_not_authority(environment, outcome):
     from contextlib import contextmanager
     from tests.test_approved_dispatch import Client
     from amplifier_module_loop_streaming.dispatch import (
         AttributedHooks, AttributedCoordinator, MEDIA_ROUTE_SOURCE,
     )
-    _, coordinator, _, echo = environment
+    _, coordinator, loop, echo = environment
     records, active = [], []
     class Boundary:
         async def __call__(self, *args, **kwargs):
@@ -806,6 +808,8 @@ async def test_proposed_nested_route_enrollment_is_exact_scoped_and_not_authorit
             assert descriptor["source"]["tool_name"] == "read"
             if outcome == "registration-refusal":
                 raise RuntimeError("Source route is not enrolled by host")
+            if outcome == "route-revoked":
+                loop.config["programmatic_allowed_tools"] = []
             active.append(True)
             try:
                 yield
@@ -830,8 +834,8 @@ async def test_proposed_nested_route_enrollment_is_exact_scoped_and_not_authorit
         return await original(arguments)
     echo.execute = execute
     async def handler(lease):
-        if outcome == "registration-refusal":
-            with pytest.raises(RuntimeError, match="not enrolled"):
+        if outcome in {"registration-refusal", "route-revoked"}:
+            with pytest.raises(RuntimeError, match="not enrolled|revoked"):
                 await lease.call("read", {})
             return {"refused": True}
         return await lease.call("read", {})
@@ -840,7 +844,7 @@ async def test_proposed_nested_route_enrollment_is_exact_scoped_and_not_authorit
             await call_client(environment, Client(coordinator, handler))
     else:
         result, _ = await call_client(environment, Client(coordinator, handler))
-        if outcome != "registration-refusal":
+        if outcome not in {"registration-refusal", "route-revoked"}:
             assert result["status"] == ("denied" if outcome == "denied" else "completed")
     assert active == [] and len(records) == 1
     assert echo.calls == (1 if outcome == "success" else 0)
