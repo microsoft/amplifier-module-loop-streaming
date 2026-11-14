@@ -925,3 +925,51 @@ async def test_stream_tools_revocation_during_local_refit_never_retries(revoke_a
         await StreamingOrchestrator({}).execute(
             "work", context, {"main": provider}, {"image": ImageTool()}, Hooks({}), coordinator)
     assert provider.streams == 1 and not provider.allowed
+
+
+@pytest.mark.parametrize("override_at", ["count", "selected"])
+async def test_stream_support_uses_effective_options_model_not_provider_default(override_at):
+    from tests.test_durable_checkpoint import BatchProvider
+    context, coordinator = MockContext(), MockCoordinator()
+    queries, counts, sends = [], [], []
+    class Provider(BatchProvider):
+        def get_info(self):
+            return SimpleNamespace(
+                defaults={"model": "A"}, capabilities=["request_budget:provider_count"])
+        def get_stream_request_support(self, *, model, request_options=None):
+            queries.append((model, copy.deepcopy(request_options)))
+            return {"v": 1, "tools": "chat_request"} if model == "A" else None
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            counts.append((request, request_options))
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+                    "context_token_budget": 10000,
+                    "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10}}
+        async def stream(self, request, **kwargs):
+            sends.append(kwargs)
+            yield {"content": "must not send"}
+    provider = Provider(count=0)
+    async def measured_view(*, provider, retain_contents, count_view, fit_output=None):
+        view = await context.get_messages_for_request()
+        if override_at == "count":
+            attempt = await count_view(view, options={"model": "B"})
+        else:
+            attempt = await count_view(view)
+            attempt["request_options"] = {"model": "B"}
+        return {"base_view": view, "final_attempt": attempt, "count_calls": 1}
+    coordinator.register_capability("context.measured_request_view", measured_view)
+    with pytest.raises(RuntimeError, match="contract changed"):
+        await StreamingOrchestrator({}).execute(
+            "work", context, {"main": provider}, {"image": ImageTool()}, ScriptedHooks({}), coordinator)
+    assert any(model == "B" for model, _ in queries)
+    assert len(counts) == (0 if override_at == "count" else 1)
+    assert sends == []
+
+
+async def test_effective_stream_model_precedence_is_options_then_request_then_default():
+    from amplifier_module_loop_streaming import _effective_request_model
+    request = ChatRequest(messages=[Message(role="user", content="text")], model="request")
+    default = lambda provider: "default"
+    assert _effective_request_model(None, request, {"model": "selected"}, default) == "selected"
+    assert _effective_request_model(None, request, {}, default) == "request"
+    request.model = None
+    assert _effective_request_model(None, request, {}, default) == "default"

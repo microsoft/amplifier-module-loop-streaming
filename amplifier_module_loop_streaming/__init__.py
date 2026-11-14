@@ -70,6 +70,12 @@ def _canonical_stream_tools(provider, model, request_options):
             and value["tools"] == "chat_request")
 
 
+def _effective_request_model(provider, request, request_options, default_model):
+    if isinstance(request_options, Mapping) and request_options.get("model") is not None:
+        return request_options["model"]
+    return getattr(request, "model", None) or default_model(provider)
+
+
 def _build_tool_spec(tool: Any) -> ToolSpec:
     """Build a `ToolSpec` for one mounted tool, preserving model-native form.
 
@@ -4124,6 +4130,12 @@ class StreamingOrchestrator:
             then must fail locally rather than turn an unknown result into a
             fit and send an unchecked request.
             """
+            if stream_provider and request.tool_choice != "none" and _canonical_stream_tools(
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
+                request_options or {},
+            ) != canonical_stream_tools:
+                raise RuntimeError("Stream tool-input contract changed before count; replan required")
             request_budget = getattr(provider, "request_budget", None)
             if not budget_capable or not callable(request_budget):
                 # A provider that never advertised the capability keeps the
@@ -4240,6 +4252,12 @@ class StreamingOrchestrator:
             progression.  Retaining the old envelope validation here keeps a
             malformed advertised provider budget fail-closed.
             """
+            if stream_provider and request.tool_choice != "none" and _canonical_stream_tools(
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
+                request_options or {},
+            ) != canonical_stream_tools:
+                raise RuntimeError("Stream tool-input contract changed before count; replan required")
             request_budget = getattr(provider, "refit_request" if refit_error is not None else "request_budget", None)
             if not callable(request_budget):
                 await emit_budget_unavailable(
@@ -4835,7 +4853,8 @@ class StreamingOrchestrator:
             if coordinator and coordinator.cancellation.is_cancelled:
                 raise asyncio.CancelledError
             if streaming and _canonical_stream_tools(
-                provider, request.model or self._provider_default_model(provider),
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
                 request_options,
             ) != canonical_stream_tools:
                 return False
@@ -4849,7 +4868,8 @@ class StreamingOrchestrator:
             if coordinator and coordinator.cancellation.is_cancelled:
                 raise asyncio.CancelledError
             if streaming and _canonical_stream_tools(
-                provider, request.model or self._provider_default_model(provider),
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
                 request_options,
             ) != canonical_stream_tools:
                 return False
@@ -6720,7 +6740,8 @@ class StreamingOrchestrator:
         tools_list = list(tools.values()) if tools else []
         try:
             if _canonical_stream_tools(
-                provider, chat_request.model or self._provider_default_model(provider),
+                provider, _effective_request_model(
+                    provider, chat_request, request_options, self._provider_default_model),
                 request_options or {},
             ) != canonical_stream_tools:
                 raise RuntimeError("Stream tool-input contract changed after fitting; replan required")
