@@ -199,9 +199,9 @@ async def checkpoint_settled_results(coordinator, *, has_media=False):
         ) from exc
 
 
-async def report_consumer_ready(coordinator):
+async def report_consumer_ready(coordinator, *, post_complete=False):
     cap = capability(coordinator)
-    if cap is not None and tool_post_boundary(coordinator) is not None:
+    if post_complete is True and cap is not None and tool_post_boundary(coordinator) is not None:
         await _await(cap.report(
             "loop-streaming",
             event="consumer-ready", outcome="ready", details={"contract": 1, "role": "loop"},
@@ -297,17 +297,24 @@ async def stage_result(result, coordinator, call):
 
 async def post_result(hooks, coordinator, call, data, cap, staged):
     try:
-        boundary = tool_post_boundary(coordinator) if cap is not None else None
+        boundary = (tool_post_boundary(coordinator)
+                    if cap is not None and (staged or _refs(data["result"])) else None)
         if boundary is not None:
             receipt = await _await(boundary(
                 data, hooks=hooks, coordinator=coordinator
             ))
-            if (not isinstance(receipt, Mapping) or receipt.get("complete") is not True
+            if (not isinstance(receipt, Mapping) or type(receipt.get("complete")) is not bool
                     or "result" not in receipt
                     or not isinstance(receipt.get("hook_result"), HookResult)):
                 raise ValueError("Media tool post boundary did not attest the complete chain")
             post = receipt["hook_result"]
+            if receipt["complete"] is False:
+                # An incomplete witness is not a result replacement. Preserve
+                # ordinary processed text semantics without a second emit;
+                # settlement will strip refs/drop staging, never promote them.
+                return ToolPostResult(post, effective_result(post, data["result"]), False)
             value = None if post.action == "deny" else receipt["result"]
+            await report_consumer_ready(coordinator, post_complete=True)
             return ToolPostResult(post, value, True)
         post = await hooks.emit("tool:post", data)
         if coordinator:

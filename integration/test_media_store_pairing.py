@@ -79,7 +79,7 @@ async def test_actual_store_final_group_publication_and_source_sealed_checkpoint
         store, tmp_path / "session", context._messages))
     try:
         await report_consumer_ready(coordinator)
-        assert cap.report("loop", event="readiness", outcome="inspect")["consumers"]["loop-streaming"]
+        assert cap.report("loop", event="readiness", outcome="inspect")["consumers"] == {}
         call = ToolCall(id="actual-call", name="image", arguments={})
         if sequential:
             await loop._execute_tool_with_result_unscoped(
@@ -94,6 +94,7 @@ async def test_actual_store_final_group_publication_and_source_sealed_checkpoint
             await checkpoint_settled_results(
                 coordinator, has_media=bool(settled.metadata))
         rows = context._messages
+        assert cap.report("loop", event="readiness", outcome="inspect")["consumers"]["loop-streaming"]
         selected = rows[0].get("metadata", {}).get(NAMESPACE, {}).get("refs", [])
         assert selected == (staged if keep == "all" else staged[1:] if keep == "one" else [])
         for reference in selected:

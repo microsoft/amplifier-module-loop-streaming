@@ -105,12 +105,17 @@ await boundary(event_data, *, hooks=None, coordinator=None)
 The boundary must execute the **supplied current** hooks and coordinator's
 `tool:post` emit/process chain exactly once, preserving nested dispatch
 attribution, policy processing, final data and failure observations. A missing
-`result` member, nonliteral `complete=True`, wrong HookResult type, or exception
+`result` member, non-boolean `complete`, wrong HookResult type, or exception
 refuses media; explicit `result=None` is authoritative. The loop preserves
 ephemeral injections from `hook_result` separately. An absent boundary keeps
 the ordinary hook path, drops staging, freezes unavailable text, and does not
 advertise `consumer-ready`. Merely wrapping raw Core `emit` and asserting
 `complete=True` is not a qualified implementation of this interface.
+Ordinary non-media results use their existing hook path even when an incomplete
+bridge is installed. A valid `complete=False` receipt supplies processed
+non-media hook semantics, not an authoritative media/result replacement;
+useful text survives while refs are stripped and staging dropped. Readiness
+is reported only after an actual complete witnessed media chain.
 
 `SettledToolResult` is exported for extensions such as loop-live. Its
 `model_dump()` is detached JSON with `version: 1`, `tool_call_id`, `tool_name`,
