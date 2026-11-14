@@ -889,3 +889,32 @@ async def test_stream_tools_contract_uses_one_frozen_channel(tools_present, clai
         assert await operation == "done"
         assert bool(sends[0][0].tools) is tools_present
     assert len(support_calls) >= 2
+
+
+async def test_stream_tools_revocation_during_local_refit_never_retries():
+    from tests.test_durable_checkpoint import BatchProvider
+    context, coordinator = MockContext(), MockCoordinator()
+    refusal = RuntimeError("owned pretransport refusal")
+    class Provider(BatchProvider):
+        allowed = True
+        streams = 0
+        def get_stream_request_support(self, *, model, request_options=None):
+            return {"v": 1, "tools": "chat_request"} if self.allowed else None
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+                    "context_token_budget": 10000,
+                    "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10}}
+        def refit_request(self, request, *, error, context_estimate, request_options=None):
+            assert error is refusal
+            self.allowed = False
+            return self.request_budget(request, context_estimate=context_estimate, request_options=request_options)
+        async def stream(self, request, **kwargs):
+            self.streams += 1
+            assert self.streams == 1
+            raise refusal
+            yield
+    provider = Provider(count=0)
+    with pytest.raises(RuntimeError, match="owned pretransport"):
+        await StreamingOrchestrator({}).execute(
+            "work", context, {"main": provider}, {"image": ImageTool()}, ScriptedHooks({}), coordinator)
+    assert provider.streams == 1 and not provider.allowed

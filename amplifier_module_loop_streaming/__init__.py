@@ -4834,6 +4834,11 @@ class StreamingOrchestrator:
                 return False
             if coordinator and coordinator.cancellation.is_cancelled:
                 raise asyncio.CancelledError
+            if streaming and _canonical_stream_tools(
+                provider, request.model or self._provider_default_model(provider),
+                request_options,
+            ) != canonical_stream_tools:
+                return False
             if streaming:
                 recorder = foreground_usage_recorder()
                 if callable(recorder):
