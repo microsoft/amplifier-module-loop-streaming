@@ -544,13 +544,22 @@ async def test_settled_media_checkpoint_precedes_next_count_send_and_finalizatio
 
 @pytest.mark.parametrize("finalization", [False, True])
 @pytest.mark.parametrize("lost_capability", [False, True])
-@pytest.mark.parametrize("resume_budget", ["fit", "unavailable", "oversized", "output-cap", "cancel"])
+@pytest.mark.parametrize("measured", [False, True])
+@pytest.mark.parametrize("resume_budget", [
+    "fit", "unavailable", "oversized", "output-cap", "cancel",
+    "same-cap", "larger-cap", "reduced-cap",
+])
 async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reexecute(
-    tmp_path, finalization, lost_capability, resume_budget,
+    tmp_path, finalization, lost_capability, resume_budget, measured,
 ):
     from tests.test_durable_checkpoint import BatchProvider
     coordinator, media, loop = setup()
-    context = MockContext()
+    if measured:
+        from tests.test_measured_compaction_runtime import _MeasuredContext
+        context = _MeasuredContext()
+        coordinator.register_capability("context.measured_request_view", context.get_measured_request_view)
+    else:
+        context = MockContext()
     owner = Owner(tmp_path / "prepared.json", context)
     coordinator.register_capability("execution.suspension", owner)
     coordinator.register_capability("execution.resume", owner.claim)
@@ -561,21 +570,40 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
             self.requests = []
             self.counted = []
             self.resuming = False
+            self.pending = None
+            self.released = []
+            self.count_options = []
+        def get_info(self):
+            return SimpleNamespace(capabilities=["request_budget:provider_count"] if measured else [])
         async def request_budget(self, request, *, context_estimate, request_options=None):
             self.counted.append(request)
+            self.count_options.append(copy.deepcopy(request_options))
+            self.pending = (request, copy.deepcopy(request_options))
             if self.resuming and resume_budget == "cancel":
                 await asyncio.sleep(0)
                 coordinator.cancellation.is_cancelled = True
                 coordinator.cancellation.state = "cancelled"
             if self.resuming and resume_budget == "unavailable":
                 return None
+            cap = 64000 if resume_budget in {"same-cap", "larger-cap", "reduced-cap"} else None
+            if self.resuming:
+                cap = {"output-cap": 1, "larger-cap": 128000, "reduced-cap": 32000}.get(resume_budget, cap)
             return {"estimated_input_tokens": 10, "context_token_budget": 10000,
                     "input_limit_tokens": 1 if self.resuming and resume_budget == "oversized" else 10000,
-                    **({"max_output_tokens": 1} if self.resuming and resume_budget == "output-cap" else {}),
+                    **({"max_output_tokens": cap} if cap is not None else {}),
                     "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10}}
         async def complete(self, request, **kwargs):
+            assert self.pending[0] is request and self.pending[1] == kwargs
+            self.pending = None
             self.requests.append(request)
             return await super().complete(request, **kwargs)
+        def release_media_request(self, request, *, request_options=None):
+            if self.pending is None or self.pending[0] is not request:
+                return False
+            assert self.pending[1] == request_options
+            self.released.append((request, copy.deepcopy(request_options)))
+            self.pending = None
+            return True
         def parse_tool_calls(self, response):
             return [ToolCall(id="call", name="image", arguments={})] if self.calls == 1 else []
     class Hooks(MutatingHooks):
@@ -598,10 +626,14 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
     serialized = owner.path.read_text()
     assert PIXELS not in serialized and NAMESPACE in serialized
     canonical_request = frame["prepared_request"]["request"]
+    if resume_budget in {"same-cap", "larger-cap", "reduced-cap"}:
+        assert canonical_request["max_output_tokens"] is None
+        assert frame["prepared_request"]["original_output_cap"] == 64000
     saved_rows = [row for row in canonical_request["messages"] if row["role"] == "tool"]
     assert saved_rows[0]["tool_call_id"] == "call"
     assert saved_rows[0]["metadata"] == {NAMESPACE: {"refs": [ref()]}}
     before = copy.deepcopy(media.publications)
+    assert provider.pending is None, "Suspension must abandon the original counted object"
     owner.hold = False
     provider.resuming = True
     if lost_capability:
@@ -610,20 +642,117 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
             await StreamingOrchestrator(loop.config).resume(frame, *args)
         assert media.publications == before and provider.calls == 1
         return
-    if resume_budget != "fit":
+    if resume_budget not in {"fit", "same-cap", "larger-cap"}:
         if resume_budget == "cancel" or (finalization and resume_budget == "unavailable"):
             assert await StreamingOrchestrator(loop.config).resume(frame, *args) == ""
         else:
             with pytest.raises((RuntimeError, ContextLengthError)):
                 await StreamingOrchestrator(loop.config).resume(frame, *args)
         assert media.publications == before and provider.calls == 1 and hooks.provider_hooks == 2
+        assert provider.pending is None, "Refusal/cancellation must release the restored counted object"
         return
     assert await StreamingOrchestrator(loop.config).resume(frame, *args) == "done"
     assert media.publications == before and hooks.provider_hooks == 2
     assert provider.counted[-1] is provider.requests[-1]
+    assert provider.count_options[-1] == frame["prepared_request"]["request_options"]
+    assert canonical_request == frame["prepared_request"]["request"]
+    assert provider.requests[-1].max_output_tokens is None
     media_rows = [m for m in provider.requests[-1].messages if (m.metadata or {}).get(NAMESPACE)]
     assert media_rows[0].metadata[NAMESPACE]["refs"] == [ref()]
     assert PIXELS not in provider.requests[-1].model_dump_json()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("outcome", ["cancel", "task-cancel", "malformed", "observer-error", "success"])
+async def test_fresh_count_lifetime_releases_exact_original_options(streaming, outcome):
+    """A finite preflight can prepare pixels even when dispatch never starts."""
+    from tests.test_ephemeral_cache_persist_mode import RequestCapturingProvider
+    coordinator, _, _ = setup()
+    context = MockContext()
+    await context.add_message({"role": "user", "content": "media", "metadata": {
+        NAMESPACE: {"refs": [ref()]},
+    }})
+
+    class Provider(RequestCapturingProvider):
+        def __init__(self):
+            super().__init__()
+            self.pending = None
+            self.releases = []
+            self.counted = []
+            self.active = False
+            self.iterator_closed = False
+
+        async def request_budget(self, request, *, context_estimate, request_options=None):
+            assert isinstance(context_estimate, int)  # existing text-only estimate
+            self.pending = (request, copy.deepcopy(request_options))
+            self.counted.append(request)
+            await asyncio.sleep(0)
+            if outcome == "cancel":
+                coordinator.cancellation.is_cancelled = True
+                coordinator.cancellation.state = "cancelled"
+            elif outcome == "task-cancel":
+                # Cleanup must use the pre-await options even after mutation.
+                request_options["mutated-after-prepare"] = True
+                raise asyncio.CancelledError
+            if outcome == "malformed":
+                return {"estimated_input_tokens": True}
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 100,
+                    "context_token_budget": 0, "max_output_tokens": 64000}
+
+        def release_media_request(self, request, *, request_options=None):
+            assert not self.active, "Do not abandon an active stream"
+            if self.pending is None or self.pending[0] is not request:
+                return False
+            assert self.pending[1] == request_options
+            self.releases.append((request, copy.deepcopy(request_options)))
+            self.pending = None
+            return True
+
+        async def complete(self, request, **kwargs):
+            assert self.pending[0] is request and self.pending[1] == kwargs
+            self.pending = None
+            return await super().complete(request, **kwargs)
+
+        def close(self):
+            pytest.fail("Loop may not close a shared provider")
+
+    class StreamProvider(Provider):
+        async def stream(self, request, **kwargs):
+            assert self.pending[0] is request
+            self.active = True
+            try:
+                self.requests.append(request)
+                yield {"content": "done"}
+            finally:
+                self.pending = None
+                self.active = False
+                self.iterator_closed = True
+
+    class Hooks(ScriptedHooks):
+        async def emit(self, event, payload=None):
+            if event == "orchestrator:provider_budget" and outcome == "observer-error":
+                raise LookupError("observer failed")
+            return await super().emit(event, payload)
+
+    provider = (StreamProvider if streaming else Provider)()
+    operation = StreamingOrchestrator({"extended_thinking": True}).execute(
+        "work", context, {"main": provider}, {}, Hooks({}), coordinator)
+    if outcome == "task-cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    elif outcome in {"malformed", "observer-error"}:
+        with pytest.raises(ContextLengthError if outcome == "malformed" else LookupError):
+            await operation
+    else:
+        assert await operation == (("done" if streaming else "ok") if outcome == "success" else "")
+    assert provider.pending is None
+    assert len(provider.requests) == (1 if outcome == "success" else 0)
+    if outcome != "success":
+        assert len(provider.releases) == 1
+        assert provider.releases[0][0] is provider.counted[0]
+        assert provider.releases[0][1] == ({} if streaming else {"extended_thinking": True})
+    elif streaming:
+        assert provider.iterator_closed
 
 
 async def test_restored_refs_on_unsupported_path_are_unavailable_at_same_position():
