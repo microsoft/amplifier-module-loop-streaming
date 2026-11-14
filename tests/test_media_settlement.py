@@ -626,6 +626,7 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
     serialized = owner.path.read_text()
     assert PIXELS not in serialized and NAMESPACE in serialized
     canonical_request = frame["prepared_request"]["request"]
+    frozen_request = copy.deepcopy(canonical_request)
     if resume_budget in {"same-cap", "larger-cap", "reduced-cap"}:
         assert canonical_request["max_output_tokens"] is None
         assert frame["prepared_request"]["original_output_cap"] == 64000
@@ -655,7 +656,7 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
     assert media.publications == before and hooks.provider_hooks == 2
     assert provider.counted[-1] is provider.requests[-1]
     assert provider.count_options[-1] == frame["prepared_request"]["request_options"]
-    assert canonical_request == frame["prepared_request"]["request"]
+    assert frozen_request == frame["prepared_request"]["request"]
     assert provider.requests[-1].max_output_tokens is None
     media_rows = [m for m in provider.requests[-1].messages if (m.metadata or {}).get(NAMESPACE)]
     assert media_rows[0].metadata[NAMESPACE]["refs"] == [ref()]
@@ -753,6 +754,59 @@ async def test_fresh_count_lifetime_releases_exact_original_options(streaming, o
         assert provider.releases[0][1] == ({} if streaming else {"extended_thinking": True})
     elif streaming:
         assert provider.iterator_closed
+
+
+@pytest.mark.parametrize("exit_kind", ["task-cancel", "consumer-close"])
+async def test_active_stream_settles_before_exact_request_cleanup(exit_kind):
+    from tests.test_ephemeral_cache_persist_mode import RequestCapturingProvider
+    coordinator, _, _ = setup()
+    waiting = asyncio.Event()
+
+    class Provider(RequestCapturingProvider):
+        active = False
+        closed = False
+        pending = None
+        release_attempts = 0
+
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"}, capabilities=[])
+
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            self.pending = (request, copy.deepcopy(request_options))
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 100,
+                    "context_token_budget": 0}
+
+        async def stream(self, request, **kwargs):
+            assert self.pending[0] is request
+            self.active = True
+            try:
+                yield {"content": "first"}
+                waiting.set()
+                await asyncio.Event().wait()
+            finally:
+                self.pending = None
+                self.active = False
+                self.closed = True
+
+        def release_media_request(self, request, *, request_options=None):
+            self.release_attempts += 1
+            assert not self.active and self.closed
+            assert self.pending is None
+            return False  # The settled transport already released its candidate.
+
+    provider = Provider()
+    stream = StreamingOrchestrator({})._execute_stream(
+        "work", MockContext(), {"main": provider}, {}, ScriptedHooks({}), coordinator)
+    assert (await anext(stream))[0] == "first"
+    if exit_kind == "task-cancel":
+        task = asyncio.create_task(anext(stream))
+        await waiting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await stream.aclose()
+    assert provider.closed and not provider.active and provider.release_attempts == 1
 
 
 async def test_restored_refs_on_unsupported_path_are_unavailable_at_same_position():
