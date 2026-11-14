@@ -4990,6 +4990,9 @@ class StreamingOrchestrator:
                 measured_stream_count = prepared["measured_stream_count"]
                 overflow_retried = prepared.get("overflow_retried", False)
                 restored_count = await revalidate_prepared_media_budget(chat_request, request_options)
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    await exit_for_cancellation()
+                    return
                 if restored_count is not None:
                     measured_stream_count = restored_count
                 prepared = None
@@ -6225,6 +6228,9 @@ class StreamingOrchestrator:
                     final_overflow_retried = final_prepared["overflow_retried"]
                     final_measured_transaction = None
                     await revalidate_prepared_media_budget(max_iter_chat_request, request_options)
+                    if coordinator and coordinator.cancellation.is_cancelled:
+                        await exit_for_cancellation()
+                        return
                 else:
                     # Preserve the normal declarations, including provider-native
                     # specifications, so any assistant tool call and paired tool

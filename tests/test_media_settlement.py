@@ -544,7 +544,7 @@ async def test_settled_media_checkpoint_precedes_next_count_send_and_finalizatio
 
 @pytest.mark.parametrize("finalization", [False, True])
 @pytest.mark.parametrize("lost_capability", [False, True])
-@pytest.mark.parametrize("resume_budget", ["fit", "unavailable", "oversized", "output-cap"])
+@pytest.mark.parametrize("resume_budget", ["fit", "unavailable", "oversized", "output-cap", "cancel"])
 async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reexecute(
     tmp_path, finalization, lost_capability, resume_budget,
 ):
@@ -561,8 +561,12 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
             self.requests = []
             self.counted = []
             self.resuming = False
-        def request_budget(self, request, *, context_estimate, request_options=None):
+        async def request_budget(self, request, *, context_estimate, request_options=None):
             self.counted.append(request)
+            if self.resuming and resume_budget == "cancel":
+                await asyncio.sleep(0)
+                coordinator.cancellation.is_cancelled = True
+                coordinator.cancellation.state = "cancelled"
             if self.resuming and resume_budget == "unavailable":
                 return None
             return {"estimated_input_tokens": 10, "context_token_budget": 10000,
@@ -607,7 +611,7 @@ async def test_prepared_request_suspension_is_refs_only_and_resume_does_not_reex
         assert media.publications == before and provider.calls == 1
         return
     if resume_budget != "fit":
-        if finalization and resume_budget == "unavailable":
+        if resume_budget == "cancel" or (finalization and resume_budget == "unavailable"):
             assert await StreamingOrchestrator(loop.config).resume(frame, *args) == ""
         else:
             with pytest.raises((RuntimeError, ContextLengthError)):
