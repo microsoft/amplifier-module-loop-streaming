@@ -4507,8 +4507,10 @@ class StreamingOrchestrator:
                 candidate.messages.extend(
                     Message(**message) for message in degraded_output_warning(cap)
                 )
+                counted_options = deepcopy(dict(request_options or {}))
+                options_snapshot = deepcopy(counted_options)
                 decision = await count_measured_request(
-                    candidate, base_view, request_options=request_options
+                    candidate, base_view, request_options=counted_options
                 )
                 if coordinator and coordinator.cancellation.is_cancelled:
                     raise _MeasuredOutputFitCancelled()
@@ -4524,6 +4526,7 @@ class StreamingOrchestrator:
                     return {
                         "dispatch": candidate,
                         "budget_decision": decision,
+                        "request_options": options_snapshot,
                         "count_calls": count_calls,
                     }
             return None
@@ -5327,13 +5330,16 @@ class StreamingOrchestrator:
                             else list(base_view)
                         )
                         candidate_request = build_chat_request(candidate_messages)
+                        counted_options = deepcopy(dict(options))
+                        options_snapshot = deepcopy(counted_options)
                         return {
                             "dispatch": candidate_request,
                             "budget_decision": await count_measured_request(
                                 candidate_request,
                                 base_view,
-                                request_options=options,
+                                request_options=counted_options,
                             ),
+                            "request_options": options_snapshot,
                         }
 
                     try:
@@ -5353,6 +5359,11 @@ class StreamingOrchestrator:
                                 "context.measured_request_view did not return a ChatRequest dispatch"
                             )
                         measured_stream_count = measured_final_count(measured_result)
+                        selected_attempt = measured_result["final_attempt"]
+                        if "request_options" in selected_attempt:
+                            if not isinstance(selected_attempt["request_options"], Mapping):
+                                raise TypeError("Measured dispatch request_options is not a mapping")
+                            request_options = deepcopy(dict(selected_attempt["request_options"]))
                         measured_base_view = measured_result.get("base_view")
                         if not isinstance(measured_base_view, list) or not all(
                             isinstance(message, dict) for message in measured_base_view
@@ -6165,13 +6176,16 @@ class StreamingOrchestrator:
                             candidate_request = build_chat_request(
                                 candidate_messages, tool_choice="none"
                             )
+                            counted_options = deepcopy(dict(options))
+                            options_snapshot = deepcopy(counted_options)
                             return {
                                 "dispatch": candidate_request,
                                 "budget_decision": await count_measured_request(
                                     candidate_request,
                                     base_view,
-                                    request_options=options,
+                                    request_options=counted_options,
                                 ),
+                                "request_options": options_snapshot,
                             }
 
                         measured_result = await request_measured_view(
@@ -6190,6 +6204,11 @@ class StreamingOrchestrator:
                                 "context.measured_request_view did not return a ChatRequest dispatch"
                             )
                         measured_final_count(measured_result)
+                        selected_attempt = measured_result["final_attempt"]
+                        if "request_options" in selected_attempt:
+                            if not isinstance(selected_attempt["request_options"], Mapping):
+                                raise TypeError("Measured finalization request_options is not a mapping")
+                            request_options = deepcopy(dict(selected_attempt["request_options"]))
                         final_measured_base_view = measured_result.get("base_view")
                         if not isinstance(final_measured_base_view, list) or not all(
                             isinstance(message, dict) for message in final_measured_base_view

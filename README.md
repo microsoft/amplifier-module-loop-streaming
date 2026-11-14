@@ -144,6 +144,11 @@ canonical context remain reference-only. The selected host/provider adapter
 owns private hydration and the same projection for count/refit/send; the loop
 never calls `resolve` or `prepare_request`. Ref-bearing metadata marks the
 local text estimate as containing unmeasured images, not a cheap image fit.
+Measured `count_view` and accepted `fit_output` envelopes include a detached
+`request_options` snapshot of the exact owning provider-count options. A
+returned final envelope's options drive dispatch; legacy contexts that omit
+the additive field retain their existing calling contract. Context must not
+infer or merge options from a provider's ambient state to validate a witness.
 Goal utilities are text-only and show explicit unavailable image evidence.
 Approved nested `model.complete` likewise freezes no-pixels placeholders before
 the selected adapter's budget/send and validates ref identity when available;
