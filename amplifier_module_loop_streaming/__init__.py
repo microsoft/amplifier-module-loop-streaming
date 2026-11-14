@@ -4846,6 +4846,13 @@ class StreamingOrchestrator:
             await hooks.emit('orchestrator:request_refit', {
                 'attempt': 1, 'phase': 'before_transport', 'result': 'refitted',
             })
+            if coordinator and coordinator.cancellation.is_cancelled:
+                raise asyncio.CancelledError
+            if streaming and _canonical_stream_tools(
+                provider, request.model or self._provider_default_model(provider),
+                request_options,
+            ) != canonical_stream_tools:
+                return False
             return True
 
         if callable(getattr(provider, 'refit_request', None)):

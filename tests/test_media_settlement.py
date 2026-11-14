@@ -891,7 +891,8 @@ async def test_stream_tools_contract_uses_one_frozen_channel(tools_present, clai
     assert len(support_calls) >= 2
 
 
-async def test_stream_tools_revocation_during_local_refit_never_retries():
+@pytest.mark.parametrize("revoke_at", ["refit", "hook"])
+async def test_stream_tools_revocation_during_local_refit_never_retries(revoke_at):
     from tests.test_durable_checkpoint import BatchProvider
     context, coordinator = MockContext(), MockCoordinator()
     refusal = RuntimeError("owned pretransport refusal")
@@ -906,7 +907,8 @@ async def test_stream_tools_revocation_during_local_refit_never_retries():
                     "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10}}
         def refit_request(self, request, *, error, context_estimate, request_options=None):
             assert error is refusal
-            self.allowed = False
+            if revoke_at == "refit":
+                self.allowed = False
             return self.request_budget(request, context_estimate=context_estimate, request_options=request_options)
         async def stream(self, request, **kwargs):
             self.streams += 1
@@ -914,7 +916,12 @@ async def test_stream_tools_revocation_during_local_refit_never_retries():
             raise refusal
             yield
     provider = Provider(count=0)
+    class Hooks(ScriptedHooks):
+        async def emit(self, event, data=None):
+            if event == "orchestrator:request_refit" and revoke_at == "hook":
+                provider.allowed = False
+            return await super().emit(event, data)
     with pytest.raises(RuntimeError, match="owned pretransport"):
         await StreamingOrchestrator({}).execute(
-            "work", context, {"main": provider}, {"image": ImageTool()}, ScriptedHooks({}), coordinator)
+            "work", context, {"main": provider}, {"image": ImageTool()}, Hooks({}), coordinator)
     assert provider.streams == 1 and not provider.allowed
