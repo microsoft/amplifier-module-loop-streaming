@@ -188,13 +188,19 @@ and finalization's `tool_choice="none"`, with the same or lower output cap.
 
 The exact callback-owned counted request must be returned unchanged. Message
 content must differ from the failed request: a deep copy, metadata change, or
-output-cap-only change is not semantic repair. Its strict `provider_count` must
-fit the guarded allowance and be smaller than the server's observed rejected
-input count. Missing, `None`, estimate-only, malformed, unchanged, non-reducing,
+output-cap-only change is not semantic repair. Both its safety-reserved
+`estimated_input_tokens` and strict `provider_count` must fit the smaller of the
+server-reported rejected-request allowance and the fresh counted allowance.
+The strict count must also be smaller than the server's observed rejected
+input count. Context may receive `None` or estimate-only intermediate pressure
+readings so it can compact an opaque prefix; only the final selected attempt
+authorizes a retry. Missing, `None`, estimate-only, malformed, unchanged, non-reducing,
 over-budget, cancelled, and second-overflow paths make no further foreground
 send. Initial `None` preflight still permits the first request; it never permits
 an unproven retry. The selected retention transaction commits at the retry
 dispatch boundary after rate spacing; refusal or cancellation rolls it back.
+Counted request and decision snapshots are checked again across the commit
+await, with a veto while the transaction is still open.
 Hooks and tools do not rerun. The generic loop neither parses error messages nor
 knows provider-private feedback formats. `orchestrator:provider_overflow_recovery`
 records only the scalar recovery result.

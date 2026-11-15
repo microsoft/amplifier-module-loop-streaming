@@ -4757,6 +4757,14 @@ class StreamingOrchestrator:
                 )
                 if count is None:
                     raise ContextLengthError("Provider overflow repair requires a provider count")
+                retry_allowance = min(allowance, counted_budget["input_limit_tokens"])
+                if (
+                    counted_budget["estimated_input_tokens"] > retry_allowance
+                    or count > retry_allowance
+                ):
+                    raise ContextLengthError(
+                        "Provider overflow repair exceeds the rejected or counted input budget"
+                    )
                 if count >= observed:
                     raise ContextLengthError("Provider overflow repair did not reduce the provider count")
                 counted_cap = counted_budget.get("max_output_tokens")
@@ -4773,7 +4781,21 @@ class StreamingOrchestrator:
                 if rebuilt_request.model_dump() != snapshot:
                     raise ContextLengthError("Provider overflow repair changed after counting")
                 if transaction is not None:
-                    committed = await transaction.commit(is_cancelled=cancelled)
+                    # Commit may await compaction-event delivery. Veto while
+                    # the transaction is still open if that await changes the
+                    # selected counted request or its decision.
+                    committed = await transaction.commit(
+                        is_cancelled=lambda: (
+                            cancelled()
+                            or rebuilt_request.model_dump() != snapshot
+                            or final_attempt.get("budget_decision") != counted_budget
+                        )
+                    )
+                    if (
+                        rebuilt_request.model_dump() != snapshot
+                        or final_attempt.get("budget_decision") != counted_budget
+                    ):
+                        raise ContextLengthError("Provider overflow repair changed after counting")
                     if not committed or cancelled():
                         return None
                 selected = True

@@ -621,6 +621,53 @@ async def test_repair_requires_a_fitting_reduced_provider_count(budget) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "estimated,count,fresh_limit,fits",
+    [
+        (16, 15, 20, False),  # native count fits fresh allowance, not server's 10
+        (11, 9, 20, False),  # count fits both, safety-reserved estimate does not
+        (10, 9, 20, True),  # exact server-limit fit
+        (8, 7, 8, True),  # fresh count can narrow the server's allowance
+        (9, 7, 8, False),  # narrower fresh allowance remains binding
+    ],
+)
+async def test_repair_fits_both_server_and_fresh_counted_allowances(
+    estimated, count, fresh_limit, fits
+) -> None:
+    class FreshAllowanceProvider(RecoveringProvider):
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            result = super().request_budget(
+                request, context_estimate=context_estimate, request_options=request_options
+            )
+            if self.complete_calls:
+                result.update(
+                    estimated_input_tokens=estimated,
+                    input_limit_tokens=fresh_limit,
+                    measurement={
+                        "kind": "provider_count",
+                        "source": "test.provider.count",
+                        "input_tokens": count,
+                    },
+                )
+            return result
+
+    context = OverflowContext()
+    provider = FreshAllowanceProvider()
+    if fits:
+        assert await _execute_recovery(context, provider) == "recovered"
+        assert provider.complete_calls == 2
+        assert provider.requests[-1] is provider.counted_requests[-1]
+        assert context.transactions[-1].committed == 1
+        assert context.transactions[-1].rolled_back == 0
+    else:
+        with pytest.raises(ContextLengthError, match="input budget"):
+            await _execute_recovery(context, provider)
+        assert provider.complete_calls == 1
+        assert context.transactions[-1].committed == 0
+        assert context.transactions[-1].rolled_back == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pressure", [None, {key: value for key, value in _fit().items() if key != "measurement"}])
 async def test_unavailable_opaque_pressure_can_be_compacted_before_final_provider_count(pressure) -> None:
     pressure_attempts = []
@@ -833,10 +880,13 @@ async def test_old_measured_getter_declines_without_a_reactive_invocation(getter
 
 @pytest.mark.asyncio
 async def test_reason_getter_typeerror_is_not_retried_without_the_keyword() -> None:
+    invocations = []
+
     class BrokenContext(OverflowContext):
         async def get_measured_request_view(
             self, *, provider, retain_contents, count_view, reason=None
         ):
+            invocations.append(reason)
             if reason:
                 self.repair_reasons.append(reason)
                 raise TypeError("implementation failure")
@@ -849,6 +899,7 @@ async def test_reason_getter_typeerror_is_not_retried_without_the_keyword() -> N
     with pytest.raises(TypeError, match="implementation failure"):
         await _execute_recovery(context, provider)
     assert context.repair_reasons == ["provider_overflow"]
+    assert invocations == [None, "provider_overflow"]
     assert provider.complete_calls == 1
 
 
@@ -890,6 +941,77 @@ async def test_stop_during_measured_repair_never_sends_a_retry(during) -> None:
     with pytest.raises(ContextLengthError, match="provider rejected input"):
         await _execute_recovery(context, provider, coordinator=coordinator)
     assert provider.complete_calls == 1
+    assert context.transactions[-1].rolled_back == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["request", "budget"])
+async def test_commit_await_revalidates_counted_snapshot_and_rolls_back(change) -> None:
+    class CommitMutationContext(OverflowContext):
+        async def get_measured_request_view(
+            self, *, provider, retain_contents, count_view, reason=None
+        ):
+            result = await super().get_measured_request_view(
+                provider=provider, retain_contents=retain_contents,
+                count_view=count_view, reason=reason,
+            )
+            if reason:
+                attempt = result["final_attempt"]
+                original_commit = result["transaction"].commit
+
+                async def mutate_during_commit(**kwargs):
+                    await asyncio.sleep(0)
+                    if change == "request":
+                        attempt["dispatch"].messages[-1].content = "not counted"
+                    else:
+                        attempt["budget_decision"]["estimated_input_tokens"] += 1
+                    return await original_commit(**kwargs)
+
+                result["transaction"].commit = mutate_during_commit
+            return result
+
+    context = CommitMutationContext()
+    provider = RecoveringProvider()
+    with pytest.raises(ContextLengthError, match="changed after counting"):
+        await _execute_recovery(context, provider)
+    assert provider.complete_calls == 1
+    assert context.transactions[-1].committed == 0
+    assert context.transactions[-1].rolled_back == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["veto", "exception", "cancellation"])
+async def test_open_transaction_rolls_back_when_commit_does_not_select(failure) -> None:
+    class CommitFailureContext(OverflowContext):
+        async def get_measured_request_view(
+            self, *, provider, retain_contents, count_view, reason=None
+        ):
+            result = await super().get_measured_request_view(
+                provider=provider, retain_contents=retain_contents,
+                count_view=count_view, reason=reason,
+            )
+            if reason:
+                async def fail_commit(**_kwargs):
+                    await asyncio.sleep(0)
+                    if failure == "exception":
+                        raise RuntimeError("commit failed")
+                    if failure == "cancellation":
+                        raise asyncio.CancelledError()
+                    return False
+
+                result["transaction"].commit = fail_commit
+            return result
+
+    context = CommitFailureContext()
+    provider = RecoveringProvider()
+    expected = (
+        RuntimeError if failure == "exception" else
+        asyncio.CancelledError if failure == "cancellation" else ContextLengthError
+    )
+    with pytest.raises(expected):
+        await _execute_recovery(context, provider)
+    assert provider.complete_calls == 1
+    assert context.transactions[-1].committed == 0
     assert context.transactions[-1].rolled_back == 1
 
 
