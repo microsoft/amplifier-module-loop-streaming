@@ -4641,19 +4641,24 @@ class StreamingOrchestrator:
 
             if coordinator and coordinator.cancellation.is_cancelled:
                 return None
-            # A generic **kwargs getter has not opted into reactive semantic
-            # compaction. Never probe it by invocation/TypeError fallback.
-            try:
-                reason_parameter = inspect.signature(measured_view_getter).parameters.get("reason")
-            except (TypeError, ValueError):
-                reason_parameter = None
-            if (
-                not measured_compaction_capable
-                or reason_parameter is None
-                or reason_parameter.kind not in (
+            def explicitly_accepts_keyword(getter: Any, name: str) -> bool:
+                # Neither **kwargs nor a speculative TypeError invocation is
+                # an advertisement of the reactive reason/hard_fit contract.
+                try:
+                    parameter = inspect.signature(getter).parameters.get(name)
+                except (TypeError, ValueError):
+                    return False
+                return parameter is not None and parameter.kind in (
                     inspect.Parameter.KEYWORD_ONLY,
                     inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 )
+
+            use_measured_repair = (
+                measured_compaction_capable
+                and explicitly_accepts_keyword(measured_view_getter, "reason")
+            )
+            if not use_measured_repair and not explicitly_accepts_keyword(
+                retaining_getter, "hard_fit"
             ):
                 return None
 
@@ -4714,12 +4719,21 @@ class StreamingOrchestrator:
             selected = False
             try:
                 # Do not offer the cap-only output ladder as semantic repair.
-                result = await measured_view_getter(
-                    provider=provider,
-                    retain_contents=list(retain_contents),
-                    count_view=count_repair,
-                    reason="provider_overflow",
-                )
+                if use_measured_repair:
+                    result = await measured_view_getter(
+                        provider=provider,
+                        retain_contents=list(retain_contents),
+                        count_view=count_repair,
+                        reason="provider_overflow",
+                    )
+                else:
+                    # Legacy retention owns its legal reduction and may commit
+                    # compaction delivery before returning. It has no staged
+                    # transaction, but cannot authorize an uncounted send.
+                    base_view = list(await request_messages(
+                        list(retain_contents), token_budget=target, hard_fit=True
+                    ))
+                    result = {"final_attempt": await count_repair(base_view)}
                 if not isinstance(result, dict):
                     raise ContextLengthError("Provider overflow repair returned an invalid view")
                 transaction = result.get("transaction")

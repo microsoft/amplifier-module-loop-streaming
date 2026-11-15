@@ -171,15 +171,19 @@ A provider may optionally expose synchronous `recover_context_overflow` to
 turn its own `ContextLengthError` into private, request-bound feedback. The loop
 uses it only before a normal or finalization request has yielded an SDK chunk
 or returned a response, and only once for that outbound generation. Recovery
-requires both measured capabilities above and a Context getter that explicitly
-advertises a keyword-capable `reason` parameter. Older getters, including ones
-with only `**kwargs`, safely decline reactive repair; the loop does not invoke
-them speculatively or retry an implementation `TypeError`.
+prefers both measured capabilities above with a Context getter that explicitly
+advertises a keyword-capable `reason` parameter. Otherwise, a retention getter
+that explicitly advertises keyword-capable `hard_fit` may build the legal
+provider-targeted view. `**kwargs` alone or an uninspectable callable does not
+advertise either contract. Without either qualified path, recovery declines.
+The loop never probes support by invocation or retries an implementation
+`TypeError`; a reason-aware measured-path failure never falls back to retention.
 
 Recovery feedback must be a strict budget dictionary: non-boolean integer
 fields, an observed input above its allowance, and a positive target smaller
 than the failed context estimate. Only after accepting that feedback does the
-loop call `context.measured_request_view(..., reason="provider_overflow")`.
+loop call `context.measured_request_view(..., reason="provider_overflow")`, or
+the legacy retention getter with the feedback target and `hard_fit=True`.
 Context may semantically compact an eligible prefix even when the public
 text-only pressure is low; its legal retention and protected-content rules
 still apply. The recovered view replays the already-resolved overlays on a deep
@@ -197,10 +201,15 @@ readings so it can compact an opaque prefix; only the final selected attempt
 authorizes a retry. Missing, `None`, estimate-only, malformed, unchanged, non-reducing,
 over-budget, cancelled, and second-overflow paths make no further foreground
 send. Initial `None` preflight still permits the first request; it never permits
-an unproven retry. The selected retention transaction commits at the retry
-dispatch boundary after rate spacing; refusal or cancellation rolls it back.
+an unproven retry. A selected measured transaction commits at the retry dispatch
+boundary after rate spacing; refusal or cancellation rolls an open transaction back.
 Counted request and decision snapshots are checked again across the commit
 await, with a veto while the transaction is still open.
+Legacy hard-fit retention may commit compaction delivery before returning its
+view, as its existing contract permits; it provides no dispatch-owned transaction
+to roll back after counting. That path still uses the same frozen request
+assembly, provider count and final admission checks, and a failed count never
+permits a foreground retry.
 Hooks and tools do not rerun. The generic loop neither parses error messages nor
 knows provider-private feedback formats. `orchestrator:provider_overflow_recovery`
 records only the scalar recovery result.

@@ -22,7 +22,10 @@ from tests.test_measured_compaction_runtime import (
     _RepairMeasuredContext as OverflowContext,
     _CountTolerantContext,
 )
-from tests.test_provider_budget_guard import _retaining_coordinator as _legacy_coordinator
+from tests.test_provider_budget_guard import (
+    HardFitBudgetContext,
+    _retaining_coordinator as _legacy_coordinator,
+)
 
 
 def _retaining_coordinator(context):
@@ -869,6 +872,13 @@ async def test_old_measured_getter_declines_without_a_reactive_invocation(getter
         "positional_only": positional_reason, "uninspectable": Uninspectable(),
     }[getter_kind]
     coordinator.register_capability("context.measured_request_view", getter)
+    # No explicit hard_fit fallback in this fixture: old measured signatures
+    # alone must not authorize a reactive invocation.
+    async def old_retention(*, provider, retain_contents, token_budget=None):
+        return await context.retaining_view(
+            provider=provider, retain_contents=retain_contents, token_budget=token_budget
+        )
+    coordinator.register_capability("context.request_retention", old_retention)
     provider = RecoveringProvider()
     with pytest.raises(ContextLengthError, match="provider rejected input"):
         await _execute_recovery(context, provider, coordinator=coordinator)
@@ -876,6 +886,229 @@ async def test_old_measured_getter_declines_without_a_reactive_invocation(getter
     assert len(provider.recovery_options) == 1
     assert provider.complete_calls == 1
     assert context.repair_reasons == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["normal", "streaming", "finalization"])
+@pytest.mark.parametrize("measured_getter", ["missing", "old"])
+async def test_explicit_legacy_hard_fit_retries_only_the_changed_counted_request(
+    phase, measured_getter
+) -> None:
+    context = HardFitBudgetContext()
+    old = "old history" * 100
+    context._messages.append({"role": "assistant", "content": old})
+    tool_calls = []
+
+    class CountingTool(OneShotTool):
+        async def execute(self, arguments):
+            tool_calls.append(arguments)
+            return await super().execute(arguments)
+
+    class FinalProvider(RecoveringProvider):
+        def parse_tool_calls(self, response):
+            return [ToolCallStub()] if self.complete_calls == 1 else []
+
+    provider = (
+        FinalProvider(fail_call=2) if phase == "finalization" else
+        RecoveringStreamProvider() if phase == "streaming" else RecoveringProvider()
+    )
+    provider.recovery = _overflow(cap=64)
+    hooks = ScriptedHooks({
+        "provider:request": ScriptedHookResult(
+            action="inject_context", ephemeral=True, context_injection="LEGACY-CURRENT-OVERLAY"
+        )
+    })
+    coordinator = _legacy_coordinator(context)
+    measured_calls = []
+
+    async def old_measured(*, provider, retain_contents, count_view):
+        measured_calls.append(list(retain_contents))
+        rows = list(context._messages)
+        return {
+            "base_view": rows,
+            "final_attempt": await count_view(rows),
+            "outcome": "not_needed",
+            "count_calls": 1,
+        }
+
+    if measured_getter == "old":
+        coordinator.register_capability("context.measured_request_view", old_measured)
+    result = await StreamingOrchestrator({
+        "extended_thinking": True,
+        "max_iterations": 1 if phase == "finalization" else -1,
+        "ephemeral_injection_mode": "tail", "reminder_placement": "tail",
+    }).execute(
+        "work", context, {"main": provider},
+        {"mock_tool": CountingTool()} if phase == "finalization" else {},
+        hooks, coordinator,
+    )
+
+    assert result == ("stream recovered" if phase == "streaming" else "recovered")
+    expected_ordinary = 2 if phase == "finalization" else 1
+    assert context.hard_fit_calls == (
+        [False] * expected_ordinary + [True] if measured_getter == "missing" else [True]
+    )
+    assert len(measured_calls) == (expected_ordinary if measured_getter == "old" else 0)
+    assert context.request_calls[-1][1] == 1
+    assert len(provider.requests) == (3 if phase == "finalization" else 2)
+    assert provider.requests[-1] is provider.counted_requests[-1]
+    assert provider.requests[-1].max_output_tokens == 64
+    assert provider.requests[-1].tools == provider.requests[-2].tools
+    assert provider.requests[-1].tool_choice == provider.requests[-2].tool_choice
+    if phase == "finalization":
+        assert provider.requests[-1].tool_choice == "none"
+    contents = [message.content for message in provider.requests[-1].messages]
+    assert old not in contents
+    assert "\n".join(contents).count("LEGACY-CURRENT-OVERLAY") == 1
+    assert any(message.get("content") == old for message in context._messages)
+    assert len(tool_calls) == (1 if phase == "finalization" else 0)
+    assert [name for name, _ in hooks.emitted].count("provider:request") == (2 if phase == "finalization" else 1)
+    assert len(provider.recovery_options) == 1
+    expected_options = {} if phase == "streaming" else {"extended_thinking": True}
+    assert provider.budget_options[-1] == provider.recovery_options[-1] == expected_options
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["unchanged", "none", "estimate", "malformed", "server_limit", "reserved_limit"]
+)
+async def test_legacy_hard_fit_still_requires_changed_content_and_strict_final_fit(failure) -> None:
+    class LegacyContext(HardFitBudgetContext):
+        async def retaining_view(
+            self, *, provider=None, retain_contents, token_budget=None, hard_fit=False
+        ):
+            if failure == "unchanged" and hard_fit:
+                self.hard_fit_calls.append(hard_fit)
+                return list(self._messages)
+            return await super().retaining_view(
+                provider=provider, retain_contents=retain_contents,
+                token_budget=token_budget, hard_fit=hard_fit,
+            )
+
+    class PostRejectProvider(RecoveringProvider):
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            result = super().request_budget(
+                request, context_estimate=context_estimate, request_options=request_options
+            )
+            if self.complete_calls:
+                if failure == "none":
+                    return None
+                if failure == "estimate":
+                    result.pop("measurement")
+                elif failure == "malformed":
+                    result["max_output_tokens"] = 0
+                elif failure in ("server_limit", "reserved_limit"):
+                    result.update(estimated_input_tokens=11, input_limit_tokens=20)
+                    result["measurement"]["input_tokens"] = 11 if failure == "server_limit" else 9
+            return result
+
+    context = LegacyContext()
+    context._messages.append({"role": "assistant", "content": "old history" * 100})
+    provider = PostRejectProvider()
+    hooks = ScriptedHooks({})
+    with pytest.raises(ContextLengthError):
+        await _execute_recovery(
+            context, provider, coordinator=_legacy_coordinator(context), hooks=hooks
+        )
+    assert provider.complete_calls == 1
+    assert context.hard_fit_calls == [False, True]
+    assert [name for name, _ in hooks.emitted].count("provider:request") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during", ["retention", "count", "spacing"])
+async def test_stop_during_legacy_repair_prevents_retry(during, monkeypatch) -> None:
+    class StoppingContext(HardFitBudgetContext):
+        async def retaining_view(
+            self, *, provider=None, retain_contents, token_budget=None, hard_fit=False
+        ):
+            result = await super().retaining_view(
+                provider=provider, retain_contents=retain_contents,
+                token_budget=token_budget, hard_fit=hard_fit,
+            )
+            if hard_fit and during == "retention":
+                coordinator.cancellation.is_cancelled = True
+            return result
+
+    class StoppingProvider(RecoveringProvider):
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            result = super().request_budget(
+                request, context_estimate=context_estimate, request_options=request_options
+            )
+            if self.complete_calls and during == "count":
+                coordinator.cancellation.is_cancelled = True
+            return result
+
+    async def stop_spacing(self, _hooks, _iteration):
+        if self._last_provider_call_end is not None and during == "spacing":
+            coordinator.cancellation.is_cancelled = True
+
+    monkeypatch.setattr(StreamingOrchestrator, "_apply_rate_limit_delay", stop_spacing)
+    context = StoppingContext()
+    context._messages.append({"role": "assistant", "content": "old history" * 100})
+    coordinator = _legacy_coordinator(context)
+    provider = StoppingProvider()
+    hooks = ScriptedHooks({})
+    with pytest.raises(ContextLengthError, match="provider rejected input"):
+        await _execute_recovery(context, provider, coordinator=coordinator, hooks=hooks)
+    assert provider.complete_calls == 1
+    assert [name for name, _ in hooks.emitted].count("provider:request") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("getter_kind", ["kwargs", "positional_only", "uninspectable"])
+async def test_legacy_hard_fit_requires_explicit_inspectable_keyword(getter_kind) -> None:
+    context = HardFitBudgetContext()
+    context._messages.append({"role": "assistant", "content": "old history" * 100})
+    coordinator = _legacy_coordinator(context)
+    invocations = []
+
+    async def record_ordinary(kwargs):
+        invocations.append(kwargs)
+        return list(context._messages)
+
+    async def kwargs_only(**kwargs):
+        return await record_ordinary(kwargs)
+
+    async def positional_only(hard_fit=False, /, **kwargs):
+        return await record_ordinary(kwargs)
+
+    class Uninspectable:
+        __signature__ = "not a signature"
+
+        async def __call__(self, **kwargs):
+            return await record_ordinary(kwargs)
+
+    coordinator.register_capability("context.request_retention", {
+        "kwargs": kwargs_only, "positional_only": positional_only,
+        "uninspectable": Uninspectable(),
+    }[getter_kind])
+    provider = RecoveringProvider()
+    with pytest.raises(ContextLengthError, match="provider rejected input"):
+        await _execute_recovery(context, provider, coordinator=coordinator)
+    assert len(invocations) == 1
+    assert "hard_fit" not in invocations[0]
+    assert provider.complete_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_legacy_hard_fit_typeerror_is_not_reinvoked() -> None:
+    class BrokenContext(HardFitBudgetContext):
+        async def retaining_view(
+            self, *, provider=None, retain_contents, token_budget=None, hard_fit=False
+        ):
+            self.hard_fit_calls.append(hard_fit)
+            if hard_fit:
+                raise TypeError("legacy implementation failure")
+            return list(self._messages)
+
+    context = BrokenContext()
+    context._messages.append({"role": "assistant", "content": "old history" * 100})
+    provider = RecoveringProvider()
+    with pytest.raises(TypeError, match="legacy implementation failure"):
+        await _execute_recovery(context, provider, coordinator=_legacy_coordinator(context))
+    assert context.hard_fit_calls == [False, True]
+    assert provider.complete_calls == 1
 
 
 @pytest.mark.asyncio
@@ -900,6 +1133,29 @@ async def test_reason_getter_typeerror_is_not_retried_without_the_keyword() -> N
         await _execute_recovery(context, provider)
     assert context.repair_reasons == ["provider_overflow"]
     assert invocations == [None, "provider_overflow"]
+    assert provider.complete_calls == 1
+    assert context.hard_fit_calls == [], "a reason-aware getter failure must not enter legacy fallback"
+
+
+@pytest.mark.asyncio
+async def test_reason_aware_measured_native_error_never_enters_legacy_fallback() -> None:
+    class RefusingContext(OverflowContext):
+        async def get_measured_request_view(
+            self, *, provider, retain_contents, count_view, reason=None
+        ):
+            if reason:
+                self.repair_reasons.append(reason)
+                raise ContextLengthError("protected native history cannot be reduced")
+            return await super().get_measured_request_view(
+                provider=provider, retain_contents=retain_contents, count_view=count_view
+            )
+
+    context = RefusingContext()
+    provider = RecoveringProvider()
+    with pytest.raises(ContextLengthError, match="protected native history"):
+        await _execute_recovery(context, provider)
+    assert context.repair_reasons == ["provider_overflow"]
+    assert context.hard_fit_calls == []
     assert provider.complete_calls == 1
 
 
