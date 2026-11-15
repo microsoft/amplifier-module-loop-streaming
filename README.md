@@ -76,6 +76,146 @@ this does not add a cancellation-recovery policy. A missing capability preserves
 the behavior of existing hosts. The Loop itself does not write transcripts.
 This checkpoint is not the earlier `tool:post` event, which precedes result append.
 
+### Reference-only tool media (integration candidate)
+
+The optional, session-bound `experimental.media.v1` capability is a structural
+interface with `version == 1` and six callable operations: `ingest`, `publish`,
+`validate`, `resolve`, `prepare_request`, and `report`. The loop imports only
+Core types; it does not import Foundation or a host/provider implementation.
+
+Canonical rich `ToolResult` images are ingested **before** `tool:post`
+serialization. Only refs surviving the final processed result's actual
+`output["experimental.media.v1"]["refs"]` are published under the actual
+session/tool-call origin, then attached to the corresponding tool message's
+metadata. Explicit null, a missing result in final chained data, removal,
+replacement, denial, and surfaced dispatch exceptions do not restore earlier
+refs. JSON-looking strings are text, never an alternate media transport.
+Absent or incompatible media handling replaces canonical image transport with
+an explicit unavailable/no-pixels warning while preserving useful output.
+
+Promotion additionally requires a host-installed `session.media.tool_post`
+callable with this structural signature:
+
+```python
+await boundary(event_data, *, hooks=None, coordinator=None)
+# -> {"hook_result": actual_core_hook_result,
+#     "result": final_effective_value, "complete": True}
+```
+
+The boundary must execute the **supplied current** hooks and coordinator's
+`tool:post` emit/process chain exactly once, preserving nested dispatch
+attribution, policy processing, final data and failure observations. A missing
+`result` member, non-boolean `complete`, wrong HookResult type, or exception
+refuses media; explicit `result=None` is authoritative. The loop preserves
+ephemeral injections from `hook_result` separately. An absent boundary keeps
+the ordinary hook path, drops staging, freezes unavailable text, and does not
+advertise `consumer-ready`. Merely wrapping raw Core `emit` and asserting
+`complete=True` is not a qualified implementation of this interface.
+Ordinary non-media results use their existing hook path even when an incomplete
+bridge is installed. A valid `complete=False` receipt supplies processed
+non-media hook semantics, not an authoritative media/result replacement;
+useful text survives while refs are stripped and staging dropped. Readiness
+is reported only after an actual complete witnessed media chain.
+When Core's special injection/approval aggregate omits final data, an
+unwitnessed media-installed path cannot safely restore earlier text: it uses
+null rather than resurrect a possible prior redaction. A qualified boundary
+is required to preserve both useful text and exact redaction in that case.
+
+`SettledToolResult` is exported for extensions such as loop-live. Its
+`model_dump()` is detached JSON with `version: 1`, `tool_call_id`, `tool_name`,
+`content`, `metadata`, `result` (the effective structured post-hook result), and
+`success` (boolean or null). `from_legacy()` accepts an instance, that mapping,
+or historical `[id, name, text]` records without parsing the text. Metadata
+survives ordered append, completed cancellation siblings, and settled-tool
+continuations. Historical triple reads remain supported, but new extensions
+must persist `model_dump()`, not `list(result)`, to avoid discarding metadata.
+
+The dispatcher exposes `tools.dispatch.media_refs(parent_origin, ref) -> bool`
+for a host's injected nested-origin verifier. It recognizes only exact detached
+refs from completed, successful effective structured inner outputs actually
+returned through the active parent's lease. It rechecks current parent
+session/run/call authority and tool allowlist, refuses forged/stale/failed/
+unknown/redacted/text-only results, and clears its call-local evidence when
+that parent finishes. It neither rewrites inner provenance/expiry nor grants
+cross-session access. Programmatic runners separately own confirmation that
+their consumer received the result before selecting refs for outer output.
+Draft cooperative route adapters may expose `enroll_attributed_route` on the
+host boundary. The dispatcher supplies exact current and parent hook/coordinator
+tokens, source and observation, plus `MEDIA_ROUTE_SOURCE`; its context manager
+spans nested execution through settlement and revokes on exit. This source
+descriptor is not proof of accepted code or permission to enable a graph.
+
+`media.checkpoint_settled_results(coordinator, *, has_media=False)` awaits the
+existing zero-argument host checkpoint. Media-bearing settled appends require
+that capability. Its return is **not** interpreted as a media commit receipt:
+the host must save and verify the exact canonical prefix/content/source,
+bind its acknowledgment to the media store, and refuse private request
+preparation until that acceptance exists. Assets-only publication and
+consumer-ready reports do not grant durable reachability.
+
+Requests, measured views, prepared dispatch/finalization continuations, and
+canonical context remain reference-only. The selected host/provider adapter
+owns private hydration and the same projection for count/refit/send; the loop
+never calls `resolve` or `prepare_request`. Ref-bearing metadata marks the
+local text estimate as containing unmeasured images, not a cheap image fit.
+Measured `count_view` and accepted `fit_output` envelopes include a detached
+`request_options` snapshot of the exact owning provider-count options. A
+returned final envelope's options drive dispatch; legacy contexts that omit
+the additive field retain their existing calling contract. Context must not
+infer or merge options from a provider's ambient state to validate a witness.
+An actual provider may expose synchronous
+`get_stream_request_support(*, model, request_options=None)` returning exactly
+`{"v": 1, "tools": "chat_request"}`. Only that qualified route consumes
+`ChatRequest.tools` as the sole schema channel and omits the legacy duplicate
+runtime `tools=` argument. The loop freezes this choice before fitting and
+rechecks it before dispatch; a changed claim refuses locally. Missing or
+malformed support preserves legacy streaming behavior. Runtime tool objects
+are never put into count options or serialized continuations.
+Goal utilities are text-only and show explicit unavailable image evidence.
+Approved nested `model.complete` likewise freezes no-pixels placeholders before
+the selected adapter's budget/send and validates ref identity when available;
+forged refs refuse rather than becoming a text-only approval.
+Unsupported restored refs receive request-local unavailable text at their
+original position without rewriting history. A previously fitted prepared
+continuation that loses compatible media handling instead refuses locally
+before count/send: changing its fitted payload requires an authorized refit.
+Media-bearing prepared resumes obtain a fresh provider count for the exact
+restored canonical object and saved options. Adapter-private associations
+cannot be serialized or reused by object identity across suspension. This
+revalidation does not replay hooks, tools, context assembly or compaction; an
+unavailable count, oversized request or newly reduced output allowance refuses
+locally rather than altering the saved fitted request.
+
+**Activation holds:** this candidate requires exact accepted media-store,
+checkpoint, provider-adapter, and nested-origin integration qualification.
+The installed Core hook registry returns final chained data with
+`action="continue"` even after `modify`; the loop handles final-field presence.
+Core also copies handler input and logs/continues after individual handler
+exceptions. Mutation without returning modified data is not an effective
+Core hook replacement, and those swallowed exceptions are not observable
+through its public `emit` result. Media promotion therefore requires the
+qualified host hook boundary/error witness above before enabling media;
+passing mock-hook tests is not that qualification. No native/background,
+provider wire, durable crash-recovery, or live-session parity is implied.
+
+`integration/test_media_store_pairing.py` is an explicitly selected candidate-
+graph check, outside the Core-only default suite. Run it with the exact selected
+Foundation source first on `PYTHONPATH` and Pillow available. It exercises real
+store publication, partial suppression, source-sealed checkpoint acceptance,
+private projection, and nested provenance. Its synthetic witnessed post
+boundary does **not** qualify a host registration facade or vendor wire path.
+
+`integration/test_media_positive_profile.py` selects an immutable public bridge
+with `MEDIA_HOOK_BRIDGE_SOURCE` and its exact `MEDIA_HOOK_BRIDGE_SHA256`. Its
+bounded cooperative graph names the actual loop/context modules and a late host
+participant, initializes through the actual loader, and seals only after late
+registrations. PNG/JPEG checks join final witnessed refs, source-sealed canonical
+checkpoint refs, and private count/send pixels, including nested leases and
+prepared/settled resume. These controlled public-API checks are candidate-graph
+evidence, not universal raw-registry mutation proof, accepted host activation,
+or vendor inference/wire qualification. Default unqualified graphs stay
+incomplete; the earlier negative-only profile remains separate.
+
 ### Provider budget preflight
 
 When a provider exposes the optional `request_budget` capability, the loop
