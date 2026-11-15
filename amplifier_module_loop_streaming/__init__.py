@@ -15,6 +15,7 @@ import re
 import time
 import weakref
 from collections.abc import AsyncIterator, Mapping
+from copy import deepcopy
 from functools import partial
 from typing import Any, ClassVar
 
@@ -3915,8 +3916,6 @@ class StreamingOrchestrator:
             recovery = getattr(provider, "recover_context_overflow", None)
             if (
                 not callable(recovery)
-                or retaining_getter is None
-                or not retention_accepts_hard_fit()
                 or (coordinator and coordinator.cancellation.is_cancelled)
             ):
                 return None
@@ -4096,7 +4095,6 @@ class StreamingOrchestrator:
             *,
             attempt: int,
             request_options: Mapping[str, Any] | None = None,
-            allow_unproven: bool = False,
         ) -> tuple[int | None, int | None]:
             """Return a smaller context budget and effective output cap when available.
 
@@ -4116,7 +4114,7 @@ class StreamingOrchestrator:
                 # present at provider selection and is missing here is a
                 # reportable unavailability.
                 if budget_capable:
-                    if attempt and not allow_unproven:
+                    if attempt:
                         await emit_budget_unavailable(
                             mode="post_concrete_failure",
                             reason="capability_missing",
@@ -4132,7 +4130,7 @@ class StreamingOrchestrator:
                         attempt=attempt,
                     )
                     return None, None
-                if attempt and not allow_unproven:
+                if attempt:
                     raise ContextLengthError(
                         "Provider request_budget capability was unavailable after "
                         "reporting a concrete budget"
@@ -4146,7 +4144,7 @@ class StreamingOrchestrator:
             if inspect.isawaitable(decision):
                 decision = await decision
             if decision is None:
-                if attempt and not allow_unproven:
+                if attempt:
                     await emit_budget_unavailable(
                         mode="post_concrete_failure",
                         reason="no_decision",
@@ -4567,15 +4565,14 @@ class StreamingOrchestrator:
             turn_start_view_block: str | None,
             request_injection: tuple[str, bool] | None,
             pending_injections: list[dict[str, Any]],
-            tool_choice: str | None,
             finalization_overlay: dict[str, Any] | None,
             request_options: Mapping[str, Any] | None,
             effective_output_cap: int | None,
         ) -> ChatRequest | None:
-            """Build one provider-authorized hard-fit retry, or decline safely.
+            """Measure one semantic repair after a provider-owned rejection.
 
             The provider owns overflow classification.  This generic layer
-            only validates its public decision and replays the already-resolved
+            only validates its feedback and replays the already-resolved
             request view; it never invokes hooks, tools, or provider-specific
             error parsing.
             """
@@ -4644,63 +4641,148 @@ class StreamingOrchestrator:
 
             if coordinator and coordinator.cancellation.is_cancelled:
                 return None
-            rebuilt_base_messages = list(
-                await request_messages(
-                    retain_contents, token_budget=target, hard_fit=True
+            # A generic **kwargs getter has not opted into reactive semantic
+            # compaction. Never probe it by invocation/TypeError fallback.
+            try:
+                reason_parameter = inspect.signature(measured_view_getter).parameters.get("reason")
+            except (TypeError, ValueError):
+                reason_parameter = None
+            if (
+                not measured_compaction_capable
+                or reason_parameter is None
+                or reason_parameter.kind not in (
+                    inspect.Parameter.KEYWORD_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 )
-            )
-            rebuilt_messages = (
-                _replay_request_overlays(
-                    rebuilt_base_messages,
-                    turn_start_view_block=turn_start_view_block,
-                    request_injection=request_injection,
-                    pending_injections=pending_injections,
+            ):
+                return None
+
+            # Clone the failed request, not a fresh tool/config factory. Only
+            # Context's legal base view and the already-resolved overlays change.
+            frozen_request = failed_request.model_copy(deep=True)
+            frozen_options = deepcopy(request_options)
+            frozen_overlays = deepcopy((
+                turn_start_view_block, request_injection,
+                pending_injections, finalization_overlay,
+            ))
+            caps = [
+                cap for cap in (
+                    frozen_request.max_output_tokens, effective_output_cap, decision_cap,
                 )
-                if self._ephemeral_injection_mode == "tail"
-                else list(rebuilt_base_messages)
-            )
-            if finalization_overlay is not None:
-                rebuilt_messages.append(finalization_overlay)
-            if effective_output_cap is None:
-                retry_output_cap = decision_cap
-            elif decision_cap is None:
-                retry_output_cap = effective_output_cap
-            else:
-                retry_output_cap = min(effective_output_cap, decision_cap)
-            rebuilt_request = build_chat_request(
-                rebuilt_messages,
-                tool_choice=tool_choice,
-                max_output_tokens=retry_output_cap,
-            )
-            smaller_budget, _ = await check_request_budget(
-                rebuilt_request,
-                rebuilt_base_messages,
-                attempt=1,
-                request_options=request_options,
-                # Valid server rejection authorizes one unknown preflight retry.
-                allow_unproven=True,
-            )
-            if smaller_budget is not None:
-                logger.warning("Provider overflow recovery rebuilt request remains oversized")
+                if cap is not None
+            ]
+            retry_cap = min(caps) if caps else None
+            counted_attempts: list[tuple[ChatRequest, Any, Any]] = []
+
+            def cancelled() -> bool:
+                return bool(coordinator and coordinator.cancellation.is_cancelled)
+
+            async def count_repair(base_view: list[dict[str, Any]]) -> dict[str, Any]:
+                if cancelled():
+                    raise _MeasuredOutputFitCancelled()
+                start_block, injection, pending, final_overlay = deepcopy(frozen_overlays)
+                messages = (
+                    _replay_request_overlays(
+                        deepcopy(base_view),
+                        turn_start_view_block=start_block,
+                        request_injection=injection,
+                        pending_injections=pending,
+                    )
+                    if self._ephemeral_injection_mode == "tail"
+                    else deepcopy(base_view)
+                )
+                if final_overlay is not None:
+                    messages.append(final_overlay)
+                candidate = frozen_request.model_copy(deep=True)
+                candidate.messages = [Message(**message) for message in messages]
+                candidate.max_output_tokens = retry_cap
+                snapshot = candidate.model_dump()
+                budget = await count_measured_request(
+                    candidate, base_view, request_options=deepcopy(frozen_options)
+                )
+                if cancelled():
+                    raise _MeasuredOutputFitCancelled()
+                # Context may need an unavailable/estimate-only pressure reading
+                # before it can legally summarize the opaque prefix. Only the
+                # selected final attempt must prove a fitting provider count.
+                # count_measured_request already validates advertised envelopes.
+                attempt = {"dispatch": candidate, "budget_decision": budget}
+                counted_attempts.append((candidate, snapshot, deepcopy(budget)))
+                return attempt
+
+            transaction = None
+            selected = False
+            try:
+                # Do not offer the cap-only output ladder as semantic repair.
+                result = await measured_view_getter(
+                    provider=provider,
+                    retain_contents=list(retain_contents),
+                    count_view=count_repair,
+                    reason="provider_overflow",
+                )
+                if not isinstance(result, dict):
+                    raise ContextLengthError("Provider overflow repair returned an invalid view")
+                transaction = result.get("transaction")
+                if cancelled():
+                    return None
+                final_attempt = result.get("final_attempt")
+                if not isinstance(final_attempt, dict):
+                    raise ContextLengthError("Provider overflow repair returned an invalid attempt")
+                rebuilt_request = final_attempt.get("dispatch")
+                owned = next((
+                    (snapshot, budget)
+                    for candidate, snapshot, budget in counted_attempts
+                    if candidate is rebuilt_request
+                ), None)
+                if owned is None or not isinstance(rebuilt_request, ChatRequest):
+                    raise ContextLengthError(
+                        "Provider overflow repair did not return its counted request"
+                    )
+                snapshot, counted_budget = owned
+                if (
+                    rebuilt_request.model_dump() != snapshot
+                    or final_attempt.get("budget_decision") != counted_budget
+                ):
+                    raise ContextLengthError("Provider overflow repair changed after counting")
+                if (
+                    [message.content for message in rebuilt_request.messages]
+                    == [message.content for message in frozen_request.messages]
+                ):
+                    raise ContextLengthError("Provider overflow repair left message content unchanged")
+                count = (
+                    validate_measured_budget_decision(
+                        counted_budget, require_hard_fit=True
+                    )
+                    if counted_budget is not None else None
+                )
+                if count is None:
+                    raise ContextLengthError("Provider overflow repair requires a provider count")
+                if count >= observed:
+                    raise ContextLengthError("Provider overflow repair did not reduce the provider count")
+                counted_cap = counted_budget.get("max_output_tokens")
+                if retry_cap is not None and counted_cap is not None and counted_cap > retry_cap:
+                    raise ContextLengthError("Provider overflow repair increased the output cap")
                 await hooks.emit(
-                    "orchestrator:provider_overflow_recovery",
-                    {"result": "oversized"},
+                    "orchestrator:provider_overflow_recovery", {"result": "retry"}
                 )
+                # A rejected request still consumes the normal rate spacing.
+                self._last_provider_call_end = failed_call_end
+                await self._apply_rate_limit_delay(hooks, iteration)
+                if cancelled():
+                    return None
+                if rebuilt_request.model_dump() != snapshot:
+                    raise ContextLengthError("Provider overflow repair changed after counting")
+                if transaction is not None:
+                    committed = await transaction.commit(is_cancelled=cancelled)
+                    if not committed or cancelled():
+                        return None
+                selected = True
+                return rebuilt_request
+            except _MeasuredOutputFitCancelled:
                 return None
-            if coordinator and coordinator.cancellation.is_cancelled:
-                return None
-            logger.warning("Retrying provider generation after input-overflow recovery")
-            await hooks.emit(
-                "orchestrator:provider_overflow_recovery",
-                {"result": "retry"},
-            )
-            # A rejected request is still a provider call. Preserve the normal
-            # minimum spacing before issuing the one authorized retry.
-            self._last_provider_call_end = failed_call_end
-            await self._apply_rate_limit_delay(hooks, iteration)
-            if coordinator and coordinator.cancellation.is_cancelled:
-                return None
-            return rebuilt_request
+            finally:
+                if not selected and transaction is not None:
+                    transaction.rollback()
 
         # --- Turn-start reminder assembly (reminder-redesign-spec.md,
         # W1.2, Option D). Hoists iteration 1's provider:request emit to
@@ -5360,6 +5442,8 @@ class StreamingOrchestrator:
                     budget_decision = measured_result.get("final_attempt", {}).get(
                         "budget_decision"
                     )
+                    if isinstance(budget_decision, dict):
+                        original_output_cap = budget_decision.get("max_output_tokens")
                     if measured_stream_count is not None and isinstance(budget_decision, dict):
                         measurement = budget_decision["measurement"]
                         estimated = budget_decision["estimated_input_tokens"]
@@ -5588,7 +5672,6 @@ class StreamingOrchestrator:
                             turn_start_view_block=replay_turn_start_block,
                             request_injection=replay_request_injection,
                             pending_injections=replay_pending_injections,
-                            tool_choice=None,
                             finalization_overlay=None,
                             request_options=request_options,
                             effective_output_cap=(
@@ -5657,7 +5740,6 @@ class StreamingOrchestrator:
                         turn_start_view_block=replay_turn_start_block,
                         request_injection=replay_request_injection,
                         pending_injections=replay_pending_injections,
-                        tool_choice=None,
                         finalization_overlay=None,
                         request_options=request_options,
                         effective_output_cap=(
@@ -6193,6 +6275,8 @@ class StreamingOrchestrator:
                         budget_decision = measured_result.get("final_attempt", {}).get(
                             "budget_decision"
                         )
+                        if isinstance(budget_decision, dict):
+                            original_output_cap = budget_decision.get("max_output_tokens")
                         if (
                             measured_final_count(measured_result) is not None
                             and isinstance(budget_decision, dict)
@@ -6421,7 +6505,6 @@ class StreamingOrchestrator:
                         turn_start_view_block=None,
                         request_injection=final_replay_request_injection,
                         pending_injections=final_replay_pending_injections,
-                        tool_choice="none",
                         finalization_overlay=finalization_overlay,
                         request_options=request_options,
                         effective_output_cap=(
