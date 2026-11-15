@@ -155,6 +155,46 @@ async def test_pause_during_finalization_preserves_exact_request_and_settled_eff
 
 
 @pytest.mark.asyncio
+async def test_prepared_finalization_resume_preserves_owned_local_refit(tmp_path):
+    context, coordinator, owner = setup_owner(tmp_path)
+    refused = RuntimeError("owned local refusal")
+    class Provider(BatchProvider):
+        refits = 0
+        attempts = 0
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            return {"estimated_input_tokens": 10, "input_limit_tokens": 10000,
+                    "context_token_budget": 10000,
+                    "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10}}
+        def refit_request(self, request, *, error, context_estimate, request_options=None):
+            assert error is refused and request.tool_choice == "none"
+            self.refits += 1
+            return self.request_budget(
+                request, context_estimate=context_estimate, request_options=request_options)
+        async def complete(self, request, **kwargs):
+            self.attempts += 1
+            if self.attempts == 2:
+                raise refused
+            return await super().complete(request, **kwargs)
+    class Hooks(ScriptedHooks):
+        providers = 0
+        async def emit(self, event, data=None):
+            if event == "provider:request":
+                self.providers += 1
+                if self.providers == 2:
+                    owner.hold = True
+            return await super().emit(event, data)
+    provider, tool, hooks = Provider(count=1), OrderedTool(count=1), Hooks({})
+    config = {"max_iterations": 1}
+    args = (context, {"main": provider}, {"mock_tool": tool}, hooks, coordinator)
+    with pytest.raises(ExecutionSuspended) as stopped:
+        await StreamingOrchestrator(config).execute("work", *args)
+    assert stopped.value.continuation["phase"] == "prepared_finalization"
+    owner.hold = False
+    assert await StreamingOrchestrator(config).resume(stopped.value.continuation, *args) == "done"
+    assert provider.attempts == 3 and provider.refits == 1 and tool.completed == [0]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pause_at", [
     "turn-return", "eval-return", "judge-return",
     "eval-hook", "judge-hook", "summary-hook", "continuation-hook",

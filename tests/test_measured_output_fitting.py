@@ -678,3 +678,69 @@ async def test_measured_protected_floor_error_finalizes_goal_without_generation(
     assert len(complete) == 1
     assert complete[0]["status"] == "error" and complete[0]["goal_final"] is True
     assert [p["state"] for p in hooks.payloads("orchestrator:goal_progress")] == ["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("finalization", [False, True])
+@pytest.mark.parametrize("output_fitting", [False, True])
+async def test_count_and_output_fit_envelopes_bind_exact_effective_request_options(
+    streaming, finalization, output_fitting
+):
+    from amplifier_core.message_models import ToolCall
+    context, _ = await _context_with_protected_markers()
+    coordinator, hooks = _Coordinator(), _Hooks()
+    envelopes, fit_envelopes = [], []
+    class Provider(_MeasuredTransport):
+        def request_budget(self, request, *, context_estimate, request_options=None):
+            result = super().request_budget(
+                request, context_estimate=context_estimate, request_options=request_options)
+            if not output_fitting:
+                result["input_limit_tokens"] = 100_000
+            return result
+        def parse_tool_calls(self, response):
+            if finalization and len(self.requests) == 1:
+                return [ToolCall(id="one", name="preserved_tool", arguments={})]
+            return []
+    provider = Provider(fit_at=32_000)
+    if streaming:
+        async def stream(request, *, tools):
+            provider.requests.append(request)
+            yield {"content": "streamed"}
+        provider.stream = stream
+
+    async def measured(*, provider, retain_contents, count_view, fit_output=None):
+        async def counted(view):
+            envelope = await count_view(view)
+            assert envelope["request_options"] == provider.counted_options[-1]
+            assert envelope["request_options"] is not provider.counted_options[-1]
+            envelopes.append(envelope)
+            return envelope
+        async def fitted(view, attempt):
+            envelope = await fit_output(view, attempt)
+            if envelope is not None:
+                assert envelope["request_options"] == provider.counted_options[-1]
+                assert envelope["request_options"] is not provider.counted_options[-1]
+                fit_envelopes.append(envelope)
+            return envelope
+        return await context.get_measured_request_view(
+            provider=provider, retain_contents=retain_contents,
+            count_view=counted, fit_output=fitted)
+    coordinator.register_capability("context.measured_request_view", measured)
+    loop = StreamingOrchestrator({
+        "extended_thinking": True, "max_iterations": 1 if finalization else 3,
+        "ephemeral_injection_mode": "tail", "reminder_placement": "tail",
+    })
+    await loop.execute(
+        "LATEST-USER-MARKER", context, {"main": provider},
+        {"preserved_tool": _Tool()}, hooks, coordinator)
+    assert envelopes and bool(fit_envelopes) is output_fitting
+    for request in provider.requests:
+        selected = next(e for e in envelopes + fit_envelopes if e["dispatch"] is request)
+        expected = {"extended_thinking": True} if not streaming or request.tool_choice == "none" else {}
+        assert selected["request_options"] == expected
+    assert all(options == {"extended_thinking": True} for options in provider.complete_options)
+    before = deepcopy([e["request_options"] for e in envelopes + fit_envelopes])
+    for options in provider.counted_options:
+        options["later"] = True
+    assert [e["request_options"] for e in envelopes + fit_envelopes] == before

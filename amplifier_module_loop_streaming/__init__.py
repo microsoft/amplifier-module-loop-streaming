@@ -45,6 +45,10 @@ from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 
 from ._text_estimate import estimate_messages
 from ._request_refit import RefitProvider
+from .media import (SettledToolResult, stage_result, settle_result, text_only_messages,
+                    checkpoint_settled_results, report_consumer_ready,
+                    validate_prepared_media,
+                    capability as media_capability, post_result as media_post_result)
 from .steering import SteeringQueue
 from .suspension import (ExecutionSuspended, ToolExecutionSuspended, NestedExecutionHeld, ResumingTool,
                          canonical_copy, fingerprint, validate as validate_continuation)
@@ -52,8 +56,50 @@ from .suspension import (ExecutionSuspended, ToolExecutionSuspended, NestedExecu
 logger = logging.getLogger(__name__)
 
 
+class _MediaRequestLifetime:
+    """Own only Loop-created count associations, never Context's candidates."""
+
+    def __init__(self):
+        self.current = None
+
+    def track(self, provider, request, options):
+        release = getattr(provider, "release_media_request", None)
+        if not callable(release):
+            return
+        frozen = deepcopy(options)
+        if self.current is not None:
+            old_provider, old_request, old_options = self.current
+            if old_provider is provider and old_request is request and old_options == frozen:
+                return
+            self.close()
+        # Register before the awaited count, including its refusal/cancel paths.
+        self.current = (provider, request, frozen)
+
+    def close(self):
+        if self.current is not None:
+            provider, request, options = self.current
+            provider.release_media_request(request, request_options=options)
+            self.current = None
+
+
 class _MeasuredOutputFitCancelled(BaseException):
     """Unwind Context's staged fit into Loop's cooperative cancellation path."""
+
+
+def _canonical_stream_tools(provider, model, request_options):
+    support = getattr(provider, "get_stream_request_support", None)
+    if not callable(support):
+        return False
+    value = support(model=model, request_options=deepcopy(request_options))
+    return (isinstance(value, dict) and set(value) == {"v", "tools"}
+            and type(value["v"]) is int and value["v"] == 1
+            and value["tools"] == "chat_request")
+
+
+def _effective_request_model(provider, request, request_options, default_model):
+    if isinstance(request_options, Mapping) and request_options.get("model") is not None:
+        return request_options["model"]
+    return getattr(request, "model", None) or default_model(provider)
 
 
 def _build_tool_spec(tool: Any) -> ToolSpec:
@@ -190,6 +236,8 @@ def _flatten_message_for_evaluator(
             btype = block.get("type")
             if btype == "text":
                 parts.append(block.get("text", ""))
+            elif btype in {"image", "image_url", "input_image"}:
+                parts.append("[Image unavailable in text-only evaluation; no pixels supplied.]")
             elif btype == "tool_call":
                 name = block.get("name", "?")
                 # `input` is the tool-call-argument dict per ToolCallBlock's
@@ -212,6 +260,9 @@ def _flatten_message_for_evaluator(
         text = "\n".join(p for p in parts if p)
     else:
         text = str(content)
+    media = (msg.get("metadata") or {}).get("experimental.media.v1")
+    if isinstance(media, dict) and media.get("refs"):
+        text += "\n[Image unavailable in text-only evaluation; no pixels supplied.]"
     return f"{role}: {text}" if text else ""
 
 
@@ -777,6 +828,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_capability("session.steer", orchestrator.steer)
     coordinator.register_capability("tools.dispatch", orchestrator.approved_dispatch)
     coordinator.register_capability("model.complete", orchestrator.approved_dispatch.complete)
+    coordinator.register_capability("tools.dispatch.media_refs", orchestrator.approved_dispatch.media_refs)
     # Conversation-scope provider pin (see ConversationProviderPin). Registered
     # as a capability, NOT read from config, so an app can detect its absence
     # (`get_capability` -> None) under a different orchestrator and refuse
@@ -784,6 +836,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_capability(
         "conversation.provider_pin", ConversationProviderPin(orchestrator, coordinator)
     )
+    await report_consumer_ready(coordinator)
     logger.info(
         "Mounted StreamingOrchestrator with steering and "
         "conversation-provider-pin capabilities"
@@ -2146,7 +2199,11 @@ class StreamingOrchestrator:
             return
         entries = self._goal_turn_evidence["tools"]
         captured = 0
-        for tool_call, (_, tool_name, result) in zip(tool_calls, tool_results):
+        for tool_call, settled in zip(tool_calls, tool_results):
+            settled = SettledToolResult.from_legacy(settled)
+            tool_name, result = settled.tool_name, settled.content
+            if settled.metadata.get("experimental.media.v1"):
+                result += "\n[Image unavailable in text-only goal evidence; no pixels supplied.]"
             try:
                 arguments = json.dumps(tool_call.arguments, default=str)
             except (TypeError, ValueError):
@@ -2769,6 +2826,13 @@ class StreamingOrchestrator:
         }
 
     async def _goal_utility_boundary(self, kind, provider_name, request, kwargs, coordinator):
+        # Utilities are intentionally text-only, including saved utility
+        # requests. Never let a provider wrapper interpret refs as visual input.
+        request.messages = [Message(**message) for message in text_only_messages(
+            [message.model_dump(exclude_none=True) for message in request.messages],
+            reason="[Image unavailable in text-only utility; no pixels supplied.]",
+            images=True,
+        )]
         owner = coordinator.get_capability("execution.suspension") if coordinator else None
         if owner is not None and owner.requested():
             self._goal_utility_prepared = canonical_copy({
@@ -3594,9 +3658,12 @@ class StreamingOrchestrator:
             try:
                 prior = settled[index] if settled else None
                 if prior and "result" in prior:
-                    return tuple(prior["result"])
-                return await self._execute_tool_only(
-                    call, mounted_by_call[index], hooks, parallel_group_id, coordinator)
+                    result = SettledToolResult.from_legacy(prior["result"])
+                    if result.tool_call_id != call.id or result.tool_name != call.name:
+                        raise ValueError("Settled tool identity does not match call")
+                    return result
+                return SettledToolResult.from_legacy(await self._execute_tool_only(
+                    call, mounted_by_call[index], hooks, parallel_group_id, coordinator))
             except ToolExecutionSuspended as suspended:
                 return suspended
             except Exception as error:
@@ -3613,7 +3680,8 @@ class StreamingOrchestrator:
                     error={"code": "resume_dispatch_failed", "message": str(error),
                            "retryable": False},
                 )
-                return call.id, call.name, json.dumps(result.model_dump())
+                return SettledToolResult(call.id, call.name, json.dumps(result.model_dump()),
+                                         result=result.model_dump(), success=False)
 
         tool_tasks = [asyncio.ensure_future(dispatch(index, call))
                       for index, call in enumerate(tool_calls)]
@@ -3643,6 +3711,7 @@ class StreamingOrchestrator:
             preserved = 0
             for tc, task in zip(tool_calls, tool_tasks):
                 content: str | None = None
+                metadata = {}
                 if task.done() and not task.cancelled():
                     task_exc = task.exception()
                     if task_exc is None:
@@ -3652,7 +3721,8 @@ class StreamingOrchestrator:
                             content = json.dumps({"status": "cancelled", "outcome": "suspended",
                                                   "effects": "not_rolled_back"})
                         else:
-                            _done_id, _done_name, content = result
+                            result = SettledToolResult.from_legacy(result)
+                            content, metadata = result.content, result.metadata
                             preserved += 1
                     else:
                         # Finished by raising something that is not a
@@ -3670,6 +3740,7 @@ class StreamingOrchestrator:
                         "name": tc.name,
                         "tool_call_id": tc.id,
                         "content": content,
+                        **({"metadata": metadata} if metadata else {}),
                     }
                 )
             logger.info(
@@ -3720,7 +3791,8 @@ class StreamingOrchestrator:
             # All admitted siblings settled. Preserve successful results without
             # representing a suspended delegate as a completed tool result.
             outcomes = [({"continuation": result.continuation}
-                         if isinstance(result, ToolExecutionSuspended) else {"result": list(result)})
+                         if isinstance(result, ToolExecutionSuspended) else
+                         {"result": SettledToolResult.from_legacy(result).model_dump()})
                         for result in tool_results]
             await self._suspend_at_boundary("settling_tools", iteration, context, coordinator,
                                             tool_calls, settled_tools=outcomes)
@@ -3732,15 +3804,8 @@ class StreamingOrchestrator:
             # MUST add tool results to context before returning
             # Otherwise we leave orphaned tool_calls without matching tool_results
             # which violates provider API contracts (Anthropic, OpenAI)
-            for tool_call_id, tool_name, content in tool_results:
-                await context.add_message(
-                    {
-                        "role": "tool",
-                        "name": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "content": content,
-                    }
-                )
+            for result in tool_results:
+                await context.add_message(SettledToolResult.from_legacy(result).message())
             # Emit cancel:requested on first detection and trigger cleanup callbacks
             if not self._cancel_requested_emitted:
                 self._cancel_requested_emitted = True
@@ -3782,41 +3847,50 @@ class StreamingOrchestrator:
 
         # Add all results to context in original order (sequential, deterministic)
         # Note: Context manager handles compaction internally when get_messages_for_request() is called
-        for tool_call_id, tool_name, content in tool_results:
-            await context.add_message(
-                {
-                    "role": "tool",
-                    "name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "content": content,
-                }
-            )
+        for result in tool_results:
+            await context.add_message(SettledToolResult.from_legacy(result).message())
 
         # tool:post precedes this ordered append. Only now is the
         # settled batch ready for a host-owned durable checkpoint.
         # Keep older hosts compatible, but do not dispatch again when
         # a host that promises persistence cannot complete its write.
-        checkpoint = (
-            coordinator.get_capability("session.durable_checkpoint")
-            if coordinator
-            else None
-        )
-        if checkpoint is not None:
-            try:
-                if not callable(checkpoint):
-                    raise TypeError("session.durable_checkpoint is not callable")
-                checkpoint_result = checkpoint()
-                if inspect.isawaitable(checkpoint_result):
-                    checkpoint_result = await checkpoint_result
-                if checkpoint_result is False:
-                    raise RuntimeError("session.durable_checkpoint returned False")
-            except Exception as exc:
-                raise RuntimeError(
-                    "Durable session checkpoint failed; refusing further provider dispatch"
-                ) from exc
+        await checkpoint_settled_results(coordinator, has_media=any(
+            SettledToolResult.from_legacy(result).metadata.get("experimental.media.v1")
+            for result in tool_results
+        ))
         return True
 
     async def _execute_stream(
+        self, prompt, context, providers, tools, hooks, coordinator=None, *,
+        continuation=None,
+    ) -> AsyncIterator[tuple[str, int]]:
+        """Bound private count candidates to this exact execution lifetime."""
+        lifetime = _MediaRequestLifetime()
+        stream = self._execute_stream_scoped(
+            prompt, context, providers, tools, hooks, coordinator,
+            continuation=continuation, media_lifetime=lifetime,
+        )
+        failed = False
+        try:
+            async for item in stream:
+                yield item
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                await stream.aclose()
+            finally:
+                try:
+                    lifetime.close()
+                except BaseException:
+                    if not failed:
+                        raise
+                    # Do not replace the original refusal/cancellation or log
+                    # provider exceptions that may contain private request data.
+                    logger.warning("Exact media request cleanup failed during execution exit")
+
+    async def _execute_stream_scoped(
         self,
         prompt: str,
         context,
@@ -3824,7 +3898,7 @@ class StreamingOrchestrator:
         tools: dict[str, Any],
         hooks: HookRegistry,
         coordinator: ModuleCoordinator | None = None,
-        *, continuation: dict[str, Any] | None = None,
+        *, continuation: dict[str, Any] | None = None, media_lifetime,
     ) -> AsyncIterator[tuple[str, int]]:
         """
         Internal streaming execution.
@@ -4049,7 +4123,10 @@ class StreamingOrchestrator:
         ) -> ChatRequest:
             tools_list = [_build_tool_spec(tool) for tool in tools.values()] if tools else None
             kwargs: dict[str, Any] = {
-                "messages": [Message(**message) for message in message_dicts],
+                "messages": [Message(**message) for message in (
+                    message_dicts if media_capability(coordinator) is not None
+                    else text_only_messages(message_dicts)
+                )],
                 "tools": tools_list,
                 "reasoning_effort": self.config.get("reasoning_effort"),
             }
@@ -4106,6 +4183,12 @@ class StreamingOrchestrator:
             then must fail locally rather than turn an unknown result into a
             fit and send an unchecked request.
             """
+            if request.tool_choice != "none" and stream_provider and _canonical_stream_tools(
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
+                request_options or {},
+            ) != canonical_stream_tools:
+                raise RuntimeError("Stream tool-input contract changed before count; replan required")
             request_budget = getattr(provider, "request_budget", None)
             if not budget_capable or not callable(request_budget):
                 # A provider that never advertised the capability keeps the
@@ -4140,6 +4223,7 @@ class StreamingOrchestrator:
             budget_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
             if accepts_named_request_options(request_budget):
                 budget_kwargs["request_options"] = request_options
+            media_lifetime.track(provider, request, budget_kwargs.get("request_options"))
             decision = request_budget(request, **budget_kwargs)
             if inspect.isawaitable(decision):
                 decision = await decision
@@ -4222,6 +4306,12 @@ class StreamingOrchestrator:
             progression.  Retaining the old envelope validation here keeps a
             malformed advertised provider budget fail-closed.
             """
+            if request.tool_choice != "none" and stream_provider and _canonical_stream_tools(
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
+                request_options or {},
+            ) != canonical_stream_tools:
+                raise RuntimeError("Stream tool-input contract changed before count; replan required")
             request_budget = getattr(provider, "refit_request" if refit_error is not None else "request_budget", None)
             if not callable(request_budget):
                 await emit_budget_unavailable(
@@ -4234,6 +4324,7 @@ class StreamingOrchestrator:
                 kwargs["error"] = refit_error
             if accepts_named_request_options(request_budget):
                 kwargs["request_options"] = request_options
+            media_lifetime.track(provider, request, kwargs.get("request_options"))
             decision = request_budget(request, **kwargs)
             if inspect.isawaitable(decision):
                 decision = await decision
@@ -4328,6 +4419,38 @@ class StreamingOrchestrator:
             return validate_measured_budget_decision(
                 decision, require_hard_fit=True
             )
+
+        async def revalidate_prepared_media_budget(request, request_options, original_output_cap):
+            """Rebind a restored canonical object to a fresh private count.
+
+            A continuation can save refs/options, never a process-local adapter
+            association. Do not replay request hooks, context assembly or tools,
+            and do not change the already selected output cap to obtain a fit.
+            """
+            if not any(
+                (message.metadata or {}).get("experimental.media.v1", {}).get("refs")
+                for message in request.messages
+                if isinstance((message.metadata or {}).get("experimental.media.v1"), dict)
+            ):
+                return None
+            decision = await count_measured_request(
+                request, [message.model_dump(mode="json") for message in request.messages],
+                request_options=request_options,
+            )
+            count = (validate_measured_budget_decision(decision, require_hard_fit=True)
+                     if decision is not None else None)
+            if count is None:
+                raise RuntimeError("Prepared media request requires a fresh provider count")
+            output_cap = decision.get("max_output_tokens")
+            # None on the canonical request means provider default, not an
+            # unknown allowance when the original count saved that default.
+            effective_cap = (request.max_output_tokens if request.max_output_tokens is not None
+                             else original_output_cap)
+            if output_cap is not None and (
+                effective_cap is None or effective_cap > output_cap
+            ):
+                raise ContextLengthError("Prepared media request output cap changed; refit required")
+            return count
 
         def foreground_usage_recorder() -> Any | None:
             """Claim one Context's foreground meter immediately before dispatch."""
@@ -4499,8 +4622,10 @@ class StreamingOrchestrator:
                 candidate.messages.extend(
                     Message(**message) for message in degraded_output_warning(cap)
                 )
+                counted_options = deepcopy(dict(request_options or {}))
+                options_snapshot = deepcopy(counted_options)
                 decision = await count_measured_request(
-                    candidate, base_view, request_options=request_options
+                    candidate, base_view, request_options=counted_options
                 )
                 if coordinator and coordinator.cancellation.is_cancelled:
                     raise _MeasuredOutputFitCancelled()
@@ -4516,6 +4641,7 @@ class StreamingOrchestrator:
                     return {
                         "dispatch": candidate,
                         "budget_decision": decision,
+                        "request_options": options_snapshot,
                         "count_calls": count_calls,
                     }
             return None
@@ -4698,20 +4824,31 @@ class StreamingOrchestrator:
                 )
                 if final_overlay is not None:
                     messages.append(final_overlay)
+                # The failed request already used the capability-dependent
+                # media projection. Replacing only its messages must retain
+                # that policy without rebuilding tools/config or hydrating refs.
+                if media_capability(coordinator) is None:
+                    messages = text_only_messages(messages)
                 candidate = frozen_request.model_copy(deep=True)
                 candidate.messages = [Message(**message) for message in messages]
                 candidate.max_output_tokens = retry_cap
                 snapshot = candidate.model_dump()
+                counted_options = deepcopy(frozen_options)
                 budget = await count_measured_request(
-                    candidate, base_view, request_options=deepcopy(frozen_options)
+                    candidate, base_view, request_options=counted_options
                 )
                 if cancelled():
                     raise _MeasuredOutputFitCancelled()
+                if counted_options != frozen_options:
+                    raise ContextLengthError("Provider overflow repair options changed during counting")
                 # Context may need an unavailable/estimate-only pressure reading
                 # before it can legally summarize the opaque prefix. Only the
                 # selected final attempt must prove a fitting provider count.
                 # count_measured_request already validates advertised envelopes.
-                attempt = {"dispatch": candidate, "budget_decision": budget}
+                attempt = {
+                    "dispatch": candidate, "budget_decision": budget,
+                    "request_options": deepcopy(frozen_options),
+                }
                 counted_attempts.append((candidate, snapshot, deepcopy(budget)))
                 return attempt
 
@@ -4753,10 +4890,33 @@ class StreamingOrchestrator:
                         "Provider overflow repair did not return its counted request"
                     )
                 snapshot, counted_budget = owned
-                if (
-                    rebuilt_request.model_dump() != snapshot
-                    or final_attempt.get("budget_decision") != counted_budget
-                ):
+
+                def repair_changed() -> bool:
+                    # Callback ownership alone is insufficient: another count
+                    # abandons the prior private media association. Never send
+                    # that earlier request or silently prepare it again.
+                    lifetime_changed = (
+                        callable(getattr(provider, "release_media_request", None))
+                        and (
+                            media_lifetime.current is None
+                            or media_lifetime.current[0] is not provider
+                            or media_lifetime.current[1] is not rebuilt_request
+                        )
+                    )
+                    return (
+                        rebuilt_request.model_dump() != snapshot
+                        or final_attempt.get("budget_decision") != counted_budget
+                        or final_attempt.get("request_options") != frozen_options
+                        or request_options != frozen_options
+                        or lifetime_changed
+                        or (
+                            media_capability(coordinator) is None
+                            and any((message.metadata or {}).get("experimental.media.v1")
+                                    for message in rebuilt_request.messages)
+                        )
+                    )
+
+                if repair_changed():
                     raise ContextLengthError("Provider overflow repair changed after counting")
                 if (
                     [message.content for message in rebuilt_request.messages]
@@ -4792,7 +4952,7 @@ class StreamingOrchestrator:
                 await self._apply_rate_limit_delay(hooks, iteration)
                 if cancelled():
                     return None
-                if rebuilt_request.model_dump() != snapshot:
+                if repair_changed():
                     raise ContextLengthError("Provider overflow repair changed after counting")
                 if transaction is not None:
                     # Commit may await compaction-event delivery. Veto while
@@ -4801,17 +4961,14 @@ class StreamingOrchestrator:
                     committed = await transaction.commit(
                         is_cancelled=lambda: (
                             cancelled()
-                            or rebuilt_request.model_dump() != snapshot
-                            or final_attempt.get("budget_decision") != counted_budget
+                            or repair_changed()
                         )
                     )
-                    if (
-                        rebuilt_request.model_dump() != snapshot
-                        or final_attempt.get("budget_decision") != counted_budget
-                    ):
+                    if repair_changed():
                         raise ContextLengthError("Provider overflow repair changed after counting")
                     if not committed or cancelled():
                         return None
+                validate_prepared_media(rebuilt_request, coordinator)
                 selected = True
                 return rebuilt_request
             except _MeasuredOutputFitCancelled:
@@ -4933,6 +5090,12 @@ class StreamingOrchestrator:
                 return False
             if coordinator and coordinator.cancellation.is_cancelled:
                 raise asyncio.CancelledError
+            if streaming and _canonical_stream_tools(
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
+                request_options,
+            ) != canonical_stream_tools:
+                return False
             if streaming:
                 recorder = foreground_usage_recorder()
                 if callable(recorder):
@@ -4940,6 +5103,14 @@ class StreamingOrchestrator:
             await hooks.emit('orchestrator:request_refit', {
                 'attempt': 1, 'phase': 'before_transport', 'result': 'refitted',
             })
+            if coordinator and coordinator.cancellation.is_cancelled:
+                raise asyncio.CancelledError
+            if streaming and _canonical_stream_tools(
+                provider, _effective_request_model(
+                    provider, request, request_options, self._provider_default_model),
+                request_options,
+            ) != canonical_stream_tools:
+                return False
             return True
 
         if callable(getattr(provider, 'refit_request', None)):
@@ -5002,6 +5173,9 @@ class StreamingOrchestrator:
                     and continuation["phase"] == "prepared_request" else None)
         final_prepared = (continuation.get("prepared_request") if continuation
                           and continuation["phase"] == "prepared_finalization" else None)
+        for saved in (prepared, final_prepared):
+            if saved is not None:
+                validate_prepared_media(ChatRequest(**saved["request"]), coordinator)
         while prepared is not None or self.max_iterations == -1 or iteration < self.max_iterations:
             # Check for cancellation at iteration start
             if coordinator and coordinator.cancellation.is_cancelled:
@@ -5016,6 +5190,7 @@ class StreamingOrchestrator:
                 if stream_provider != prepared["stream"]:
                     raise ValueError("Prepared request transport changed")
                 request_options = prepared["request_options"]
+                canonical_stream_tools = prepared.get("canonical_stream_tools", False)
                 dispatch_base_messages = prepared["dispatch_base_messages"]
                 retained_contents = prepared["retained_contents"]
                 replay_turn_start_block = prepared["replay_turn_start_block"]
@@ -5024,6 +5199,13 @@ class StreamingOrchestrator:
                 original_output_cap = prepared["original_output_cap"]
                 measured_stream_count = prepared["measured_stream_count"]
                 overflow_retried = prepared.get("overflow_retried", False)
+                restored_count = await revalidate_prepared_media_budget(
+                    chat_request, request_options, original_output_cap)
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    await exit_for_cancellation()
+                    return
+                if restored_count is not None:
+                    measured_stream_count = restored_count
                 prepared = None
             else:
                 await self._suspend_at_boundary("provider", iteration, context, coordinator)
@@ -5414,6 +5596,8 @@ class StreamingOrchestrator:
                     if self.extended_thinking and not stream_provider
                     else {}
                 )
+                canonical_stream_tools = stream_provider and _canonical_stream_tools(
+                    provider, self._provider_default_model(provider), request_options)
                 measured_transaction = None
                 measured_stream_count = None
                 if measured_compaction_capable:
@@ -5436,13 +5620,16 @@ class StreamingOrchestrator:
                             else list(base_view)
                         )
                         candidate_request = build_chat_request(candidate_messages)
+                        counted_options = deepcopy(dict(options))
+                        options_snapshot = deepcopy(counted_options)
                         return {
                             "dispatch": candidate_request,
                             "budget_decision": await count_measured_request(
                                 candidate_request,
                                 base_view,
-                                request_options=options,
+                                request_options=counted_options,
                             ),
+                            "request_options": options_snapshot,
                         }
 
                     try:
@@ -5462,6 +5649,11 @@ class StreamingOrchestrator:
                                 "context.measured_request_view did not return a ChatRequest dispatch"
                             )
                         measured_stream_count = measured_final_count(measured_result)
+                        selected_attempt = measured_result["final_attempt"]
+                        if "request_options" in selected_attempt:
+                            if not isinstance(selected_attempt["request_options"], Mapping):
+                                raise TypeError("Measured dispatch request_options is not a mapping")
+                            request_options = deepcopy(dict(selected_attempt["request_options"]))
                         measured_base_view = measured_result.get("base_view")
                         if not isinstance(measured_base_view, list) or not all(
                             isinstance(message, dict) for message in measured_base_view
@@ -5667,6 +5859,7 @@ class StreamingOrchestrator:
                     "request": request.model_dump(mode="json"),
                     "overflow_retried": retried,
                     "request_options": request_options,
+                    "canonical_stream_tools": canonical_stream_tools,
                     "dispatch_base_messages": dispatch_base_messages,
                     "retained_contents": retained_contents,
                     "replay_turn_start_block": replay_turn_start_block,
@@ -5700,6 +5893,8 @@ class StreamingOrchestrator:
                         hooks,
                         coordinator,
                         provider_name=provider_name,
+                        canonical_stream_tools=canonical_stream_tools,
+                        request_options=request_options,
                         recover_overflow=partial(
                             recover_context_overflow,
                             chat_request,
@@ -5728,17 +5923,23 @@ class StreamingOrchestrator:
                         hooks,
                         coordinator,
                         provider_name=provider_name,
+                        canonical_stream_tools=canonical_stream_tools,
+                        request_options=request_options,
                         on_stream_error=record_unavailable_stream_usage,
                     )
-                async for chunk in response_stream:
-                    # Check for immediate cancellation between chunks
-                    if coordinator and coordinator.cancellation.is_immediate:
-                        # Clear pending steers: immediate cancellation ends the turn,
-                        # and any steer queued during streaming must not leak into a
-                        # future turn — matching the other cancellation exits. (spec §5.2)
-                        self._steering_queue.clear()
-                        return
-                    yield (chunk, iteration)
+                try:
+                    async for chunk in response_stream:
+                        # Check for immediate cancellation between chunks
+                        if coordinator and coordinator.cancellation.is_immediate:
+                            # Steers cannot outlive this cancelled turn.
+                            self._steering_queue.clear()
+                            return
+                        yield (chunk, iteration)
+                finally:
+                    # Settle the owned iterator before abandoning a count
+                    # association; the provider may still have an active send.
+                    await self._close_async_iterator(
+                        response_stream, description="provider response stream")
 
                 # Update rate limit timestamp after streaming completes
                 self._last_provider_call_end = time.monotonic()
@@ -6241,6 +6442,11 @@ class StreamingOrchestrator:
                     original_output_cap = final_prepared["original_output_cap"]
                     final_overflow_retried = final_prepared["overflow_retried"]
                     final_measured_transaction = None
+                    await revalidate_prepared_media_budget(
+                        max_iter_chat_request, request_options, original_output_cap)
+                    if coordinator and coordinator.cancellation.is_cancelled:
+                        await exit_for_cancellation()
+                        return
                 else:
                     # Preserve the normal declarations, including provider-native
                     # specifications, so any assistant tool call and paired tool
@@ -6274,13 +6480,16 @@ class StreamingOrchestrator:
                             candidate_request = build_chat_request(
                                 candidate_messages, tool_choice="none"
                             )
+                            counted_options = deepcopy(dict(options))
+                            options_snapshot = deepcopy(counted_options)
                             return {
                                 "dispatch": candidate_request,
                                 "budget_decision": await count_measured_request(
                                     candidate_request,
                                     base_view,
-                                    request_options=options,
+                                    request_options=counted_options,
                                 ),
+                                "request_options": options_snapshot,
                             }
 
                         measured_result = await request_measured_view(
@@ -6299,6 +6508,11 @@ class StreamingOrchestrator:
                                 "context.measured_request_view did not return a ChatRequest dispatch"
                             )
                         measured_final_count(measured_result)
+                        selected_attempt = measured_result["final_attempt"]
+                        if "request_options" in selected_attempt:
+                            if not isinstance(selected_attempt["request_options"], Mapping):
+                                raise TypeError("Measured finalization request_options is not a mapping")
+                            request_options = deepcopy(dict(selected_attempt["request_options"]))
                         final_measured_base_view = measured_result.get("base_view")
                         if not isinstance(final_measured_base_view, list) or not all(
                             isinstance(message, dict) for message in final_measured_base_view
@@ -6702,6 +6916,8 @@ class StreamingOrchestrator:
         recover_overflow=None,
         on_unconfirmed_stream=None,
         before_retry=None,
+        canonical_stream_tools=False,
+        request_options=None,
     ) -> AsyncIterator[str]:
         """Forward a stream, retrying exactly once before its first SDK chunk."""
         while True:
@@ -6719,6 +6935,8 @@ class StreamingOrchestrator:
                 hooks,
                 coordinator,
                 provider_name=provider_name,
+                canonical_stream_tools=canonical_stream_tools,
+                request_options=request_options,
                 on_provider_chunk=mark_provider_chunk,
                 on_stream_error=on_unconfirmed_stream,
             )
@@ -6754,6 +6972,8 @@ class StreamingOrchestrator:
         provider_name=None,
         on_provider_chunk=None,
         on_stream_error=None,
+        canonical_stream_tools=False,
+        request_options=None,
     ) -> AsyncIterator[str]:
         """Stream tokens from provider that supports streaming.
 
@@ -6774,7 +6994,15 @@ class StreamingOrchestrator:
         # Convert tools dict to list for provider
         tools_list = list(tools.values()) if tools else []
         try:
-            stream_iter = provider.stream(chat_request, tools=tools_list)
+            if _canonical_stream_tools(
+                provider, _effective_request_model(
+                    provider, chat_request, request_options, self._provider_default_model),
+                request_options or {},
+            ) != canonical_stream_tools:
+                raise RuntimeError("Stream tool-input contract changed after fitting; replan required")
+            stream_iter = (provider.stream(chat_request, **(request_options or {}))
+                           if canonical_stream_tools
+                           else provider.stream(chat_request, tools=tools_list))
         except ContextLengthError:
             if on_stream_error is not None:
                 on_stream_error()
@@ -6993,7 +7221,7 @@ class StreamingOrchestrator:
                     pre_result, "tool:pre", tool_call.name
                 )
                 if pre_result.action == "deny":
-                    return (
+                    return SettledToolResult(
                         tool_call.id,
                         tool_call.name,
                         f"Denied by hook: {pre_result.reason}",
@@ -7012,7 +7240,7 @@ class StreamingOrchestrator:
                         "parallel_group_id": parallel_group_id,
                     },
                 )
-                return (tool_call.id, tool_call.name, error_msg)
+                return SettledToolResult(tool_call.id, tool_call.name, error_msg)
 
             # Approval and policy hooks may await. Recheck at actual admission,
             # before recording a start or invoking any effect. This call was
@@ -7076,26 +7304,26 @@ class StreamingOrchestrator:
                         else:
                             coordinator._tool_dispatch_contexts[asyncio.current_task()] = _previous_dispatch
 
+            # Ingest rich content before any tool:post observer serializes it.
+            result, media_cap, staged_refs = await stage_result(result, coordinator, tool_call)
             # Serialize result for logging
             result_data = (
                 result.model_dump() if hasattr(result, "model_dump") else str(result)
             )
+            original_result_data = deepcopy(result_data)
 
             # Post-tool hook
-            post_result = await hooks.emit(
-                TOOL_POST,
+            post_state = await media_post_result(
+                hooks, coordinator, tool_call,
                 {
                     "tool_name": tool_call.name,
                     "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
                     "parallel_group_id": parallel_group_id,
-                },
+                }, media_cap, staged_refs,
             )
-            if coordinator:
-                await coordinator.process_hook_result(
-                    post_result, "tool:post", tool_call.name
-                )
+            post_result = post_state.hook_result
 
             # Store ephemeral injection from tool:post for next iteration
             if (
@@ -7114,25 +7342,10 @@ class StreamingOrchestrator:
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
 
-            # Check if a hook modified the tool result.
-            # hooks.emit() chains modify actions: when a hook
-            # returns action="modify", the data dict is replaced.
-            # We detect this by checking if the returned "result"
-            # is a different object than what we originally sent.
-            modified_result = None
-            if post_result and post_result.data is not None:
-                returned_result = post_result.data.get("result")
-                if returned_result is not None and returned_result is not result_data:
-                    modified_result = returned_result
-
-            if modified_result is not None:
-                if isinstance(modified_result, (dict, list)):
-                    content = json.dumps(modified_result)
-                else:
-                    content = str(modified_result)
-            else:
-                content = result.get_serialized_output()
-            return (tool_call.id, tool_call.name, content)
+            return await settle_result(
+                tool_call, result, result_data, original_result_data, post_state,
+                media_cap, staged_refs, coordinator,
+            )
 
         except Exception as e:
             # Safety net: errors become error messages
@@ -7147,7 +7360,7 @@ class StreamingOrchestrator:
                     "parallel_group_id": parallel_group_id,
                 },
             )
-            return (tool_call.id, tool_call.name, error_msg)
+            return SettledToolResult(tool_call.id, tool_call.name, error_msg)
 
     async def _execute_tool_with_result(self, tool_call, tools, context, hooks, coordinator=None):
         if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
@@ -7245,25 +7458,24 @@ class StreamingOrchestrator:
                     else:
                         coordinator._tool_dispatch_contexts[asyncio.current_task()] = _previous_dispatch
 
+            result, media_cap, staged_refs = await stage_result(result, coordinator, tool_call)
             # Serialize result for logging
             result_data = (
                 result.model_dump() if hasattr(result, "model_dump") else str(result)
             )
+            original_result_data = deepcopy(result_data)
 
             # Post-tool hook
-            post_result = await hooks.emit(
-                TOOL_POST,
+            post_state = await media_post_result(
+                hooks, coordinator, tool_call,
                 {
                     "tool_name": tool_call.name,
                     "tool_call_id": tool_call.id,
                     "tool_input": tool_call.arguments,
                     "result": result_data,
-                },
+                }, media_cap, staged_refs,
             )
-            if coordinator:
-                await coordinator.process_hook_result(
-                    post_result, "tool:post", tool_call.name
-                )
+            post_result = post_state.hook_result
 
             # Store ephemeral injection from tool:post for next iteration
             if (
@@ -7282,41 +7494,26 @@ class StreamingOrchestrator:
                     f"Stored ephemeral injection from tool:post ({tool_call.name}) for next iteration"
                 )
 
-            # Check if a hook modified the tool result.
-            # hooks.emit() chains modify actions: when a hook
-            # returns action="modify", the data dict is replaced.
-            # We detect this by checking if the returned "result"
-            # is a different object than what we originally sent.
-            modified_result = None
-            if post_result and post_result.data is not None:
-                returned_result = post_result.data.get("result")
-                if returned_result is not None and returned_result is not result_data:
-                    modified_result = returned_result
-
-            if modified_result is not None:
-                if isinstance(modified_result, (dict, list)):
-                    tool_content = json.dumps(modified_result)
-                else:
-                    tool_content = str(modified_result)
-            else:
-                tool_content = result.get_serialized_output()
-
-            await context.add_message(
-                {
-                    "role": "tool",
-                    "name": tool_call.name,
-                    "tool_call_id": tool_call.id,
-                    "content": tool_content,
-                }
+            settled = await settle_result(
+                tool_call, result, result_data, original_result_data, post_state,
+                media_cap, staged_refs, coordinator,
             )
+            await context.add_message(settled.message())
             response_added = True
+            await checkpoint_settled_results(
+                coordinator, has_media=bool(settled.metadata.get("experimental.media.v1"))
+            )
 
             return {
-                "success": result.success,
-                "error": result.error if not result.success else None,
+                "success": settled.success,
+                "error": settled.result.get("error") if isinstance(settled.result, dict) else None,
             }
 
         except Exception as e:
+            if response_added:
+                # The effect/result already settled. Checkpoint failure must
+                # stop subsequent dispatch, not become an ordinary tool error.
+                raise
             # Safety net: Ensure a tool response is ALWAYS added to prevent orphaned tool calls
             logger.error(
                 f"Unexpected error executing tool {tool_call.name}: {e}", exc_info=True
