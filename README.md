@@ -168,25 +168,55 @@ or absence of earlier provider calls is claimed by this cleanup.
 ### Provider-reported overflow recovery
 
 A provider may optionally expose synchronous `recover_context_overflow` to
-turn its own `ContextLengthError` into one smaller context target. The loop
+turn its own `ContextLengthError` into private, request-bound feedback. The loop
 uses it only before a normal or finalization request has yielded an SDK chunk
-or returned a response, only when retention explicitly supports `hard_fit`,
-and only once for that outbound generation. The recovered view replays the
-already-resolved retention and request overlays without rerunning hooks or
-tools; a finalization retry keeps `tool_choice="none"`.
+or returned a response, and only once for that outbound generation. Recovery
+prefers both measured capabilities above with a Context getter that explicitly
+advertises a keyword-capable `reason` parameter. Otherwise, a retention getter
+that explicitly advertises keyword-capable `hard_fit` may build the legal
+provider-targeted view. `**kwargs` alone or an uninspectable callable does not
+advertise either contract. Without either qualified path, recovery declines.
+The loop never probes support by invocation or retries an implementation
+`TypeError`; a reason-aware measured-path failure never falls back to retention.
 
 Recovery feedback must be a strict budget dictionary: non-boolean integer
 fields, an observed input above its allowance, and a positive target smaller
-than the failed context estimate. A retry is preflighted with the same complete
-options and the same or lower wire output cap. A fitting preflight retries;
-`None` is an explicitly unproven retry authorized by the server rejection; an
-over-budget, malformed, cancelled, or second-overflow path propagates without
-another send. The generic loop neither parses provider error messages nor
+than the failed context estimate. Only after accepting that feedback does the
+loop call `context.measured_request_view(..., reason="provider_overflow")`, or
+the legacy retention getter with the feedback target and `hard_fit=True`.
+Context may semantically compact an eligible prefix even when the public
+text-only pressure is low; its legal retention and protected-content rules
+still apply. The recovered view replays the already-resolved overlays on a deep
+clone of the failed request, preserving selected model, tools, options, metadata,
+and finalization's `tool_choice="none"`, with the same or lower output cap.
+
+The exact callback-owned counted request must be returned unchanged. Message
+content must differ from the failed request: a deep copy, metadata change, or
+output-cap-only change is not semantic repair. Both its safety-reserved
+`estimated_input_tokens` and strict `provider_count` must fit the smaller of the
+server-reported rejected-request allowance and the fresh counted allowance.
+The strict count must also be smaller than the server's observed rejected
+input count. Context may receive `None` or estimate-only intermediate pressure
+readings so it can compact an opaque prefix; only the final selected attempt
+authorizes a retry. Missing, `None`, estimate-only, malformed, unchanged, non-reducing,
+over-budget, cancelled, and second-overflow paths make no further foreground
+send. Initial `None` preflight still permits the first request; it never permits
+an unproven retry. A selected measured transaction commits at the retry dispatch
+boundary after rate spacing; refusal or cancellation rolls an open transaction back.
+Counted request and decision snapshots are checked again across the commit
+await, with a veto while the transaction is still open.
+Legacy hard-fit retention may commit compaction delivery before returning its
+view, as its existing contract permits; it provides no dispatch-owned transaction
+to roll back after counting. That path still uses the same frozen request
+assembly, provider count and final admission checks, and a failed count never
+permits a foreground retry.
+Hooks and tools do not rerun. The generic loop neither parses error messages nor
 knows provider-private feedback formats. `orchestrator:provider_overflow_recovery`
 records only the scalar recovery result.
 
-When a provider reports its effective output cap, an oversized compacted view
-is also preflighted with progressively smaller response reserves: 50%, 40%,
+During ordinary preflight (not reactive overflow repair), when a provider reports
+its effective output cap, an oversized compacted view is also preflighted with
+progressively smaller response reserves: 50%, 40%,
 30%, 20%, and 10% of the original cap, then 1,000 tokens. These are local
 preflights: they do not resend a provider request or omit input. At caps below
 10,000 tokens, a view-only system reminder asks the model to tell the user that

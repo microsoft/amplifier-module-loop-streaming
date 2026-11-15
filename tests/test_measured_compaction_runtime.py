@@ -121,6 +121,45 @@ class _MeasuredProvider(RequestCapturingProvider):
         return response
 
 
+class _RepairMeasuredContext(_MeasuredContext):
+    """Explicit reactive-contract fixture; ordinary pressure remains unchanged."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._messages.append({"role": "assistant", "content": "old history" * 100})
+        self.repair_reasons: list[str] = []
+
+    async def get_measured_request_view(
+        self, *, provider, retain_contents, count_view, reason=None
+    ):
+        if reason is None:
+            return await super().get_measured_request_view(
+                provider=provider, retain_contents=retain_contents, count_view=count_view
+            )
+        assert reason == "provider_overflow"
+        self.repair_reasons.append(reason)
+        base_view = [
+            {"role": "assistant", "content": "History summary."}
+            if message.get("content") == "old history" * 100 else message
+            for message in self._messages
+        ]
+        transaction = _Transaction()
+        self.transactions.append(transaction)
+        try:
+            attempt = await count_view(base_view)
+            self.measured_calls.append((provider, list(retain_contents)))
+            return {
+                "base_view": base_view,
+                "final_attempt": attempt,
+                "outcome": "compacted",
+                "count_calls": 1,
+                "transaction": transaction,
+            }
+        except BaseException:
+            transaction.rollback()
+            raise
+
+
 @pytest.mark.asyncio
 async def test_measured_view_counts_and_dispatches_the_identical_request_once() -> None:
     context = _MeasuredContext()
@@ -163,7 +202,7 @@ async def test_measured_view_counts_and_dispatches_the_identical_request_once() 
 
 @pytest.mark.asyncio
 async def test_measured_overflow_recovery_uses_context_base_view_and_retries_once() -> None:
-    context = _MeasuredContext()
+    context = _RepairMeasuredContext()
     provider = _MeasuredProvider(fail_first=True)
     coordinator = _retaining_coordinator(context)
     coordinator.register_capability(
@@ -182,7 +221,10 @@ async def test_measured_overflow_recovery_uses_context_base_view_and_retries_onc
     assert provider.complete_calls == 2
     assert len(provider.budget_calls) == 2
     assert len(provider.requests) == 2
-    assert context.request_calls[-1][1] == 1
+    assert context.request_calls == []
+    assert context.repair_reasons == ["provider_overflow"]
+    assert provider.requests[1] is provider.budget_calls[1]
+    assert [transaction.committed for transaction in context.transactions] == [1, 1]
 
 
 @pytest.mark.asyncio
@@ -353,7 +395,7 @@ async def test_measured_finalization_commit_veto_closes_tool_turn_without_send()
 
 @pytest.mark.asyncio
 async def test_measured_finalization_recovery_uses_context_base_view_once() -> None:
-    context = _MeasuredContext()
+    context = _RepairMeasuredContext()
     provider = _MeasuredFinalizingProvider()
     coordinator = _retaining_coordinator(context)
     coordinator.register_capability(
@@ -371,8 +413,11 @@ async def test_measured_finalization_recovery_uses_context_base_view_once() -> N
 
     assert provider.call_count == 3
     assert len(provider.budget_calls) == 3
-    assert context.request_calls[-1][1] == 1
-    assert [transaction.committed for transaction in context.transactions] == [1, 1]
+    assert context.request_calls == []
+    assert context.repair_reasons == ["provider_overflow"]
+    assert provider.requests[-1] is provider.budget_calls[-1]
+    assert provider.requests[-1].tool_choice == "none"
+    assert [transaction.committed for transaction in context.transactions] == [1, 1, 1]
 
 
 @pytest.mark.asyncio
@@ -506,7 +551,7 @@ async def test_rejected_measured_stream_marks_its_count_stale_before_retry() -> 
                 raise ContextLengthError("stream rejected input")
             yield {"content": "recovered"}
 
-    context = _MeasuredContext()
+    context = _RepairMeasuredContext()
     provider = RecoveringMeasuredStreamProvider()
     coordinator = _retaining_coordinator(context)
     recorded: list[tuple[object, object]] = []
@@ -551,7 +596,7 @@ async def test_synchronously_rejected_measured_stream_marks_count_stale_before_r
 
             return recovered()
 
-    context = _MeasuredContext()
+    context = _RepairMeasuredContext()
     provider = SynchronousRejectingStreamProvider()
     coordinator = _retaining_coordinator(context)
     recorded: list[tuple[object, object]] = []

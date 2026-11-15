@@ -9,6 +9,7 @@ from amplifier_core.message_models import ChatResponse, TextBlock, ToolCall
 from amplifier_module_loop_streaming import ExecutionSuspended, StreamingOrchestrator
 from amplifier_module_loop_streaming.suspension import ToolExecutionSuspended
 from tests.test_approved_dispatch import environment  # noqa: F401
+from tests.test_measured_compaction_runtime import _Transaction
 from tests.test_provider_overflow_recovery import RecoveringStreamProvider, _overflow
 
 pytestmark = pytest.mark.asyncio
@@ -173,7 +174,7 @@ async def test_public_stream_recovery_hold_retains_prepared_retry(environment, t
     coordinator.register_capability("execution.suspension", owner)
     coordinator.register_capability("execution.resume", owner.claim)
     entered, release = asyncio.Event(), asyncio.Event()
-    views, delays, requests, hold_at_send, closed = [], [], [], [], []
+    views, delays, requests, hold_at_send, closed, transactions = [], [], [], [], [], []
     old = "old history " * 100
     await context.add_message({"role": "assistant", "content": old})
 
@@ -182,14 +183,30 @@ async def test_public_stream_recovery_hold_retains_prepared_retry(environment, t
             entered.set()
             await release.wait()
 
-    async def retention(*, provider, retain_contents, token_budget=None, hard_fit=False):
-        views.append((token_budget, hard_fit))
+    async def measured_view(*, provider, retain_contents, count_view, reason=None):
+        # Deliberately opt into reactive measured repair. A legacy hard_fit-only
+        # fixture must now decline, so it cannot exercise a prepared retry hold.
+        views.append((reason, list(retain_contents)))
         rows = await context.get_messages()
-        if hard_fit:
+        if reason is not None:
+            assert reason == "provider_overflow"
             await gate("recovery")
-            return [row for row in rows if row.get("content") != old]
-        return rows
-    coordinator.register_capability("context.request_retention", retention)
+            rows = [row for row in rows if row.get("content") != old]
+        transaction = _Transaction()
+        transactions.append(transaction)
+        try:
+            attempt = await count_view(rows)
+            return {
+                "base_view": rows,
+                "final_attempt": attempt,
+                "outcome": "compacted" if reason else "not_needed",
+                "count_calls": 1,
+                "transaction": transaction,
+            }
+        except BaseException:
+            transaction.rollback()
+            raise
+    coordinator.register_capability("context.measured_request_view", measured_view)
 
     class Provider(RecoveringStreamProvider):
         async def request_budget(self, request, *, context_estimate, request_options=None):
@@ -234,10 +251,18 @@ async def test_public_stream_recovery_hold_retains_prepared_retry(environment, t
     prepared = frame["prepared_request"]
     assert prepared["stream"] is True and prepared["overflow_retried"] is True
     assert prepared["request"]["max_output_tokens"] == 64
+    assert [reason for reason, _ in views] == [None, "provider_overflow"]
+    assert provider.counted_requests[-1].model_dump(mode="json") == prepared["request"]
+    assert len(provider.counted_requests) == 2
+    assert old not in [row["content"] for row in prepared["request"]["messages"]]
+    assert [transaction.committed for transaction in transactions] == [1, 1]
+    assert [transaction.rolled_back for transaction in transactions] == [0, 0]
     assert frame["turn"]["_llm_calls_this_turn"] == provider.stream_calls == 1
     assert hold_at_send == [False] and closed == [1]
     before = (list(views), list(delays), list(requests),
-              list(provider.budget_options), list(provider.recovery_options))
+              list(provider.budget_options), list(provider.recovery_options),
+              len(provider.counted_requests),
+              [(transaction.committed, transaction.rolled_back) for transaction in transactions])
 
     # Hold still active: explicit host refusal is not implicit authorization.
     with pytest.raises(RuntimeError, match="admission refused"):
@@ -254,7 +279,11 @@ async def test_public_stream_recovery_hold_retains_prepared_retry(environment, t
     assert provider.requests[1].model_dump(mode="json") == prepared["request"]
     assert restored._llm_calls_this_turn == provider.stream_calls == 2
     assert hold_at_send == [False, False] and closed == [1, 2]
-    assert (views, delays, requests, provider.budget_options, provider.recovery_options) == before
+    assert (views, delays, requests, provider.budget_options, provider.recovery_options,
+            len(provider.counted_requests),
+            [(transaction.committed, transaction.rolled_back) for transaction in transactions]) == before
     assert owner.claims == [frame["id"], frame["id"]] and owner.consumed == {frame["id"]}
     assert len([row for row in await context.get_messages()
                 if row["role"] == "user" and row["content"] == "work"]) == 1
+    assert any(row.get("content") == old for row in await context.get_messages())
+    assert loop._tool_calls_this_turn == restored._tool_calls_this_turn == 0
