@@ -216,6 +216,120 @@ async def test_bind_rejects_idle_and_wrong_parent(environment):
                 dispatch.bind()
 
 
+async def test_current_call_crosses_real_approval_bridge_and_stays_parallel(environment):
+    """Core runs hook/approval callbacks in tasks distinct from the emitter."""
+    _, coordinator, loop, echo = environment
+    dispatch = loop.approved_dispatch
+    ready = asyncio.Event()
+    approvals, snapshots, events = [], {}, []
+
+    async def approve(prompt, options, timeout, default):
+        current = dispatch.current_call(coordinator)
+        assert current is not None and current.tool is echo
+        assert current.identity is snapshots[current.call_id].identity
+        approvals.append(current)
+        if len(approvals) == 2:
+            ready.set()
+        await asyncio.wait_for(ready.wait(), 2)
+        return "allow"
+
+    coordinator._test_approval.request_approval = approve
+
+    async def policy(event, data):
+        current = dispatch.current_call(coordinator)
+        assert current is not None
+        assert current.name == "read" and current.call_id == data["tool_call_id"]
+        assert current.arguments == data["tool_input"]
+        assert current.input_schema == echo.input_schema
+        snapshots[current.call_id] = current
+        # A consumer cannot mutate the operation or mounted schema through its view.
+        current.arguments["value"] = "changed snapshot"
+        current.input_schema["properties"]["not_the_tool"] = {}
+        fresh = dispatch.current_call(coordinator)
+        assert fresh.arguments == data["tool_input"]
+        assert fresh.input_schema == echo.input_schema
+        with pytest.raises(RuntimeError):
+            dispatch.bind()  # Observation does not make an ordinary call a controller.
+        events.append(data["tool_call_id"])
+        return HookResult(action="ask_user", approval_prompt="Allow exact read?",
+                          approval_options=["allow", "deny"], approval_default="deny")
+
+    coordinator.hooks.register("tool:pre", policy)
+
+    async def call(identity, value):
+        with dispatch.run_scope(coordinator):
+            return await loop._execute_tool_only(
+                ToolCall(id=identity, name="read", arguments={"value": value}),
+                coordinator.get("tools"), coordinator.hooks, "parallel", coordinator)
+
+    results = await asyncio.gather(call("first", 1), call("second", 2))
+    assert {entry.call_id for entry in approvals} == {"first", "second"}
+    assert approvals[0].identity is not approvals[1].identity
+    assert sorted(events) == ["first", "second"] and echo.calls == 2
+    assert {json.loads(row[2])["output"]["value"] for row in results} == {1, 2}
+    assert dispatch.current_call(coordinator) is None
+
+
+async def test_current_call_refuses_unknown_without_hiding_hook(environment):
+    _, coordinator, loop, echo = environment
+    observed = []
+
+    async def policy(event, data):
+        observed.append(data["tool_name"])
+        assert loop.approved_dispatch.current_call(coordinator) is None
+        return HookResult()
+
+    coordinator.hooks.register("tool:pre", policy)
+    with loop.approved_dispatch.run_scope(coordinator):
+        result = await loop._execute_tool_only(
+            ToolCall(id="unknown", name="missing", arguments={}),
+            coordinator.get("tools"), coordinator.hooks, None, coordinator)
+    assert observed == ["missing"] and "not found" in result[2]
+    assert echo.calls == 0 and loop._tool_calls_this_turn == 0
+
+
+async def test_current_call_reports_changes_and_rejects_remount(environment):
+    _, coordinator, loop, echo = environment
+    dispatch = loop.approved_dispatch
+    call = ToolCall(id="same", name="read", arguments={"value": 1})
+    tools = dispatch.wrap_tools(coordinator.get("tools"))
+    with dispatch.run_scope(coordinator):
+        with dispatch.call_scope(call, tools, coordinator.hooks, None):
+            first = dispatch.current_call(coordinator)
+            assert first is not None
+            assert dispatch.current_call(SimpleNamespace()) is None
+            call.arguments["value"] = 2
+            changed = dispatch.current_call(coordinator)
+            assert changed.identity is first.identity
+            assert changed.arguments != first.arguments
+            echo.input_schema = {"type": "object", "required": ["value"]}
+            assert dispatch.current_call(coordinator).input_schema != first.input_schema
+            dispatch.validate_context = lambda _: False
+            assert dispatch.current_call(coordinator) is None
+            dispatch.validate_context = None
+            await coordinator.mount("tools", Echo(), name="read")
+            assert dispatch.current_call(coordinator) is None
+    assert dispatch.current_call(coordinator) is None
+
+
+async def test_inherited_current_call_expires_after_parent_returns(environment):
+    _, coordinator, loop, _ = environment
+    dispatch = loop.approved_dispatch
+    release = asyncio.Event()
+
+    async def late():
+        await release.wait()
+        return dispatch.current_call(coordinator)
+
+    with dispatch.run_scope(coordinator):
+        with dispatch.call_scope(ToolCall(id="parent", name="read", arguments={}),
+                                 coordinator.get("tools"), coordinator.hooks, None):
+            assert dispatch.current_call(coordinator) is not None
+            inherited = asyncio.create_task(late())
+    release.set()
+    assert await inherited is None
+
+
 async def test_lease_cannot_cross_run_session_or_parent_scope(environment):
     _, coordinator, loop, echo = environment
     dispatch = loop.approved_dispatch
