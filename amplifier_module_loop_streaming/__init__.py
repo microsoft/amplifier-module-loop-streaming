@@ -6942,9 +6942,12 @@ class StreamingOrchestrator:
         Tool errors become results; asyncio.CancelledError still propagates so
         the caller can preserve completed sibling results during cancellation.
         """
-        if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
+        if not self._owns_dispatch_pipeline:
             return await self._execute_tool_unscoped(tool_call, tools, hooks, parallel_group_id, coordinator)
-        tools = self._streaming_dispatch.wrap_tools(tools)
+        # Ordinary calls remain observable without enabling programmatic calls
+        # or adding their serialization locks to the normal tool pipeline.
+        if self._streaming_dispatch.enabled:
+            tools = self._streaming_dispatch.wrap_tools(tools)
         with self._streaming_dispatch.call_scope(tool_call, tools, hooks, parallel_group_id):
             return await self._execute_tool_unscoped(tool_call, tools, hooks, parallel_group_id, coordinator)
 
@@ -7150,9 +7153,10 @@ class StreamingOrchestrator:
             return (tool_call.id, tool_call.name, error_msg)
 
     async def _execute_tool_with_result(self, tool_call, tools, context, hooks, coordinator=None):
-        if not self._owns_dispatch_pipeline or not self._streaming_dispatch.enabled:
+        if not self._owns_dispatch_pipeline:
             return await self._execute_tool_with_result_unscoped(tool_call, tools, context, hooks, coordinator)
-        tools = self._streaming_dispatch.wrap_tools(tools)
+        if self._streaming_dispatch.enabled:
+            tools = self._streaming_dispatch.wrap_tools(tools)
         with self._streaming_dispatch.call_scope(tool_call, tools, hooks, None):
             return await self._execute_tool_with_result_unscoped(tool_call, tools, context, hooks, coordinator)
 

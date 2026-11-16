@@ -6,11 +6,12 @@ unchecked tool execution path.
 """
 
 import asyncio
+from copy import deepcopy
 import json
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 from amplifier_core.message_models import ToolCall
@@ -30,6 +31,10 @@ class Run:
     model_calls: int = 0
 
 
+class _CallIdentity:
+    __slots__ = ("__weakref__",)
+
+
 @dataclass
 class CallScope:
     run: Run
@@ -38,6 +43,19 @@ class CallScope:
     hooks: object
     parallel_group_id: str | None
     active: bool = True
+    identity: object = field(default_factory=_CallIdentity)
+
+
+@dataclass(frozen=True)
+class CurrentToolCall:
+    """Host observation of one active call, never permission to execute it."""
+
+    identity: object
+    call_id: str
+    name: str
+    arguments: dict
+    input_schema: dict
+    tool: object
 
 
 class GuardedTool:
@@ -407,6 +425,37 @@ class ApprovedDispatch:
         lease = DispatchLease(self, scope)
         lease._valid()
         return lease
+
+    def current_call(self, coordinator):
+        """Snapshot this coordinator's active registered call without a lease.
+
+        Arguments/schema are detached copies; identity is opaque and expires
+        with the existing call scope. Consumers must validate their own policy
+        and re-read the snapshot at actual execution. Unknown tools, remounts,
+        unsupported schemas and calls outside this dispatch scope return None.
+        This does not alter hook order, admission or tool-owned validation.
+        """
+        scope, run = _CALL.get(), _RUN.get()
+        if (scope is None or run is None or scope.run is not run
+                or run.owner is not self or run.coordinator is not coordinator
+                or not scope.active or not run.active
+                or coordinator.cancellation.is_cancelled
+                or self.validate_context is not None
+                and self.validate_context(coordinator) is not True):
+            return None
+        name = scope.call.name
+        tool = scope.tools.get(name)
+        # Only our own execution adapters may be unwrapped. A resumed operation
+        # is not a new invocation of the mounted tool and stays unsupported.
+        while isinstance(tool, GuardedTool):
+            tool = tool.tool
+        if tool is None or (coordinator.get("tools") or {}).get(name) is not tool:
+            return None
+        schema, arguments = getattr(tool, "input_schema", None), scope.call.arguments
+        if not isinstance(schema, dict) or not isinstance(arguments, dict):
+            return None
+        return CurrentToolCall(scope.identity, scope.call.id, name,
+                               deepcopy(arguments), deepcopy(schema), tool)
 
     async def complete(self, request):
         """A bounded, attributed ordinary inference call for an active caller.
