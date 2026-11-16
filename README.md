@@ -39,6 +39,14 @@ Provides streaming orchestration that delivers LLM responses token-by-token for 
 - Progressive rendering
 - Interruptible generation
 
+### Unknown tool names
+
+A model call naming an unavailable tool returns the existing failure result with
+the original call ID and name, allowing the model to correct its next call. It
+does not invoke `tool:pre`, request permission, resolve an alias or execute a
+tool. A subsequent call to an available tool follows the normal policy and
+approval path. Model-call budgets still apply; unknown names do not reset them.
+
 ### Goals changed during a turn
 
 Hosts may set `coordinator.session_state["goal"]` before execution or while a

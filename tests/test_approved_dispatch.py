@@ -183,6 +183,69 @@ async def test_coordinator_approval_rejection_is_preserved(environment):
     assert echo.calls == 0
 
 
+@pytest.mark.parametrize("serial", [False, True])
+@pytest.mark.parametrize("answer", ["allow", "deny"])
+async def test_unknown_tool_does_not_request_approval_before_corrected_call(
+    environment, serial, answer
+):
+    _, coordinator, loop, echo = environment
+    approval = coordinator._test_approval
+    approval.answer = answer
+    context = coordinator.get("context")
+    policy_calls = []
+
+    async def policy(event, data):
+        policy_calls.append(data["tool_name"])
+        return HookResult(
+            action="ask_user",
+            approval_prompt="Allow " + data["tool_name"] + "?",
+            approval_options=["allow", "deny"],
+            approval_default="deny",
+        )
+
+    coordinator.hooks.register("tool:pre", policy)
+
+    async def dispatch(call):
+        with loop.approved_dispatch.run_scope(coordinator):
+            if serial:
+                result = await loop._execute_tool_with_result(
+                    call, coordinator.get("tools"), context,
+                    coordinator.hooks, coordinator,
+                )
+                messages = await context.get_messages()
+                return result, messages[-1]
+            call_id, name, content = await loop._execute_tool_only(
+                call, coordinator.get("tools"), coordinator.hooks, "group", coordinator,
+            )
+            return None, {"tool_call_id": call_id, "name": name, "content": content}
+
+    result, message = await dispatch(
+        ToolCall(id="unknown", name="mcp_9_read", arguments={})
+    )
+    assert message["tool_call_id"] == "unknown"
+    assert message["name"] == "mcp_9_read"
+    assert message["content"] == "Error: Tool 'mcp_9_read' not found"
+    if serial:
+        assert result["success"] is False
+    assert policy_calls == []
+    assert approval.calls == []
+    assert echo.calls == 0
+
+    _, corrected = await dispatch(
+        ToolCall(id="corrected", name="read", arguments={"value": 42})
+    )
+    assert corrected["tool_call_id"] == "corrected"
+    assert corrected["name"] == "read"
+    assert policy_calls == ["read"]
+    assert approval.calls == ["Allow read?"]
+    if answer == "allow":
+        assert json.loads(corrected["content"])["output"] == {"value": 42}
+        assert echo.calls == 1
+    else:
+        assert "denied" in corrected["content"].lower()
+        assert echo.calls == 0
+
+
 async def test_post_hook_modified_output_and_unknown_outcome_are_preserved(environment):
     _, coordinator, _, _ = environment
 
