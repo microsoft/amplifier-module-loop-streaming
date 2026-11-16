@@ -576,3 +576,16 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Unavailable tool names
+
+A call whose exact name is absent from the mounted tool registry returns the
+existing correlated tool-not-found result before `tool:pre` policy or approval
+hooks. There is nothing executable to approve. The parallel dispatch path keeps
+its existing `tool:error` event; sequential dispatch keeps its tool-result message.
+The model can issue a later call using an exact available name.
+
+Known calls still follow the ordinary hook, schema, mode and permission paths.
+Their registry lookup remains after awaited hooks, including when a hook changes
+the mounted tool. No alias is resolved, tool execution is not counted for a
+missing name, and the existing iteration and finalization limits are unchanged.

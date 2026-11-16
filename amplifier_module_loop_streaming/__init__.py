@@ -6978,26 +6978,29 @@ class StreamingOrchestrator:
         look safe while it was overwriting completed work.
         """
         try:
-            # Pre-tool hook
-            pre_result = await hooks.emit(
-                TOOL_PRE,
-                {
-                    "tool_name": tool_call.name,
-                    "tool_call_id": tool_call.id,
-                    "tool_input": tool_call.arguments,
-                    "parallel_group_id": parallel_group_id,
-                },
-            )
-            if coordinator:
-                pre_result = await coordinator.process_hook_result(
-                    pre_result, "tool:pre", tool_call.name
+            # Missing names are not executable and must not request approval.
+            # Keep the ordinary lookup after awaited hooks for known names.
+            if tool_call.name in tools:
+                # Pre-tool hook
+                pre_result = await hooks.emit(
+                    TOOL_PRE,
+                    {
+                        "tool_name": tool_call.name,
+                        "tool_call_id": tool_call.id,
+                        "tool_input": tool_call.arguments,
+                        "parallel_group_id": parallel_group_id,
+                    },
                 )
-                if pre_result.action == "deny":
-                    return (
-                        tool_call.id,
-                        tool_call.name,
-                        f"Denied by hook: {pre_result.reason}",
+                if coordinator:
+                    pre_result = await coordinator.process_hook_result(
+                        pre_result, "tool:pre", tool_call.name
                     )
+                    if pre_result.action == "deny":
+                        return (
+                            tool_call.id,
+                            tool_call.name,
+                            f"Denied by hook: {pre_result.reason}",
+                        )
 
             # Get tool
             tool = tools.get(tool_call.name)
@@ -7172,31 +7175,34 @@ class StreamingOrchestrator:
         response_added = False
 
         try:
-            # Pre-tool hook
-            pre_result = await hooks.emit(
-                TOOL_PRE,
-                {
-                    "tool_name": tool_call.name,
-                    "tool_call_id": tool_call.id,
-                    "tool_input": tool_call.arguments,
-                },
-            )
-            if coordinator:
-                pre_result = await coordinator.process_hook_result(
-                    pre_result, "tool:pre", tool_call.name
+            # Missing names are not executable and must not request approval.
+            # Keep the ordinary lookup after awaited hooks for known names.
+            if tool_call.name in tools:
+                # Pre-tool hook
+                pre_result = await hooks.emit(
+                    TOOL_PRE,
+                    {
+                        "tool_name": tool_call.name,
+                        "tool_call_id": tool_call.id,
+                        "tool_input": tool_call.arguments,
+                    },
                 )
-                if pre_result.action == "deny":
-                    # Add tool_result message (not system) so Anthropic API accepts it
-                    await context.add_message(
-                        {
-                            "role": "tool",
-                            "name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                            "content": f"Tool execution denied: {pre_result.reason}",
-                        }
+                if coordinator:
+                    pre_result = await coordinator.process_hook_result(
+                        pre_result, "tool:pre", tool_call.name
                     )
-                    response_added = True
-                    return {"success": False, "error": f"Denied: {pre_result.reason}"}
+                    if pre_result.action == "deny":
+                        # Add tool_result message (not system) so Anthropic API accepts it
+                        await context.add_message(
+                            {
+                                "role": "tool",
+                                "name": tool_call.name,
+                                "tool_call_id": tool_call.id,
+                                "content": f"Tool execution denied: {pre_result.reason}",
+                            }
+                        )
+                        response_added = True
+                        return {"success": False, "error": f"Denied: {pre_result.reason}"}
 
             # Get tool
             tool = tools.get(tool_call.name)
