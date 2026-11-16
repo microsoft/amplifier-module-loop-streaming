@@ -551,15 +551,17 @@ Perfect for:
 ## Observing an active tool call
 
 Hosts can call `coordinator.get_capability("tools.dispatch").current_call(coordinator)`
-while an existing dispatch scope is active. It returns an immutable record with
-an opaque call identity, call ID, actual registry name, mounted tool, and detached
+while an ordinary tool call is active within the engine's execution run, including
+when programmatic dispatch is disabled or unconfigured. It returns an immutable
+record with an opaque call identity, call ID, actual registry name, mounted tool, and detached
 argument/schema copies. Missing scopes, unknown tools, changed mounts, cancelled
 runs and unsupported schemas return `None`. Resumed tool operations are not
 described as fresh invocations.
 
-This is an observation, not an execution lease or an approval. It does not change
-which calls create scopes, hook order, validation, permissions or budgets. A host
-that uses it to describe an exact approval must validate the arguments and its
+This is an observation, not an execution lease or an approval. It does not enable
+programmatic dispatch, add tool serialization, or change hook order, validation,
+permissions or budgets. Internal calls outside an execution run remain unobserved.
+A host that uses it to describe an exact approval must validate the arguments and its
 current execution context, then compare a fresh snapshot immediately before
 execution. A saved identity is not valid after the call returns. Plain-text
 approval prompts do not acquire structured authority from this capability.

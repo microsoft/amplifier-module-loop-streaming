@@ -60,7 +60,7 @@ class Client:
 
 
 @pytest_asyncio.fixture
-async def environment():
+async def environment(request):
     class Approval:
         def __init__(self):
             self.calls = []
@@ -76,15 +76,16 @@ async def environment():
             return self.answer
 
     approval = Approval()
+    config = {"min_delay_between_calls_ms": 0}
+    dispatch_setting = getattr(request, "param", True)
+    if dispatch_setting is not None:
+        config["programmatic_dispatch"] = dispatch_setting
     session = AmplifierSession(
         {
             "session": {
                 "orchestrator": {
                     "module": "loop-streaming",
-                    "config": {
-                        "min_delay_between_calls_ms": 0,
-                        "programmatic_dispatch": True,
-                    },
+                    "config": config,
                 },
                 "context": {"module": "context-simple"},
             },
@@ -217,6 +218,8 @@ async def test_bind_rejects_idle_and_wrong_parent(environment):
                 dispatch.bind()
 
 
+@pytest.mark.parametrize("environment", [True, None, False], indirect=True,
+                         ids=["enabled", "default", "disabled"])
 async def test_current_call_crosses_real_approval_bridge_and_stays_parallel(environment):
     """Core runs hook/approval callbacks in tasks distinct from the emitter."""
     _, coordinator, loop, echo = environment
@@ -343,6 +346,169 @@ async def test_current_call_identity_does_not_retain_finished_scope(environment)
             del current
             assert len(witnesses) == 1
     assert not witnesses
+
+
+@pytest.mark.parametrize("environment", [None, False], indirect=True,
+                         ids=["default", "disabled"])
+async def test_default_session_observes_approved_calls_without_dispatch_authority(environment):
+    """Real session entry, Core approval and concurrent ordinary tool effects."""
+    session, coordinator, loop, _ = environment
+    dispatch = loop.approved_dispatch
+    approved, observed, executed, inherited = [], {}, [], []
+    both_started, finished = asyncio.Event(), asyncio.Event()
+
+    async def after_turn():
+        await finished.wait()
+        return dispatch.current_call(coordinator)
+
+    class ObservedTool(Echo):
+        async def execute(self, arguments):
+            current = dispatch.current_call(coordinator)
+            assert current is not None and current.tool is self
+            assert current.identity is observed[current.call_id].identity
+            assert current.arguments == arguments
+            with pytest.raises(RuntimeError, match="authorized"):
+                dispatch.bind()
+            executed.append(current.call_id)
+            inherited.append(asyncio.create_task(after_turn()))
+            if len(executed) == 2:
+                both_started.set()
+            # This would time out if disabled dispatch accidentally serialized tools.
+            await asyncio.wait_for(both_started.wait(), 2)
+            return ToolResult(success=True, output=dict(arguments))
+
+    tool = ObservedTool()
+    await coordinator.mount("tools", tool, name="read")
+
+    async def policy(event, data):
+        current = dispatch.current_call(coordinator)
+        assert current is not None and current.call_id == data["tool_call_id"]
+        observed[current.call_id] = current
+        return HookResult(action="ask_user", approval_prompt="Allow exact read?",
+                          approval_options=["allow", "deny"], approval_default="deny")
+
+    async def approve(prompt, options, timeout, default):
+        current = dispatch.current_call(coordinator)
+        assert current is not None and current.identity is observed[current.call_id].identity
+        approved.append(current.call_id)
+        return "deny" if current.call_id == "denied" else "allow"
+
+    coordinator.hooks.register("tool:pre", policy)
+    coordinator._test_approval.request_approval = approve
+
+    class Provider:
+        name, config, calls = "fixture", {}, 0
+
+        def get_info(self):
+            return SimpleNamespace(defaults={"model": "fixture"})
+
+        def parse_tool_calls(self, response):
+            return response.tool_calls or []
+
+        async def complete(self, request, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResponse(content=[], tool_calls=[
+                    ToolCall(id=name, name="read", arguments={"value": name})
+                    for name in ("first", "second", "denied")])
+            return ChatResponse(content=[TextBlock(text="done")])
+
+    provider = Provider()
+    await coordinator.mount("providers", provider, name="fixture")
+    try:
+        assert await session.execute("Run the three ordinary calls") == "done"
+        assert sorted(approved) == ["denied", "first", "second"]
+        assert sorted(executed) == ["first", "second"]
+        assert len({id(row.identity) for row in observed.values()}) == 3
+        assert provider.calls == 2 and loop._tool_calls_this_turn == 2
+        assert not dispatch.enabled and dispatch.locks == {}
+        assert dispatch.current_call(coordinator) is None
+    finally:
+        finished.set()
+        late = await asyncio.gather(*inherited)
+    assert late == [None, None]
+
+
+@pytest.mark.parametrize("environment", [None, False], indirect=True,
+                         ids=["default", "disabled"])
+@pytest.mark.parametrize("path", ["parallel", "serial"])
+@pytest.mark.parametrize("in_run", [False, True], ids=["outside-run", "in-run"])
+async def test_default_internal_tool_paths_preserve_run_boundary(environment, path, in_run):
+    """Legacy direct helper calls still execute, but cannot invent a run witness."""
+    from contextlib import nullcontext
+
+    _, coordinator, loop, echo = environment
+    dispatch = loop.approved_dispatch
+    observed = []
+
+    async def capture(event, data):
+        current = dispatch.current_call(coordinator)
+        observed.append(current)
+        if in_run:
+            assert current is not None and current.tool is echo
+            assert current.call_id == "ordinary" and current.arguments == {"value": 1}
+        else:
+            assert current is None
+        with pytest.raises(RuntimeError, match="authorized"):
+            dispatch.bind()
+        return HookResult()
+
+    coordinator.hooks.register("tool:pre", capture)
+    scope = dispatch.run_scope(coordinator) if in_run else nullcontext()
+    with scope:
+        call = ToolCall(id="ordinary", name="read", arguments={"value": 1})
+        if path == "parallel":
+            await loop._execute_tool_only(call, coordinator.get("tools"),
+                                          coordinator.hooks, "group", coordinator)
+        else:
+            await loop._execute_tool_with_result(call, coordinator.get("tools"),
+                coordinator.get("context"), coordinator.hooks, coordinator)
+        assert dispatch.current_call(coordinator) is None
+    assert len(observed) == 1 and echo.calls == 1
+    # Core records hook exceptions without raising them to the caller. Check
+    # the observed value here too so an assertion inside the hook cannot pass
+    # this regression accidentally after being converted to a hook error.
+    assert (observed[0] is not None) is in_run
+    assert not dispatch.enabled and dispatch.locks == {}
+
+
+@pytest.mark.parametrize("environment", [None, False], indirect=True,
+                         ids=["default", "disabled"])
+async def test_default_cancelled_call_expires_inherited_observation(environment):
+    _, coordinator, loop, echo = environment
+    dispatch = loop.approved_dispatch
+    started, release = asyncio.Event(), asyncio.Event()
+    inherited = []
+
+    async def late():
+        await release.wait()
+        return dispatch.current_call(coordinator)
+
+    async def held_policy(event, data):
+        assert dispatch.current_call(coordinator) is not None
+        inherited.append(asyncio.create_task(late()))
+        started.set()
+        await asyncio.Event().wait()
+
+    coordinator.hooks.register("tool:pre", held_policy)
+
+    async def run():
+        with dispatch.run_scope(coordinator):
+            return await loop._execute_tool_only(
+                ToolCall(id="cancelled", name="read", arguments={}),
+                coordinator.get("tools"), coordinator.hooks, "group", coordinator)
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+    assert await asyncio.gather(*inherited) == [None]
+    assert echo.calls == 0 and dispatch.current_call(coordinator) is None
+    assert not dispatch.enabled and dispatch.locks == {}
 
 
 async def test_lease_cannot_cross_run_session_or_parent_scope(environment):
