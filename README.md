@@ -563,6 +563,8 @@ that uses it to describe an exact approval must validate the arguments and its
 current execution context, then compare a fresh snapshot immediately before
 execution. A saved identity is not valid after the call returns. Plain-text
 approval prompts do not acquire structured authority from this capability.
+Identities support weak references so a host can attach a short-lived witness
+without retaining completed calls.
 
 ## Dependencies
 

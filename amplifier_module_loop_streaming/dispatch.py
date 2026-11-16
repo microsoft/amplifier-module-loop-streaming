@@ -31,6 +31,10 @@ class Run:
     model_calls: int = 0
 
 
+class _CallIdentity:
+    __slots__ = ("__weakref__",)
+
+
 @dataclass
 class CallScope:
     run: Run
@@ -39,7 +43,7 @@ class CallScope:
     hooks: object
     parallel_group_id: str | None
     active: bool = True
-    identity: object = field(default_factory=object)
+    identity: object = field(default_factory=_CallIdentity)
 
 
 @dataclass(frozen=True)

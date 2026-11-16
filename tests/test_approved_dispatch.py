@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -328,6 +329,20 @@ async def test_inherited_current_call_expires_after_parent_returns(environment):
             inherited = asyncio.create_task(late())
     release.set()
     assert await inherited is None
+
+
+async def test_current_call_identity_does_not_retain_finished_scope(environment):
+    _, coordinator, loop, _ = environment
+    dispatch = loop.approved_dispatch
+    witnesses = weakref.WeakKeyDictionary()
+    with dispatch.run_scope(coordinator):
+        with dispatch.call_scope(ToolCall(id="one", name="read", arguments={}),
+                                 coordinator.get("tools"), coordinator.hooks, None):
+            current = dispatch.current_call(coordinator)
+            witnesses[current.identity] = "host approval witness"
+            del current
+            assert len(witnesses) == 1
+    assert not witnesses
 
 
 async def test_lease_cannot_cross_run_session_or_parent_scope(environment):
