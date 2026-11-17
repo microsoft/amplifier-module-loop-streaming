@@ -14,6 +14,7 @@ from PIL import Image
 
 from amplifier_module_loop_streaming import SettledToolResult, StreamingOrchestrator
 from amplifier_module_loop_streaming.media import NAMESPACE, effective_result
+from amplifier_module_loop_streaming.media import initialize_media_consumer, report_consumer_ready
 from tests.test_durable_checkpoint import BatchProvider, MockContext
 from tests.test_ephemeral_cache_persist_mode import MockCoordinator, ScriptedHooks
 
@@ -285,3 +286,120 @@ async def test_canonical_stream_tools_and_cleanup_after_iterator_close(changed):
         assert await operation == "stream done"
         assert provider.closed
     assert provider.released == provider.counted
+
+
+class StartupMedia(Media):
+    """Structural readiness spy, not a genuine Foundation construction."""
+    session_id = "root"
+    enabled = False
+
+    def __init__(self):
+        super().__init__()
+        self.reports = []
+
+    def report(self, component, **report):
+        self.reports.append((component, report))
+
+
+class StartupBoundary:
+    def __init__(self, coordinator):
+        self.coordinator = coordinator
+        self.consistent = True
+        self.valid = True
+        self.graph_receipt = None
+
+    async def __call__(self, *args, **kwargs):
+        pytest.fail("Initialization cannot execute a fake tool post")
+
+    def participant(self, component):
+        assert component == "loop-streaming"
+        return self.coordinator
+
+    def readiness(self):
+        return {"contract": 1, "registration_consistent": self.consistent,
+                "scope": "python-loader-and-explicit-host"}
+
+    def receipt_status(self, receipt):
+        return {"valid": False, "reason": "construction_not_sealed" if self.valid else "invalid"}
+
+
+@pytest.mark.parametrize("missing", [
+    None, "capability", "boundary", "checkpoint", "mounted",
+    "foreign-session", "foreign-participant", "registration", "construction",
+])
+async def test_initial_readiness_requires_actual_mount_and_participation(missing):
+    coordinator = MockCoordinator()
+    coordinator.session_id, coordinator.hooks = "root", Hooks()
+    loop, cap = StreamingOrchestrator({}), StartupMedia()
+    boundary = StartupBoundary(coordinator)
+    coordinator._mounts["orchestrator"] = loop
+    coordinator.get = coordinator._mounts.get
+    coordinator.register_capability("tools.dispatch", loop.approved_dispatch)
+    coordinator.register_capability(NAMESPACE, cap)
+    coordinator.register_capability("session.media.tool_post", boundary)
+    coordinator.register_capability("session.durable_checkpoint", lambda: pytest.fail("no synthetic save"))
+    if missing == "capability":
+        coordinator.register_capability(NAMESPACE, object())
+    elif missing in {"boundary", "checkpoint"}:
+        coordinator.register_capability(
+            "session.media.tool_post" if missing == "boundary" else "session.durable_checkpoint", None)
+    elif missing == "mounted":
+        coordinator._mounts["orchestrator"] = object()
+    elif missing == "foreign-session":
+        cap.session_id = "foreign"
+    elif missing == "foreign-participant":
+        boundary.coordinator = object()
+    elif missing == "registration":
+        boundary.consistent = False
+    elif missing == "construction":
+        boundary.valid = False
+    registration = await initialize_media_consumer(coordinator, loop, "loop-streaming")
+    assert registration._ready() is (missing is None)
+    assert cap.enabled is False and not cap.staged and not cap.publications
+    if missing != "capability":
+        assert cap.reports[-1][1]["details"] == {
+            "contract": 1, "role": "loop", "ready": missing is None, "phase": "initialization"}
+
+
+async def test_readiness_withdrawal_is_not_revived_by_old_post_observation():
+    coordinator = MockCoordinator()
+    coordinator.session_id, coordinator.hooks = "root", Hooks()
+    cap, loop = StartupMedia(), StreamingOrchestrator({})
+    boundary = StartupBoundary(coordinator)
+    coordinator.get = lambda kind: loop if kind == "orchestrator" else None
+    coordinator.register_capability(NAMESPACE, cap)
+    coordinator.register_capability("tools.dispatch", loop.approved_dispatch)
+    coordinator.register_capability("session.media.tool_post", boundary)
+    coordinator.register_capability("session.durable_checkpoint", lambda: None)
+    registration = await initialize_media_consumer(coordinator, loop, "loop-streaming")
+    assert cap.reports[-1][1]["details"]["ready"] is True
+    await registration.close()
+    assert cap.reports[-1][1]["details"]["ready"] is False
+    await report_consumer_ready(coordinator, post_complete=True)
+    await registration.refresh()
+    readiness = [report for _, report in cap.reports if report["event"] == "consumer-ready"]
+    assert [report["details"]["ready"] for report in readiness] == [True, False, False]
+
+
+async def test_consumer_readiness_preserves_host_owned_dispatch_wrapper_and_denial():
+    coordinator = MockCoordinator()
+    coordinator.session_id, coordinator.hooks = "root", Hooks()
+    cap, loop = StartupMedia(), StreamingOrchestrator({})
+    boundary = StartupBoundary(coordinator)
+    coordinator.get = lambda kind: loop if kind == "orchestrator" else None
+    coordinator.register_capability(NAMESPACE, cap)
+    coordinator.register_capability("session.media.tool_post", boundary)
+    coordinator.register_capability("session.durable_checkpoint", lambda: None)
+    calls = []
+    class HostDispatch:
+        def bind(self):
+            calls.append("denied")
+            raise PermissionError("host policy denied this dispatch")
+    wrapper = HostDispatch()
+    coordinator.register_capability("tools.dispatch", wrapper)
+    await initialize_media_consumer(coordinator, loop, "loop-streaming")
+    assert cap.reports[-1][1]["details"]["ready"] is True
+    assert coordinator.get_capability("tools.dispatch") is wrapper
+    with pytest.raises(PermissionError, match="host policy denied"):
+        coordinator.get_capability("tools.dispatch").bind()
+    assert calls == ["denied"] and loop._tool_calls_this_turn == 0

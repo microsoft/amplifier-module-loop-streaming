@@ -164,12 +164,79 @@ async def checkpoint_settled_results(coordinator, *, has_media=False):
 
 
 async def report_consumer_ready(coordinator, *, post_complete=False):
+    """Legacy post observation, never initial availability or host authority."""
     cap = capability(coordinator)
     if post_complete is True and cap is not None and tool_post_boundary(coordinator) is not None:
         await _await(cap.report(
             "loop-streaming",
-            event="consumer-ready", outcome="ready", details={"contract": 1, "role": "loop"},
+            event="tool-post-complete", outcome="observed", details={"contract": 1},
         ))
+
+
+class MediaConsumerRegistration:
+    """Availability of one actually mounted consumer, not a completed tool post.
+
+    The host still owns source selection, the sealed construction receipt and
+    enablement. Public participant identity/registration facts allow reporting
+    before that seal, without requiring enabled producers to produce a witness.
+    """
+
+    def __init__(self, coordinator, consumer, component):
+        self.coordinator, self.consumer, self.component = coordinator, consumer, component
+        self.cap = capability(coordinator)
+        self.boundary = tool_post_boundary(coordinator)
+        self.closed = False
+
+    def _ready(self):
+        coordinator, boundary = self.coordinator, self.boundary
+        try:
+            facts = boundary.readiness()
+            status = boundary.receipt_status(boundary.graph_receipt)
+            return (
+                not self.closed
+                and self.cap is not None and capability(coordinator) is self.cap
+                and tool_post_boundary(coordinator) is boundary
+                and coordinator.get("orchestrator") is self.consumer
+                and self.cap.session_id == coordinator.session_id
+                and callable(coordinator.get_capability("session.durable_checkpoint"))
+                and boundary.participant(self.component) is coordinator
+                and coordinator.hooks is boundary.participant(self.component).hooks
+                and isinstance(facts, Mapping) and type(facts.get("contract")) is int
+                and facts["contract"] == 1
+                and facts.get("registration_consistent") is True
+                and facts.get("scope") == "python-loader-and-explicit-host"
+                and isinstance(status, Mapping)
+                and (status.get("valid") is True
+                     or status.get("reason") == "construction_not_sealed")
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    async def refresh(self):
+        ready = self._ready()
+        if self.cap is not None:
+            await _await(self.cap.report(
+                self.component, event="consumer-ready",
+                outcome="ready" if ready else "unavailable",
+                details={"contract": 1, "role": "loop", "ready": ready,
+                         "phase": "initialization"},
+            ))
+        return ready
+
+    async def close(self):
+        self.closed = True
+        await self.refresh()
+
+
+async def initialize_media_consumer(coordinator, consumer, component):
+    """Bind once at the consumer's actual public mount, even while disabled."""
+    registration = MediaConsumerRegistration(coordinator, consumer, component)
+    consumer._media_consumer = registration
+    cleanup = getattr(coordinator, "register_cleanup", None)
+    if registration.cap is not None and callable(cleanup):
+        cleanup(registration.close)
+    await registration.refresh()
+    return registration
 
 
 def effective_result(hook_result, current):

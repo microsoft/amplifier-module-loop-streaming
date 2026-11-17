@@ -46,7 +46,7 @@ from amplifier_core.message_models import ChatRequest, Message, ToolSpec
 from ._text_estimate import estimate_messages
 from ._request_refit import RefitProvider
 from .media import (SettledToolResult, stage_result, settle_result, text_only_messages,
-                    checkpoint_settled_results, report_consumer_ready,
+                    checkpoint_settled_results, initialize_media_consumer,
                     validate_prepared_media,
                     capability as media_capability, post_result as media_post_result)
 from .steering import SteeringQueue
@@ -828,6 +828,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_capability(
         "conversation.provider_pin", ConversationProviderPin(orchestrator, coordinator)
     )
+    await initialize_media_consumer(coordinator, orchestrator, "loop-streaming")
     logger.info(
         "Mounted StreamingOrchestrator with steering and "
         "conversation-provider-pin capabilities"
@@ -1514,6 +1515,9 @@ class StreamingOrchestrator:
         raise ExecutionSuspended(frame)
 
     async def execute(self, prompt, context, providers, tools, hooks, coordinator=None):
+        registration = getattr(self, "_media_consumer", None)
+        if registration is not None:
+            await registration.refresh()
         # One execution authority is shared by foreground and nested tools.
         # The lease expires even when the turn fails or is cancelled.
         if not self._owns_dispatch_pipeline:

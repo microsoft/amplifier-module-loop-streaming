@@ -96,6 +96,16 @@ without replaying tools or hooks. Streaming providers may explicitly promise
 the same canonical tool specifications without a duplicate runtime `tools=`
 argument. Missing support preserves the existing transport contract.
 
+The actual consumer mount binds a session-local initialization registration.
+It reports literal `ready: true` only while that same orchestrator, media
+capability, participating hook route and callable durable checkpoint remain
+installed. This report can precede host enablement and graph sealing; it never
+claims a completed post-hook chain. Execution refreshes late checkpoint
+availability, and cleanup withdraws readiness. Hosts must require literal
+`ready is True` in addition to their independent sealed-receipt/source gates.
+Completed tool posts emit a separate observation and cannot revive readiness.
+Host-owned dispatch wrappers remain installed and keep their policy boundaries.
+
 This root/same-session contract does not qualify nested inference, child tool
 forwarding, CLI adapters, live vendors or a host's production configuration.
 
