@@ -76,6 +76,29 @@ this does not add a cancellation-recovery policy. A missing capability preserves
 the behavior of existing hosts. The Loop itself does not write transcripts.
 This checkpoint is not the earlier `tool:post` event, which precedes result append.
 
+### Host-owned root tool media
+
+Ordinary root tool calls can settle PNG/JPEG media through the optional
+`experimental.media.v1` capability and `session.media.tool_post` final-hook
+boundary. Ingestion removes inline pixels before post-hook observers. Only the
+final effective result may retain refs: explicit null, redaction and filtering
+never restore the original image. Canonical tool messages retain the original
+`tool_call_id` and refs metadata, not hydrated bytes. Media requires the settled
+durable checkpoint above before another provider dispatch.
+
+The host owns capability enablement, final-chain qualification, storage,
+checkpoint acknowledgment and provider-private projection. Loop readiness
+reports are observations, not authority. Without compatible handling, images
+become unavailable-text results. Exact counted request associations are released
+on replacement and exit; restored prepared requests require fresh counting,
+without replaying tools or hooks. Streaming providers may explicitly promise
+`get_stream_request_support(...)->{"v": 1, "tools": "chat_request"}` to consume
+the same canonical tool specifications without a duplicate runtime `tools=`
+argument. Missing support preserves the existing transport contract.
+
+This root/same-session contract does not qualify nested inference, child tool
+forwarding, CLI adapters, live vendors or a host's production configuration.
+
 ### Provider budget preflight
 
 When a provider exposes the optional `request_budget` capability, the loop
