@@ -96,6 +96,12 @@ def _effective_request_model(provider, request, request_options, default_model):
     return getattr(request, "model", None) or default_model(provider)
 
 
+class RequestMeasurementUnavailable(RuntimeError):
+    """A strict caller received no usable count. Generation was never admitted."""
+
+    count_failure = {"category": "invalid_response", "retryable": False}
+
+
 class _MeasuredOutputFitCancelled(BaseException):
     """Unwind Context's staged fit into Loop's cooperative cancellation path."""
 
@@ -3942,7 +3948,7 @@ class StreamingOrchestrator:
                 for parameter in parameters
             )
 
-        def accepts_named_request_options(method: Any) -> bool:
+        def accepts_named_option(method: Any, name: str) -> bool:
             """Whether an optional provider method explicitly accepts options.
 
             A provider with only ``**kwargs`` keeps its pre-existing call
@@ -3951,7 +3957,7 @@ class StreamingOrchestrator:
             retry the call without the keyword.
             """
             try:
-                parameter = inspect.signature(method).parameters.get("request_options")
+                parameter = inspect.signature(method).parameters.get(name)
             except (TypeError, ValueError):
                 return False
             return parameter is not None and parameter.kind in (
@@ -4207,7 +4213,7 @@ class StreamingOrchestrator:
                 return None, None
             context_estimate = estimate_messages(base_messages).tokens
             budget_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
-            if accepts_named_request_options(request_budget):
+            if accepts_named_option(request_budget, "request_options"):
                 budget_kwargs["request_options"] = request_options
             media_lifetime.track(provider, request, budget_kwargs.get("request_options"))
             decision = request_budget(request, **budget_kwargs)
@@ -4284,6 +4290,7 @@ class StreamingOrchestrator:
             *,
             request_options: Mapping[str, Any] | None,
             refit_error: Exception | None = None,
+            lifetime: _MediaRequestLifetime = media_lifetime,
         ) -> dict[str, Any] | None:
             """Count one frozen provider-facing request for the Context contract.
 
@@ -4308,38 +4315,33 @@ class StreamingOrchestrator:
             kwargs: dict[str, Any] = {"context_estimate": context_estimate}
             if refit_error is not None:
                 kwargs["error"] = refit_error
-            if accepts_named_request_options(request_budget):
+            if accepts_named_option(request_budget, "request_options"):
                 kwargs["request_options"] = request_options
-            media_lifetime.track(provider, request, kwargs.get("request_options"))
+            strict = refit_error is None and getattr(context, "requires_measured_foreground", False) is True
+            if strict and accepts_named_option(request_budget, "require_measurement"):
+                kwargs["require_measurement"] = True
+            lifetime.track(provider, request, kwargs.get("request_options"))
             decision = request_budget(request, **kwargs)
             if inspect.isawaitable(decision):
                 decision = await decision
             if decision is None:
                 if refit_error is None:
                     await emit_budget_unavailable(mode="measured", reason="no_decision")
+                if strict:
+                    raise RequestMeasurementUnavailable("No provider input count was returned")
                 return None
-            required = (
-                "estimated_input_tokens",
-                "input_limit_tokens",
-                "context_token_budget",
-            )
-            if not isinstance(decision, dict) or any(
-                isinstance(decision.get(key), bool)
-                or not isinstance(decision.get(key), int)
-                or decision[key] < 0
-                for key in required
-            ):
-                raise ContextLengthError(
-                    "Provider request_budget returned an invalid budget decision"
-                )
-            # Malformed advertised measurements still raise from here: an
-            # error must never be downgraded into a compatibility fallback.
-            # Only a structurally valid decision that carries no usable
-            # provider count is reported as an unavailable measurement.
-            if validate_measured_budget_decision(decision) is None:
-                await emit_budget_unavailable(
-                    mode="measured", reason="measurement_absent"
-                )
+            # Preserve the legacy validation contract for optional callers.
+            # A malformed counter reply provides no evidence of input overflow.
+            try:
+                measured = validate_measured_budget_decision(decision)
+            except ContextLengthError:
+                if strict:
+                    raise RequestMeasurementUnavailable("Invalid provider budget decision") from None
+                raise
+            if measured is None:
+                await emit_budget_unavailable(mode="measured", reason="measurement_absent")
+                if strict:
+                    raise RequestMeasurementUnavailable("No usable provider input count was returned")
             return decision
 
         def validate_measured_budget_decision(
@@ -4586,6 +4588,9 @@ class StreamingOrchestrator:
             decision = attempt.get("budget_decision")
             if validate_measured_budget_decision(decision) is None:
                 raise ContextLengthError("Measured output fitting requires a provider count")
+            if decision.get("input_limit_independent_of_output") is True:
+                # Reducing the output reservation cannot create any input room.
+                return None
             original_cap = decision.get("max_output_tokens")
             if original.max_output_tokens is not None and original_cap is not None:
                 original_cap = min(original_cap, original.max_output_tokens)
@@ -4686,7 +4691,7 @@ class StreamingOrchestrator:
             failed_call_end = time.monotonic()
             context_estimate = estimate_messages(base_messages).tokens
             recovery_kwargs: dict[str, Any] = {"context_estimate": context_estimate}
-            if accepts_named_request_options(recovery):
+            if accepts_named_option(recovery, "request_options"):
                 recovery_kwargs["request_options"] = request_options
             decision = recovery(failed_request, error, **recovery_kwargs)
             if decision is None:
@@ -6853,6 +6858,33 @@ class StreamingOrchestrator:
                 "status": "budget_exhausted" if self._budget_exhausted else "completed",
             },
         )
+
+        schedule = getattr(context, "schedule_settled_compaction", None)
+        if (natural_completion and measured_compaction_capable and callable(schedule)
+                and getattr(context, "requires_measured_foreground", False) is True
+                and not (coordinator and (coordinator.cancellation.is_cancelled
+                                          or coordinator.session_state.get("goal")))):
+            # This callback outlives the foreground stream. Build a new request
+            # and release its private media associations as soon as it is counted.
+            async def count_settled(view):
+                candidate = build_chat_request(view)
+                lifetime = _MediaRequestLifetime()
+                options = deepcopy(request_options)
+                try:
+                    decision = await count_measured_request(
+                        candidate, view, request_options=options, lifetime=lifetime
+                    )
+                    return {"dispatch": candidate, "budget_decision": decision,
+                            "request_options": options}
+                finally:
+                    lifetime.close()
+
+            try:
+                schedule(provider=provider, count_view=count_settled, retain_contents=retained_contents)
+            except Exception:
+                # Optional maintenance cannot retroactively fail a settled turn.
+                logger.warning("Could not schedule settled context compaction")
+
 
     async def _close_async_iterator(self, iterator: Any, *, description: str) -> None:
         """Close a provider iterator when it offers asynchronous cleanup."""

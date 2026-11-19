@@ -914,3 +914,18 @@ async def test_measured_finalization_reports_its_absent_count_once_per_call() ->
         },
     ]
     assert len(provider.budget_calls) == len(_budget_payloads(hooks))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_type", [_NoDecisionProvider, _NoMeasurementProvider])
+async def test_strict_foreground_keeps_unmeasured_requests_out_of_dispatch(provider_type):
+    from amplifier_module_loop_streaming import RequestMeasurementUnavailable
+
+    context = _CountTolerantContext()
+    context.requires_measured_foreground = True
+    provider = provider_type()
+    with pytest.raises(RequestMeasurementUnavailable):
+        await StreamingOrchestrator({}).execute(
+            "current request", context, {"main": provider}, {}, ScriptedHooks({}),
+            _measured_coordinator(context))
+    assert not provider.requests
