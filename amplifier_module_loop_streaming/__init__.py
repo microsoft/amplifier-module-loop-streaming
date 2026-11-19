@@ -4305,11 +4305,14 @@ class StreamingOrchestrator:
                 request_options or {},
             ) != canonical_stream_tools:
                 raise RuntimeError("Stream tool-input contract changed before count; replan required")
+            strict = refit_error is None and getattr(context, "requires_measured_foreground", False) is True
             request_budget = getattr(provider, "refit_request" if refit_error is not None else "request_budget", None)
             if not callable(request_budget):
                 await emit_budget_unavailable(
                     mode="measured", reason="capability_missing"
                 )
+                if strict:
+                    raise RequestMeasurementUnavailable("Provider input counting is unavailable")
                 return None
             context_estimate = estimate_messages(base_view).tokens
             kwargs: dict[str, Any] = {"context_estimate": context_estimate}
@@ -4317,7 +4320,6 @@ class StreamingOrchestrator:
                 kwargs["error"] = refit_error
             if accepts_named_option(request_budget, "request_options"):
                 kwargs["request_options"] = request_options
-            strict = refit_error is None and getattr(context, "requires_measured_foreground", False) is True
             if strict and accepts_named_option(request_budget, "require_measurement"):
                 kwargs["require_measurement"] = True
             lifetime.track(provider, request, kwargs.get("request_options"))
