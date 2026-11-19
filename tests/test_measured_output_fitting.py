@@ -678,3 +678,25 @@ async def test_measured_protected_floor_error_finalizes_goal_without_generation(
     assert len(complete) == 1
     assert complete[0]["status"] == "error" and complete[0]["goal_final"] is True
     assert [p["state"] for p in hooks.payloads("orchestrator:goal_progress")] == ["error"]
+
+
+@pytest.mark.asyncio
+async def test_independent_input_ceiling_does_not_recount_lower_output_caps():
+    class IndependentTransport(_MeasuredTransport):
+        def request_budget(self, request, *, context_estimate, request_options=None,
+                           require_measurement=False):
+            assert require_measurement is True
+            result = super().request_budget(
+                request, context_estimate=context_estimate, request_options=request_options)
+            return {**result, "input_limit_independent_of_output": True}
+
+    context, _ = await _context_with_protected_markers()
+    context.requires_measured_foreground = True
+    coordinator = _Coordinator()
+    coordinator.register_capability("context.measured_request_view", context.get_measured_request_view)
+    provider = IndependentTransport(fit_at=None)
+    with pytest.raises(ContextLengthError, match="cannot fit protected content"):
+        await StreamingOrchestrator({}).execute(
+            "Current question", context, {"main": provider}, {}, _Hooks(), coordinator)
+    assert len(provider.counted) == 1
+    assert provider.requests == []
