@@ -4079,6 +4079,14 @@ class StreamingOrchestrator:
             and provider_advertises("request_budget:provider_count")
         )
 
+        estimated_getter = None
+        if (callable(get_capability) and not budget_capable
+                and not callable(getattr(provider, "stream", None))):
+            candidate = get_capability("context.estimated_request_view")
+            if callable(candidate):
+                estimated_getter = candidate
+        context_builds_request = measured_compaction_capable or estimated_getter is not None
+
         # Pure observability. `basis` names WHY this provider won:
         # "pinned" when the conversation-scope pin decided it (capability
         # `conversation.provider_pin`), else "priority" -- the unpinned
@@ -5146,7 +5154,10 @@ class StreamingOrchestrator:
         for saved in (prepared, final_prepared):
             if saved is not None:
                 validate_prepared_media(ChatRequest(**saved["request"]), coordinator)
+        on_settled = None
         while prepared is not None or self.max_iterations == -1 or iteration < self.max_iterations:
+            # A tool continuation, resume or replacement input owns a different request.
+            on_settled = None
             # Check for cancellation at iteration start
             if coordinator and coordinator.cancellation.is_cancelled:
                 await exit_for_cancellation()
@@ -5316,12 +5327,9 @@ class StreamingOrchestrator:
                     if self._ephemeral_injection_mode == "tail"
                     else []
                 )
-                # Measured compaction must start from Context's sticky snapshot, not
-                # from an ordinary estimate-driven view.  The loop still admits all
-                # current reminders above, and captures their request-only replay
-                # plan once below; the count callback will apply that frozen plan to
-                # every candidate Context asks it to measure.
-                if measured_compaction_capable:
+                # Let Context select from its own sticky snapshot after the loop
+                # has admitted all reminders and frozen its request overlays.
+                if context_builds_request:
                     message_dicts: list[dict[str, Any]] = []
                     base_message_dicts: list[dict[str, Any]] = []
                 else:
@@ -5396,7 +5404,7 @@ class StreamingOrchestrator:
                             _, changed = await self._persist_reminder(
                                 context, result.context_injection, tail=True
                             )
-                            if changed and not measured_compaction_capable:
+                            if changed and not context_builds_request:
                                 message_dicts = list(await request_messages([]))
                                 base_message_dicts = list(message_dicts)
                     # Check if we should append to last tool result
@@ -5499,7 +5507,7 @@ class StreamingOrchestrator:
                                 verify_admitted=retaining_getter is not None,
                             )
                             retained_contents.append(content)
-                            if (changed or retaining_getter is not None) and not measured_compaction_capable:
+                            if (changed or retaining_getter is not None) and not context_builds_request:
                                 message_dicts = list(
                                     await request_messages(retained_contents)
                                 )
@@ -5570,26 +5578,28 @@ class StreamingOrchestrator:
                     provider, self._provider_default_model(provider), request_options)
                 measured_transaction = None
                 measured_stream_count = None
+                if context_builds_request:
+                    def project_view(
+                        base_view,
+                        turn_start_view_block=replay_turn_start_block,
+                        request_injection=replay_request_injection,
+                        pending_injections=replay_pending_injections,
+                    ):
+                        rows = (_replay_request_overlays(base_view,
+                            turn_start_view_block=turn_start_view_block,
+                            request_injection=request_injection,
+                            pending_injections=pending_injections)
+                            if self._ephemeral_injection_mode == "tail" else base_view)
+                        return build_chat_request(rows)
+
                 if measured_compaction_capable:
                     async def count_view(
                         base_view: list[dict[str, Any]],
                         *,
-                        turn_start_view_block: str | None = replay_turn_start_block,
-                        request_injection: tuple[str, bool] | None = replay_request_injection,
-                        pending_injections: list[dict[str, Any]] = replay_pending_injections,
                         options: Mapping[str, Any] = request_options,
+                        project=project_view,
                     ) -> dict[str, Any]:
-                        candidate_messages = (
-                            _replay_request_overlays(
-                                base_view,
-                                turn_start_view_block=turn_start_view_block,
-                                request_injection=request_injection,
-                                pending_injections=pending_injections,
-                            )
-                            if self._ephemeral_injection_mode == "tail"
-                            else list(base_view)
-                        )
-                        candidate_request = build_chat_request(candidate_messages)
+                        candidate_request = project(base_view)
                         counted_options = deepcopy(dict(options))
                         options_snapshot = deepcopy(counted_options)
                         return {
@@ -5688,6 +5698,16 @@ class StreamingOrchestrator:
                             measured_transaction.rollback()
                         await exit_for_cancellation()
                         return
+                elif estimated_getter is not None:
+                    result = await estimated_getter(provider=provider, retain_contents=retained_contents,
+                        project_view=project_view, request_options=deepcopy(request_options))
+                    base_message_dicts = result["base_view"]
+                    chat_request = result["dispatch"]
+                    if chat_request is None:
+                        chat_request = project_view(base_message_dicts)
+                    else:
+                        on_settled = result.get("on_settled")
+                    smaller_context_budget, original_output_cap = None, None
                 else:
                     chat_request = build_chat_request(message_dicts)
                     smaller_context_budget, original_output_cap = await check_request_budget(
@@ -5933,6 +5953,7 @@ class StreamingOrchestrator:
                     self._llm_calls_this_turn += 1
                     response = await provider.complete(chat_request, **request_options)
                 except ContextLengthError as error:
+                    on_settled = None  # A refusal never starts maintenance for that projection.
                     if overflow_retried:
                         raise
                     recovered_request = await recover_context_overflow(
@@ -6131,6 +6152,11 @@ class StreamingOrchestrator:
                     if not self._steering_queue.is_empty:
                         continuation_needed = True
                         continue
+                    if on_settled is not None:
+                        metadata = getattr(response, "metadata", None)
+                        if (not isinstance(metadata, Mapping) or metadata.get("provider_response_completed") is not True
+                                or getattr(response, "finish_reason", None) not in {"stop", "end_turn"}):
+                            on_settled = None
                     natural_completion = True
                     break
 
@@ -6860,6 +6886,14 @@ class StreamingOrchestrator:
                 "status": "budget_exhausted" if self._budget_exhausted else "completed",
             },
         )
+
+        if (on_settled is not None and natural_completion and self._steering_queue.is_empty
+                and not (coordinator and (coordinator.cancellation.is_cancelled
+                                          or coordinator.session_state.get("goal")))):
+            try:
+                on_settled()  # Context owns the bounded background task and its cancellation.
+            except Exception:
+                logger.warning("Could not schedule settled context compaction")
 
         schedule = getattr(context, "schedule_settled_compaction", None)
         if (natural_completion and measured_compaction_capable and callable(schedule)

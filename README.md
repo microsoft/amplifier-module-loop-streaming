@@ -151,6 +151,25 @@ error both keep their existing behavior, a malformed advertised budget stays an
 error rather than becoming a fallback, and a provider that never advertised
 `request_budget` keeps its historical silent path.
 
+### Optional settled maintenance for an uncounted reply
+
+An opted-in Context can register `context.estimated_request_view` for an ordinary
+non-streaming provider without `request_budget`. The loop supplies the retained
+reminders, request options and a `project_view` callback that builds the logical
+request with its current overlays and tool declarations. Context owns its local
+estimate, output reserve and recovery policy. It returns the matching `base_view`,
+the `dispatch` request or `None` for ordinary assembly, and optionally an
+`on_settled` callback for that dispatch.
+
+After a confirmed final answer is saved and `execution:end` completes, the loop
+may invoke the callback once to schedule Context's bounded background work.
+A provider can attest to its terminal event on the returned response with
+`metadata.provider_response_completed = true` and a normal stop reason.
+An interrupted response, tool continuation, rejected request, active goal or
+pending steer leaves that request's callback unused. Provider-declared overflow
+recovery retains its existing limits. Prepared-request resume and forced
+finalization keep their existing request paths.
+
 ### Provider-count measured compaction
 
 When both sides advertise the optional measured contracts —
