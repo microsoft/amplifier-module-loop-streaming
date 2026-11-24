@@ -4095,11 +4095,13 @@ class StreamingOrchestrator:
         # call and never via a vendor-specific attribute. See
         # `_provider_default_model`; None there means "the provider could
         # not tell us", not a guess.
+        selected_provider = provider  # The per-request refit wrapper expires with this turn.
+        resolved_model = self._provider_default_model(provider)
         await hooks.emit(
             PROVIDER_RESOLVE,
             {
                 "provider": provider_name,
-                "model": self._provider_default_model(provider),
+                "model": resolved_model,
                 "basis": (
                     "pinned" if self._pinned_provider_name is not None else "priority"
                 ),
@@ -4479,6 +4481,44 @@ class StreamingOrchestrator:
                 input_tokens=input_tokens,
                 cache_write_tokens=cache_write_tokens,
             )
+
+        def same_selected_route() -> bool:
+            return (
+                self._select_provider(providers) is selected_provider
+                and self._provider_default_model(selected_provider) == resolved_model
+            )
+
+        def prepare_settled_response(response, retain_contents):
+            if budget_capable or continuation or not callable(get_capability):
+                return None
+            metadata = getattr(response, "metadata", None)
+            if (
+                not isinstance(metadata, Mapping)
+                or metadata.get("provider_response_completed") is not True
+                or getattr(response, "finish_reason", None) not in {"stop", "end_turn"}
+            ):
+                return None
+            usage = getattr(response, "usage", None)
+            if isinstance(usage, Mapping):
+                inputs, outputs = usage.get("input_tokens"), usage.get("output_tokens")
+            else:
+                inputs = getattr(usage, "input_tokens", None)
+                outputs = getattr(usage, "output_tokens", None)
+            if type(inputs) is not int or inputs <= 0 or type(outputs) is not int or outputs < 0:
+                return None
+            try:
+                observe = get_capability("context.ordinary_settled_response")
+                if callable(observe) and same_selected_route():
+                    return observe(
+                        provider=selected_provider,
+                        retain_contents=retain_contents,
+                        input_tokens=inputs,
+                        output_tokens=outputs,
+                        prompt_characters=len(prompt),
+                    )
+            except Exception:
+                logger.warning("Could not observe settled response for context maintenance")
+            return None
 
         def record_unavailable_stream_usage() -> None:
             """Keep a prior scoped meter stale rather than reopening generic hooks."""
@@ -5092,6 +5132,7 @@ class StreamingOrchestrator:
         # no-tool break is already a complete answer, even when it happens on
         # the final permitted iteration.
         natural_completion = False
+        after_reply = None
         continuation_needed = bool(continuation and iteration)
 
         async def close_finalization_tool_turn(message: str) -> None:
@@ -6131,6 +6172,7 @@ class StreamingOrchestrator:
                     if not self._steering_queue.is_empty:
                         continuation_needed = True
                         continue
+                    after_reply = prepare_settled_response(response, retained_contents)
                     natural_completion = True
                     break
 
@@ -6860,6 +6902,20 @@ class StreamingOrchestrator:
                 "status": "budget_exhausted" if self._budget_exhausted else "completed",
             },
         )
+
+        if (
+            callable(after_reply)
+            and not self._budget_exhausted
+            and self._steering_queue.is_empty
+            and not (coordinator and (coordinator.cancellation.is_cancelled
+                                      or coordinator.session_state.get("goal")))
+        ):
+            try:
+                if same_selected_route():
+                    after_reply()
+            except Exception:
+                # Maintenance is optional. A completed answer must never be replayed.
+                logger.warning("Could not schedule settled context compaction")
 
         schedule = getattr(context, "schedule_settled_compaction", None)
         if (natural_completion and measured_compaction_capable and callable(schedule)
