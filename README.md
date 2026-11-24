@@ -165,8 +165,10 @@ Context may return a callback bound to that completed turn. The loop invokes it
 after `execution:end` while the provider/model still matches and the user has
 neither stopped nor steered the chat. Active goals and resumed execution keep
 their existing paths. Context controls whether to start bounded background
-maintenance and validates the source again. A new input can arrive before
-maintenance finishes, in which case ordinary foreground recovery still applies.
+maintenance and validates the source again. Before a fresh ordinary turn writes
+to history, the loop awaits the optional `context.wait_for_settled_checkpoint`
+capability. Context returns immediately unless its one-prefix summary call has
+already been dispatched. Foreground fitting then uses the available checkpoint.
 
 ### Provider-count measured compaction
 
