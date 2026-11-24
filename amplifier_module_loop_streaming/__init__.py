@@ -4079,6 +4079,13 @@ class StreamingOrchestrator:
             and provider_advertises("request_budget:provider_count")
         )
 
+        # Allow already-dispatched maintenance to save before the first history
+        # write of a new turn, including any persistent turn-start reminders.
+        if continuation is None and not budget_capable and callable(get_capability):
+            wait_for_checkpoint = get_capability("context.wait_for_settled_checkpoint")
+            if callable(wait_for_checkpoint):
+                await wait_for_checkpoint()
+
         # Pure observability. `basis` names WHY this provider won:
         # "pinned" when the conversation-scope pin decided it (capability
         # `conversation.provider_pin`), else "priority" -- the unpinned
