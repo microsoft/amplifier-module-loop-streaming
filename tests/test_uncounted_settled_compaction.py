@@ -1,4 +1,5 @@
 """Use the fully assembled uncounted request; settle only the reply that actually completed."""
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,6 +9,11 @@ from tests.test_ephemeral_cache_persist_mode import (
     MockCoordinator, NRoundToolProvider, OneShotTool, ScriptedHooks, ScriptedHookResult,
 )
 from tests.test_request_retention import RetainingContext
+
+
+class TerminalProvider(NRoundToolProvider):
+    def get_info(self):
+        return SimpleNamespace(id="main", defaults={}, capabilities=["response:confirmed_terminal"])
 
 
 @pytest.mark.asyncio
@@ -36,7 +42,7 @@ async def test_uncounted_settles_only_the_final_tool_round_after_answer(mode):
         return {"dispatch": request, "base_view": rows, "on_settled": settled_after_reply}
     coord.register_capability("context.estimated_request_view", prepare)
     coord.register_capability("context.request_retention", context.retaining_view)
-    class Provider(NRoundToolProvider):
+    class Provider(TerminalProvider):
         async def complete(self, request, **kwargs):
             assert request is prepared[-1] and not settled
             assert kwargs == {"extended_thinking": True}
@@ -64,7 +70,7 @@ async def test_uncounted_partial_stop_fallback_and_overflow_never_schedule(dispo
         return {"dispatch": None if disposition == "fallback" else request,
                 "base_view": rows, "on_settled": lambda: settled.append(True)}
     coord.register_capability("context.estimated_request_view", prepare)
-    class Provider(NRoundToolProvider):
+    class Provider(TerminalProvider):
         async def complete(self, request, **kwargs):
             calls.append(request)
             if disposition == "overflow":
@@ -88,15 +94,19 @@ async def test_uncounted_partial_stop_fallback_and_overflow_never_schedule(dispo
 
 
 @pytest.mark.asyncio
-async def test_budget_capable_provider_never_enters_estimated_extension():
+@pytest.mark.parametrize("route", ["provider_budget", "unadvertised"])
+async def test_unsupported_routes_keep_ordinary_retention_across_calls(route):
     coord = MockCoordinator()
     getter = AsyncMock(side_effect=AssertionError("uncounted extension used for counted route"))
     coord.register_capability("context.estimated_request_view", getter)
-    class BudgetProvider(NRoundToolProvider):
+    class BudgetProvider(TerminalProvider):
         def request_budget(self, request, **kwargs):
             return None
-    provider = BudgetProvider(n_tool_rounds=0)
-    answer = await StreamingOrchestrator({}).execute("one", RetainingContext(),
-        {"main": provider}, {}, ScriptedHooks({}), coord)
-    assert answer and provider.call_count == 1
+    provider = BudgetProvider(0) if route == "provider_budget" else NRoundToolProvider(0)
+    ctx = RetainingContext()
+    loop = StreamingOrchestrator({})
+    coord.register_capability("context.request_retention", ctx.retaining_view)
+    for turn in ("one", "two", "three"):
+        assert await loop.execute(turn, ctx, {"main": provider}, {}, ScriptedHooks({}), coord)
+    assert provider.call_count == len(ctx.requirements) == 3
     getter.assert_not_called()

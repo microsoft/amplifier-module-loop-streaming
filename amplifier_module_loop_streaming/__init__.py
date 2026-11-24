@@ -4083,7 +4083,7 @@ class StreamingOrchestrator:
         if (callable(get_capability) and not budget_capable
                 and not callable(getattr(provider, "stream", None))):
             candidate = get_capability("context.estimated_request_view")
-            if callable(candidate):
+            if callable(candidate) and provider_advertises("response:confirmed_terminal"):
                 estimated_getter = candidate
         context_builds_request = measured_compaction_capable or estimated_getter is not None
 

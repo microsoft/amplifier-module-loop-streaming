@@ -154,7 +154,9 @@ error rather than becoming a fallback, and a provider that never advertised
 ### Optional settled maintenance for an uncounted reply
 
 An opted-in Context can register `context.estimated_request_view` for an ordinary
-non-streaming provider without `request_budget`. The loop supplies the retained
+non-streaming provider advertising `response:confirmed_terminal` without
+`request_budget`. Providers without that declaration keep ordinary foreground
+retention. The loop supplies the retained
 reminders, request options and a `project_view` callback that builds the logical
 request with its current overlays and tool declarations. Context owns its local
 estimate, output reserve and recovery policy. It returns the matching `base_view`,
