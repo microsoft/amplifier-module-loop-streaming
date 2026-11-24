@@ -168,6 +168,14 @@ their existing paths. Context controls whether to start bounded background
 maintenance and validates the source again. A new input can arrive before
 maintenance finishes, in which case ordinary foreground recovery still applies.
 
+When a prefix summary is already running, a fresh non-streaming turn can also
+use an opted-in host's `prepared_foreground` with Context's
+`context.begin_settled_foreground`. Context checks the actual prepared request
+and output reserve. On acceptance the ordinary provider call consumes that same
+preparation while the summary continues. Without that proof the turn follows
+the existing wait and retention path. A suspended turn stores an ordinary
+request that can safely be resumed after the host preparation has expired.
+
 ### Provider-count measured compaction
 
 When both sides advertise the optional measured contracts —

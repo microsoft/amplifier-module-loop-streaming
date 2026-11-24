@@ -16,6 +16,7 @@ import time
 import weakref
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
+from contextlib import AsyncExitStack
 from functools import partial
 from typing import Any, ClassVar
 
@@ -1487,6 +1488,8 @@ class StreamingOrchestrator:
             return
         if callable(prepared_request):
             prepared_request = prepared_request()
+            if inspect.isawaitable(prepared_request):
+                prepared_request = await prepared_request
         # The engine deliberately describes only settled, portable state.
         # Storage/admission authority and parent-child coordination stay with
         # the host; a failed checkpoint cannot dispatch another operation.
@@ -3860,9 +3863,10 @@ class StreamingOrchestrator:
     ) -> AsyncIterator[tuple[str, int]]:
         """Bound private count candidates to this exact execution lifetime."""
         lifetime = _MediaRequestLifetime()
+        pending_request = AsyncExitStack()
         stream = self._execute_stream_scoped(
             prompt, context, providers, tools, hooks, coordinator,
-            continuation=continuation, media_lifetime=lifetime,
+            continuation=continuation, media_lifetime=lifetime, pending_request=pending_request,
         )
         failed = False
         try:
@@ -3873,7 +3877,10 @@ class StreamingOrchestrator:
             raise
         finally:
             try:
-                await stream.aclose()
+                try:
+                    await stream.aclose()
+                finally:
+                    await pending_request.aclose()
             finally:
                 try:
                     lifetime.close()
@@ -3890,7 +3897,7 @@ class StreamingOrchestrator:
         tools: dict[str, Any],
         hooks: HookRegistry,
         coordinator: ModuleCoordinator | None = None,
-        *, continuation: dict[str, Any] | None = None, media_lifetime,
+        *, continuation: dict[str, Any] | None = None, media_lifetime, pending_request,
     ) -> AsyncIterator[tuple[str, int]]:
         """
         Internal streaming execution.
@@ -4081,9 +4088,16 @@ class StreamingOrchestrator:
 
         # Allow already-dispatched maintenance to save before the first history
         # write of a new turn, including any persistent turn-start reminders.
+        pending_view = None
         if continuation is None and not budget_capable and callable(get_capability):
             wait_for_checkpoint = get_capability("context.wait_for_settled_checkpoint")
-            if callable(wait_for_checkpoint):
+            if (callable(wait_for_checkpoint) and not callable(getattr(provider, "stream", None))
+                    and callable(getattr(provider, "prepared_foreground", None))):
+                begin = get_capability("context.begin_settled_foreground")
+                suspension = get_capability("execution.suspension")
+                if callable(begin) and not (suspension and suspension.requested()):
+                    pending_view = begin(provider=provider)
+            if pending_view is None and callable(wait_for_checkpoint):
                 await wait_for_checkpoint()
 
         # Pure observability. `basis` names WHY this provider won:
@@ -5195,6 +5209,7 @@ class StreamingOrchestrator:
             if saved is not None:
                 validate_prepared_media(ChatRequest(**saved["request"]), coordinator)
         while prepared is not None or self.max_iterations == -1 or iteration < self.max_iterations:
+            pending_validate = None
             # Check for cancellation at iteration start
             if coordinator and coordinator.cancellation.is_cancelled:
                 await exit_for_cancellation()
@@ -5369,7 +5384,8 @@ class StreamingOrchestrator:
                 # current reminders above, and captures their request-only replay
                 # plan once below; the count callback will apply that frozen plan to
                 # every candidate Context asks it to measure.
-                if measured_compaction_capable:
+                context_selects_view = measured_compaction_capable or pending_view is not None
+                if context_selects_view:
                     message_dicts: list[dict[str, Any]] = []
                     base_message_dicts: list[dict[str, Any]] = []
                 else:
@@ -5444,7 +5460,7 @@ class StreamingOrchestrator:
                             _, changed = await self._persist_reminder(
                                 context, result.context_injection, tail=True
                             )
-                            if changed and not measured_compaction_capable:
+                            if changed and not context_selects_view:
                                 message_dicts = list(await request_messages([]))
                                 base_message_dicts = list(message_dicts)
                     # Check if we should append to last tool result
@@ -5547,7 +5563,7 @@ class StreamingOrchestrator:
                                 verify_admitted=retaining_getter is not None,
                             )
                             retained_contents.append(content)
-                            if (changed or retaining_getter is not None) and not measured_compaction_capable:
+                            if (changed or retaining_getter is not None) and not context_selects_view:
                                 message_dicts = list(
                                     await request_messages(retained_contents)
                                 )
@@ -5618,26 +5634,31 @@ class StreamingOrchestrator:
                     provider, self._provider_default_model(provider), request_options)
                 measured_transaction = None
                 measured_stream_count = None
+                if context_selects_view:
+                    def project_view(
+                        base_view,
+                        *,
+                        turn_start_view_block=replay_turn_start_block,
+                        request_injection=replay_request_injection,
+                        pending_injections=replay_pending_injections,
+                    ):
+                        messages = (
+                            _replay_request_overlays(
+                                base_view, turn_start_view_block=turn_start_view_block,
+                                request_injection=request_injection, pending_injections=pending_injections,
+                            )
+                            if self._ephemeral_injection_mode == "tail" else list(base_view)
+                        )
+                        return build_chat_request(messages)
+
                 if measured_compaction_capable:
                     async def count_view(
                         base_view: list[dict[str, Any]],
                         *,
-                        turn_start_view_block: str | None = replay_turn_start_block,
-                        request_injection: tuple[str, bool] | None = replay_request_injection,
-                        pending_injections: list[dict[str, Any]] = replay_pending_injections,
                         options: Mapping[str, Any] = request_options,
+                        project=project_view,
                     ) -> dict[str, Any]:
-                        candidate_messages = (
-                            _replay_request_overlays(
-                                base_view,
-                                turn_start_view_block=turn_start_view_block,
-                                request_injection=request_injection,
-                                pending_injections=pending_injections,
-                            )
-                            if self._ephemeral_injection_mode == "tail"
-                            else list(base_view)
-                        )
-                        candidate_request = build_chat_request(candidate_messages)
+                        candidate_request = project(base_view)
                         counted_options = deepcopy(dict(options))
                         options_snapshot = deepcopy(counted_options)
                         return {
@@ -5736,6 +5757,21 @@ class StreamingOrchestrator:
                             measured_transaction.rollback()
                         await exit_for_cancellation()
                         return
+                elif pending_view is not None:
+                    choice = await pending_request.enter_async_context(pending_view(
+                        retain_contents=retained_contents, project_view=project_view,
+                        request_options=request_options,
+                    ))
+                    pending_view = None
+                    if choice is None:
+                        await pending_request.aclose()
+                        base_message_dicts = list(await request_messages(retained_contents))
+                        chat_request = project_view(base_message_dicts)
+                    else:
+                        base_message_dicts, chat_request = choice["base_view"], choice["dispatch"]
+                        pending_validate = choice["validate"]
+                    # Only an ordinary provider without a request-budget authority can reach here.
+                    smaller_context_budget, original_output_cap = None, None
                 else:
                     chat_request = build_chat_request(message_dicts)
                     smaller_context_budget, original_output_cap = await check_request_budget(
@@ -5889,8 +5925,19 @@ class StreamingOrchestrator:
 
             # All preparation and rate-limit waits have settled. Save the exact
             # authorized request view, not instructions to repeat those hooks.
+            async def request_for_suspension():
+                if pending_validate is None:
+                    return prepared_dispatch(chat_request, retried=overflow_retried)
+                # An ephemeral host projection cannot grant admission after a restart.
+                await pending_request.aclose()
+                await wait_for_checkpoint()
+                rows = list(await request_messages(retained_contents))
+                frame = prepared_dispatch(project_view(rows), retried=overflow_retried)
+                frame["dispatch_base_messages"] = rows
+                return frame
+
             await self._suspend_at_boundary("prepared_request", iteration, context, coordinator,
-                                            prepared_request=lambda: prepared_dispatch(chat_request, retried=overflow_retried))
+                                            prepared_request=request_for_suspension)
 
             # Check if provider supports streaming
             if stream_provider:
@@ -5979,7 +6026,16 @@ class StreamingOrchestrator:
                 foreground_recorder = foreground_usage_recorder()
                 try:
                     self._llm_calls_this_turn += 1
-                    response = await provider.complete(chat_request, **request_options)
+                    if pending_validate is None:
+                        response = await provider.complete(chat_request, **request_options)
+                    else:
+                        try:
+                            if not same_selected_route():
+                                raise RuntimeError("Selected provider changed during foreground preparation")
+                            pending_validate()
+                            response = await provider.complete(chat_request, **request_options)
+                        finally:
+                            await pending_request.aclose()
                 except ContextLengthError as error:
                     if overflow_retried:
                         raise
