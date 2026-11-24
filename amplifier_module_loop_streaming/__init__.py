@@ -4509,6 +4509,12 @@ class StreamingOrchestrator:
                 and self._provider_default_model(selected_provider) == resolved_model
             )
 
+        def require_pending_route():
+            if (not same_selected_route()
+                    or callable(getattr(selected_provider, "stream", None))
+                    or callable(getattr(selected_provider, "request_budget", None))):
+                raise RuntimeError("Selected provider request contract changed during foreground preparation")
+
         def prepare_settled_response(response, retain_contents):
             if budget_capable or continuation or not callable(get_capability):
                 return None
@@ -5209,6 +5215,7 @@ class StreamingOrchestrator:
             if saved is not None:
                 validate_prepared_media(ChatRequest(**saved["request"]), coordinator)
         while prepared is not None or self.max_iterations == -1 or iteration < self.max_iterations:
+            pending_attempt = pending_view is not None
             pending_validate = None
             # Check for cancellation at iteration start
             if coordinator and coordinator.cancellation.is_cancelled:
@@ -5758,6 +5765,7 @@ class StreamingOrchestrator:
                         await exit_for_cancellation()
                         return
                 elif pending_view is not None:
+                    require_pending_route()
                     choice = await pending_request.enter_async_context(pending_view(
                         retain_contents=retained_contents, project_view=project_view,
                         request_options=request_options,
@@ -5929,17 +5937,22 @@ class StreamingOrchestrator:
             # authorized request view, not instructions to repeat those hooks.
             async def request_for_suspension():
                 if pending_validate is None:
+                    if pending_attempt:
+                        require_pending_route()
                     return prepared_dispatch(chat_request, retried=overflow_retried)
                 # An ephemeral host projection cannot grant admission after a restart.
                 await pending_request.aclose()
                 await wait_for_checkpoint()
                 rows = list(await request_messages(retained_contents))
+                require_pending_route()
                 frame = prepared_dispatch(project_view(rows), retried=overflow_retried)
                 frame["dispatch_base_messages"] = rows
                 return frame
 
             await self._suspend_at_boundary("prepared_request", iteration, context, coordinator,
                                             prepared_request=request_for_suspension)
+            if pending_attempt:
+                require_pending_route()
 
             # Check if provider supports streaming
             if stream_provider:
@@ -6032,8 +6045,6 @@ class StreamingOrchestrator:
                         response = await provider.complete(chat_request, **request_options)
                     else:
                         try:
-                            if not same_selected_route():
-                                raise RuntimeError("Selected provider changed during foreground preparation")
                             pending_validate()
                             response = await provider.complete(chat_request, **request_options)
                         finally:

@@ -1,6 +1,7 @@
 """Only a current, host-prepared ordinary request may pass an in-flight summary."""
 import asyncio
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 from amplifier_core import ContextLengthError
@@ -15,6 +16,7 @@ from tests.test_request_retention import RetainingContext, coordinator_for, inje
 @pytest.mark.parametrize("case", [
     "held", "tools", "declined", "no_ticket", "no_host_projection", "changed_source",
     "changed_provider", "missing_validator", "provider_refusal", "stop", "suspend",
+    "stream_in_hook", "budget_in_hook", "stream_after_fit", "budget_after_fit",
 ])
 async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp_path):
     context = RetainingContext()
@@ -35,6 +37,9 @@ async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp
         await paid_summary.wait()
 
     class Provider(NRoundToolProvider):
+        def get_info(self):
+            return SimpleNamespace(id="main", defaults={"model": "unchanged"})
+
         @asynccontextmanager
         async def prepared_foreground(self, logical, *, request_options):
             nonlocal bound
@@ -96,6 +101,24 @@ async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp
     coordinator.register_capability("context.wait_for_settled_checkpoint", wait)
     loop = StreamingOrchestrator({"ephemeral_injection_mode": "tail", "reminder_placement": "tail"})
 
+    def change_capability():
+        if case.startswith("stream"):
+            async def stream(request, **kwargs):
+                events.append("unexpected stream")
+                yield {"content": "unexpected transport"}
+            provider.stream = stream
+        else:
+            def request_budget(request):
+                events.append("unexpected budget")
+                raise AssertionError("newly counted route needs ordinary replanning")
+            provider.request_budget = request_budget
+
+    class Hooks(ScriptedHooks):
+        async def emit(self, event, data):
+            if event == "provider:request" and case in {"stream_in_hook", "budget_in_hook"}:
+                change_capability()
+            return await super().emit(event, data)
+
     async def delay(hooks, iteration):
         if case == "suspend":
             suspension.hold = True
@@ -103,8 +126,10 @@ async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp
             coordinator.cancellation.is_cancelled = True
         elif case == "changed_provider":
             providers["main"] = object()
+        elif case in {"stream_after_fit", "budget_after_fit"}:
+            change_capability()
     loop._apply_rate_limit_delay = delay
-    hooks = ScriptedHooks({"provider:request": injection("CURRENT-REMINDER")})
+    hooks = Hooks({"provider:request": injection("CURRENT-REMINDER")})
     run = loop.execute("ordinary prompt", context, providers, {"mock_tool": OneShotTool()}, hooks, coordinator)
     if case == "suspend":
         with pytest.raises(ExecutionSuspended) as stopped:
@@ -119,6 +144,10 @@ async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp
             frame, context, providers, {"mock_tool": OneShotTool()}, hooks, coordinator
         )
         assert result and events[-1] == "dispatch" and events.count("prepare") == 1
+    elif case in {"stream_in_hook", "budget_in_hook", "stream_after_fit", "budget_after_fit"}:
+        with pytest.raises(RuntimeError, match="provider.*changed"):
+            await run
+        assert events == (["begin"] if case.endswith("_in_hook") else ["begin", "prepare", "release"])
     elif case in {"changed_source", "changed_provider", "missing_validator", "provider_refusal"}:
         with pytest.raises((RuntimeError, ContextLengthError, TypeError)):
             await run
