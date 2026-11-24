@@ -165,10 +165,17 @@ Context may return a callback bound to that completed turn. The loop invokes it
 after `execution:end` while the provider/model still matches and the user has
 neither stopped nor steered the chat. Active goals and resumed execution keep
 their existing paths. Context controls whether to start bounded background
-maintenance and validates the source again. Before a fresh ordinary turn writes
-to history, the loop awaits the optional `context.wait_for_settled_checkpoint`
-capability. Context returns immediately unless its one-prefix summary call has
-already been dispatched. Foreground fitting then uses the available checkpoint.
+maintenance and validates the source again. When a new ordinary turn arrives during an
+already-dispatched summary, the default `context.wait_for_settled_checkpoint`
+path lets it save before foreground fitting. The wait returns immediately if no
+such summary is running.
+
+A non-streaming provider can opt into `prepared_foreground` with Context's
+`context.begin_settled_foreground`. Context inspects the host-prepared request
+and output reserve. On acceptance the ordinary provider call consumes that same
+preparation while the earlier summary continues. A declined projection uses the
+usual wait and retention path. A suspended turn stores an ordinary request and
+can safely resume after the scoped host preparation has expired.
 
 ### Provider-count measured compaction
 
