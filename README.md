@@ -151,6 +151,25 @@ error both keep their existing behavior, a malformed advertised budget stays an
 error rather than becoming a fallback, and a provider that never advertised
 `request_budget` keeps its historical silent path.
 
+### Starting maintenance after an ordinary answer
+
+For non-streaming providers without `request_budget`, an opted-in Context can
+use a successful reply to plan for the next turn. The optional
+`context.ordinary_settled_response` capability receives the selected provider,
+retained reminders, reported input/output tokens and the current prompt length.
+The loop offers these only after it has saved a final answer whose response
+metadata affirms `provider_response_completed` and whose finish reason is a
+normal stop. It prepares each foreground request through the usual path.
+
+Context may return a callback bound to that completed turn. The loop invokes it
+after `execution:end` while the provider/model still matches and the user has
+neither stopped nor steered the chat. Active goals and resumed execution keep
+their existing paths. Context controls whether to start bounded background
+maintenance and validates the source again. Before a fresh ordinary turn writes
+to history, the loop awaits the optional `context.wait_for_settled_checkpoint`
+capability. Context returns immediately unless its one-prefix summary call has
+already been dispatched. Foreground fitting then uses the available checkpoint.
+
 ### Provider-count measured compaction
 
 When both sides advertise the optional measured contracts —
