@@ -5770,6 +5770,8 @@ class StreamingOrchestrator:
                     else:
                         base_message_dicts, chat_request = choice["base_view"], choice["dispatch"]
                         pending_validate = choice["validate"]
+                        if not callable(pending_validate):
+                            raise TypeError("Pending foreground view requires a source validator")
                     # Only an ordinary provider without a request-budget authority can reach here.
                     smaller_context_budget, original_output_cap = None, None
                 else:

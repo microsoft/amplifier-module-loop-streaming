@@ -14,7 +14,7 @@ from tests.test_request_retention import RetainingContext, coordinator_for, inje
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", [
     "held", "tools", "declined", "no_ticket", "no_host_projection", "changed_source",
-    "changed_provider", "provider_refusal", "stop", "suspend",
+    "changed_provider", "missing_validator", "provider_refusal", "stop", "suspend",
 ])
 async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp_path):
     context = RetainingContext()
@@ -85,7 +85,8 @@ async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp
                     if case == "changed_source":
                         raise RuntimeError("source changed")
 
-                yield {"base_view": rows, "dispatch": request, "validate": validate}
+                yield {"base_view": rows, "dispatch": request,
+                       "validate": None if case == "missing_validator" else validate}
                 return
         await wait()
         yield None
@@ -118,8 +119,8 @@ async def test_pending_view_is_borrowed_only_for_the_admitted_dispatch(case, tmp
             frame, context, providers, {"mock_tool": OneShotTool()}, hooks, coordinator
         )
         assert result and events[-1] == "dispatch" and events.count("prepare") == 1
-    elif case in {"changed_source", "changed_provider", "provider_refusal"}:
-        with pytest.raises((RuntimeError, ContextLengthError)):
+    elif case in {"changed_source", "changed_provider", "missing_validator", "provider_refusal"}:
+        with pytest.raises((RuntimeError, ContextLengthError, TypeError)):
             await run
         assert events.count("dispatch") == int(case == "provider_refusal")
         assert events[-1] == "release"
